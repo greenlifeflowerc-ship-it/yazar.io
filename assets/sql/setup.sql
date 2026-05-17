@@ -259,20 +259,14 @@ begin
   end if;
 
   -- ---------- match reward formulas ----------------------------------
-  v_coins_earned := (v_score / 5)
-                    + (v_kills * 8)
-                    + (v_survival / 4)
-                    + greatest(0, 50 - v_rank) * 2;
-  v_dna_earned   := (v_score / 25)
-                    + (v_kills * 2)
-                    + greatest(0, 20 - v_rank);
+  -- Coins and DNA are ONLY earned through leveling up (not per-match).
+  v_coins_earned := 0;
+  v_dna_earned   := 0;
   v_xp_earned    := (v_score / 3)
                     + (v_kills * 12)
                     + (v_survival / 2)
                     + greatest(0, 50 - v_rank) * 4;
 
-  v_coins_earned := greatest(v_coins_earned, 1);
-  v_dna_earned   := greatest(v_dna_earned, 0);
   v_xp_earned    := greatest(v_xp_earned, 1);
 
   -- ---------- XP BOOST (server-side, cannot be faked) ---------------
@@ -605,6 +599,673 @@ begin
 end;
 $$;
 grant execute on function public.get_active_boosts() to authenticated;
+
+-- =====================================================================
+-- 6. BOOSTS  ·  v2: quantity-based inventory + separate active table
+-- =====================================================================
+-- The v1 player_boosts table (row-per-purchase) is left intact for
+-- backwards compatibility, but the app now uses these two tables instead.
+-- All writes still go through SECURITY DEFINER RPCs.
+
+create table if not exists public.player_boost_inventory (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null references auth.users(id) on delete cascade,
+  boost_id   uuid not null references public.boost_definitions(id) on delete cascade,
+  quantity   int  not null default 0 check (quantity >= 0),
+  updated_at timestamptz not null default now(),
+  unique (user_id, boost_id)
+);
+create index if not exists pbi_user_idx on public.player_boost_inventory(user_id);
+
+create table if not exists public.player_active_boosts (
+  id           uuid primary key default gen_random_uuid(),
+  user_id      uuid not null references auth.users(id) on delete cascade,
+  boost_id     uuid not null references public.boost_definitions(id) on delete cascade,
+  type         text not null check (type in ('mass', 'xp')),
+  multiplier   numeric not null,
+  activated_at timestamptz not null default now(),
+  expires_at   timestamptz not null,
+  created_at   timestamptz not null default now()
+);
+create index if not exists pab_user_type_idx on public.player_active_boosts(user_id, type);
+create index if not exists pab_expires_idx   on public.player_active_boosts(expires_at);
+
+alter table public.player_boost_inventory enable row level security;
+alter table public.player_active_boosts   enable row level security;
+
+drop policy if exists "pbi self read" on public.player_boost_inventory;
+create policy "pbi self read" on public.player_boost_inventory
+  for select using (auth.uid() = user_id);
+
+drop policy if exists "pab self read" on public.player_active_boosts;
+create policy "pab self read" on public.player_active_boosts
+  for select using (auth.uid() = user_id);
+
+-- Replace the v1 functions (they were signed for old shapes).
+drop function if exists public.buy_boost(text);
+drop function if exists public.activate_boost(uuid);
+drop function if exists public.get_active_boosts();
+
+-- ---------- buy_boost  (v2: quantity-based) -------------------------
+create or replace function public.buy_boost(p_key text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user    uuid := auth.uid();
+  v_boost   boost_definitions%rowtype;
+  v_profile profiles%rowtype;
+  v_new_qty int;
+begin
+  if v_user is null then raise exception 'Not authenticated'; end if;
+
+  select * into v_boost from public.boost_definitions where key = p_key;
+  if not found then raise exception 'Boost not found: %', p_key; end if;
+
+  select * into v_profile from public.profiles where id = v_user for update;
+  if not found then raise exception 'Profile missing'; end if;
+
+  if v_boost.price_coins > 0 and v_profile.coins < v_boost.price_coins then
+    raise exception 'Not enough Coins';
+  end if;
+  if v_boost.price_dna > 0 and v_profile.dna < v_boost.price_dna then
+    raise exception 'Not enough DNA';
+  end if;
+
+  update public.profiles
+     set coins      = v_profile.coins - v_boost.price_coins,
+         dna        = v_profile.dna   - v_boost.price_dna,
+         updated_at = now()
+   where id = v_user;
+
+  insert into public.player_boost_inventory (user_id, boost_id, quantity)
+       values (v_user, v_boost.id, 1)
+  on conflict (user_id, boost_id) do update
+       set quantity   = public.player_boost_inventory.quantity + 1,
+           updated_at = now()
+       returning quantity into v_new_qty;
+
+  return jsonb_build_object(
+    'boost_key', v_boost.key,
+    'quantity',  v_new_qty,
+    'coins',     v_profile.coins - v_boost.price_coins,
+    'dna',       v_profile.dna   - v_boost.price_dna
+  );
+end;
+$$;
+grant execute on function public.buy_boost(text) to authenticated;
+
+-- ---------- activate_boost  (v2: by key, decrements inventory) ------
+create or replace function public.activate_boost(p_key text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user      uuid := auth.uid();
+  v_boost     boost_definitions%rowtype;
+  v_inventory player_boost_inventory%rowtype;
+  v_expires   timestamptz;
+begin
+  if v_user is null then raise exception 'Not authenticated'; end if;
+
+  delete from public.player_active_boosts
+   where user_id = v_user and expires_at <= now();
+
+  select * into v_boost from public.boost_definitions where key = p_key;
+  if not found then raise exception 'Boost not found'; end if;
+
+  select * into v_inventory from public.player_boost_inventory
+   where user_id = v_user and boost_id = v_boost.id
+   for update;
+  if not found or v_inventory.quantity < 1 then
+    raise exception 'You don''t own this boost';
+  end if;
+
+  if exists (
+    select 1 from public.player_active_boosts
+     where user_id = v_user and type = v_boost.type and expires_at > now()
+  ) then
+    raise exception 'You already have an active % Boost', upper(v_boost.type);
+  end if;
+
+  v_expires := now() + make_interval(secs => v_boost.duration_seconds);
+
+  update public.player_boost_inventory
+     set quantity   = quantity - 1,
+         updated_at = now()
+   where user_id = v_user and boost_id = v_boost.id;
+
+  insert into public.player_active_boosts
+       (user_id, boost_id, type, multiplier, expires_at)
+  values (v_user, v_boost.id, v_boost.type, v_boost.multiplier, v_expires);
+
+  return jsonb_build_object(
+    'boost_key',  v_boost.key,
+    'type',       v_boost.type,
+    'multiplier', v_boost.multiplier,
+    'expires_at', v_expires,
+    'quantity',   v_inventory.quantity - 1
+  );
+end;
+$$;
+grant execute on function public.activate_boost(text) to authenticated;
+
+-- ---------- get_boost_inventory  -----------------------------------
+create or replace function public.get_boost_inventory()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user   uuid := auth.uid();
+  v_items  jsonb;
+begin
+  if v_user is null then return '[]'::jsonb; end if;
+
+  delete from public.player_active_boosts
+   where user_id = v_user and expires_at <= now();
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id',               bd.id,
+    'key',              bd.key,
+    'name',             bd.name,
+    'type',             bd.type,
+    'multiplier',       bd.multiplier,
+    'duration_seconds', bd.duration_seconds,
+    'price_coins',      bd.price_coins,
+    'price_dna',        bd.price_dna,
+    'description',      bd.description,
+    'quantity',         coalesce(pbi.quantity, 0),
+    'active_expires_at', (
+      select pab.expires_at
+        from public.player_active_boosts pab
+       where pab.user_id = v_user
+         and pab.boost_id = bd.id
+         and pab.expires_at > now()
+       limit 1
+    )
+  ) order by bd.type, bd.price_coins, bd.price_dna), '[]'::jsonb)
+    into v_items
+    from public.boost_definitions bd
+    left join public.player_boost_inventory pbi
+      on pbi.user_id = v_user and pbi.boost_id = bd.id;
+
+  return v_items;
+end;
+$$;
+grant execute on function public.get_boost_inventory() to authenticated;
+
+-- ---------- get_match_start_modifiers  -----------------------------
+create or replace function public.get_match_start_modifiers()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user uuid := auth.uid();
+  v_mass numeric := 1.0;
+  v_xp   numeric := 1.0;
+  v_mass_exp timestamptz;
+  v_xp_exp   timestamptz;
+begin
+  if v_user is null then
+    return jsonb_build_object('mass_multiplier', 1.0, 'xp_multiplier', 1.0);
+  end if;
+
+  delete from public.player_active_boosts
+   where user_id = v_user and expires_at <= now();
+
+  select multiplier, expires_at into v_mass, v_mass_exp
+    from public.player_active_boosts
+   where user_id = v_user and type = 'mass' and expires_at > now()
+   order by expires_at desc limit 1;
+
+  select multiplier, expires_at into v_xp, v_xp_exp
+    from public.player_active_boosts
+   where user_id = v_user and type = 'xp' and expires_at > now()
+   order by expires_at desc limit 1;
+
+  return jsonb_build_object(
+    'mass_multiplier', coalesce(v_mass, 1.0),
+    'xp_multiplier',   coalesce(v_xp,   1.0),
+    'mass_expires_at', v_mass_exp,
+    'xp_expires_at',   v_xp_exp
+  );
+end;
+$$;
+grant execute on function public.get_match_start_modifiers() to authenticated;
+
+-- =====================================================================
+-- 7. SKINS  ·  catalogue + per-player ownership + equipped slot
+-- =====================================================================
+
+create table if not exists public.skin_definitions (
+  id           uuid primary key default gen_random_uuid(),
+  key          text unique not null,
+  name         text not null,
+  category     text not null check (category in ('level', 'premium', 'free')),
+  image_path   text not null,
+  unlock_level int default 0,
+  price_coins  int default 0,
+  sort_order   int default 0,
+  created_at   timestamptz not null default now()
+);
+create index if not exists skin_def_cat_sort_idx
+  on public.skin_definitions(category, sort_order);
+
+create table if not exists public.player_skins (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users(id) on delete cascade,
+  skin_id     uuid not null references public.skin_definitions(id) on delete cascade,
+  unlocked_at timestamptz not null default now(),
+  source      text not null check (source in ('level', 'premium', 'default', 'free')),
+  unique (user_id, skin_id)
+);
+create index if not exists ps_user_idx on public.player_skins(user_id);
+
+create table if not exists public.player_equipped_skin (
+  user_id    uuid primary key references auth.users(id) on delete cascade,
+  skin_id    uuid references public.skin_definitions(id) on delete set null,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.skin_definitions     enable row level security;
+alter table public.player_skins         enable row level security;
+alter table public.player_equipped_skin enable row level security;
+
+drop policy if exists "skindef world read" on public.skin_definitions;
+create policy "skindef world read" on public.skin_definitions
+  for select using (true);
+
+drop policy if exists "ps self read" on public.player_skins;
+create policy "ps self read" on public.player_skins
+  for select using (auth.uid() = user_id);
+
+drop policy if exists "pes self read" on public.player_equipped_skin;
+create policy "pes self read" on public.player_equipped_skin
+  for select using (auth.uid() = user_id);
+
+-- ---------- sync_skin_catalogue  -----------------------------------
+-- Idempotent upsert. The client calls this on startup with the manifest
+-- it discovered from rootBundle so the server-side catalogue mirrors
+-- what's actually on disk. The client passes pre-computed unlock_level
+-- and price_coins per the spec rules (5-step for level skins, 50-9999
+-- ascending for premium).
+create or replace function public.sync_skin_catalogue(p_items jsonb)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_item jsonb;
+begin
+  if p_items is null then return; end if;
+  for v_item in select jsonb_array_elements(p_items) loop
+    insert into public.skin_definitions (
+      key, name, category, image_path,
+      unlock_level, price_coins, sort_order
+    ) values (
+      v_item->>'key',
+      coalesce(v_item->>'name', v_item->>'key'),
+      v_item->>'category',
+      v_item->>'image_path',
+      coalesce((v_item->>'unlock_level')::int, 0),
+      coalesce((v_item->>'price_coins')::int, 0),
+      coalesce((v_item->>'sort_order')::int, 0)
+    )
+    on conflict (key) do update
+      set name         = excluded.name,
+          category     = excluded.category,
+          image_path   = excluded.image_path,
+          unlock_level = excluded.unlock_level,
+          price_coins  = excluded.price_coins,
+          sort_order   = excluded.sort_order;
+  end loop;
+end;
+$$;
+grant execute on function public.sync_skin_catalogue(jsonb) to authenticated;
+
+-- ---------- unlock_level_skins_for_user  ---------------------------
+-- Auto-grants level skins whose unlock_level <= profile.level and that
+-- aren't already owned. Returns the newly-unlocked skins for popup use.
+create or replace function public.unlock_level_skins_for_user(p_user_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_level    int;
+  v_unlocked jsonb;
+begin
+  -- Only the user themselves (or trusted server context) may call this.
+  if auth.uid() is not null and auth.uid() <> p_user_id then
+    raise exception 'Forbidden';
+  end if;
+
+  select level into v_level from public.profiles where id = p_user_id;
+  if v_level is null then return '[]'::jsonb; end if;
+
+  with newly as (
+    insert into public.player_skins (user_id, skin_id, source)
+    select p_user_id, sd.id, 'level'
+      from public.skin_definitions sd
+     where sd.category = 'level'
+       and sd.unlock_level > 0
+       and sd.unlock_level <= v_level
+       and not exists (
+         select 1 from public.player_skins ps
+          where ps.user_id = p_user_id and ps.skin_id = sd.id
+       )
+    on conflict (user_id, skin_id) do nothing
+    returning skin_id
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'key',          sd.key,
+    'name',         sd.name,
+    'image_path',   sd.image_path,
+    'unlock_level', sd.unlock_level
+  )), '[]'::jsonb) into v_unlocked
+    from newly
+    join public.skin_definitions sd on sd.id = newly.skin_id;
+
+  return v_unlocked;
+end;
+$$;
+grant execute on function public.unlock_level_skins_for_user(uuid) to authenticated;
+
+create or replace function public.claim_level_skins()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  return public.unlock_level_skins_for_user(auth.uid());
+end;
+$$;
+grant execute on function public.claim_level_skins() to authenticated;
+
+-- ---------- get_player_skins  --------------------------------------
+create or replace function public.get_player_skins()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user         uuid := auth.uid();
+  v_equipped_key text;
+  v_skins        jsonb;
+begin
+  if v_user is null then
+    return jsonb_build_object('skins', '[]'::jsonb, 'equipped_key', null);
+  end if;
+
+  select sd.key into v_equipped_key
+    from public.player_equipped_skin pes
+    join public.skin_definitions sd on sd.id = pes.skin_id
+   where pes.user_id = v_user;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id',           sd.id,
+    'key',          sd.key,
+    'name',         sd.name,
+    'category',     sd.category,
+    'image_path',   sd.image_path,
+    'unlock_level', sd.unlock_level,
+    'price_coins',  sd.price_coins,
+    'sort_order',   sd.sort_order,
+    'owned',        (ps.id is not null) or sd.category = 'free',
+    'source',       ps.source,
+    'equipped',     sd.key = v_equipped_key
+  ) order by sd.category, sd.sort_order), '[]'::jsonb)
+    into v_skins
+    from public.skin_definitions sd
+    left join public.player_skins ps
+      on ps.user_id = v_user and ps.skin_id = sd.id;
+
+  return jsonb_build_object(
+    'skins',        v_skins,
+    'equipped_key', v_equipped_key
+  );
+end;
+$$;
+grant execute on function public.get_player_skins() to authenticated;
+
+-- ---------- buy_premium_skin  --------------------------------------
+create or replace function public.buy_premium_skin(p_key text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user    uuid := auth.uid();
+  v_skin    skin_definitions%rowtype;
+  v_profile profiles%rowtype;
+begin
+  if v_user is null then raise exception 'Not authenticated'; end if;
+
+  select * into v_skin from public.skin_definitions where key = p_key;
+  if not found then raise exception 'Skin not found'; end if;
+  if v_skin.category <> 'premium' then
+    raise exception 'Not a premium skin';
+  end if;
+
+  if exists (select 1 from public.player_skins
+              where user_id = v_user and skin_id = v_skin.id) then
+    raise exception 'Already owned';
+  end if;
+
+  select * into v_profile from public.profiles where id = v_user for update;
+  if v_profile.coins < v_skin.price_coins then
+    raise exception 'Not enough Coins';
+  end if;
+
+  update public.profiles
+     set coins      = coins - v_skin.price_coins,
+         updated_at = now()
+   where id = v_user;
+
+  insert into public.player_skins (user_id, skin_id, source)
+       values (v_user, v_skin.id, 'premium');
+
+  return jsonb_build_object(
+    'skin_key', v_skin.key,
+    'coins',    v_profile.coins - v_skin.price_coins
+  );
+end;
+$$;
+grant execute on function public.buy_premium_skin(text) to authenticated;
+
+-- ---------- equip_skin  --------------------------------------------
+create or replace function public.equip_skin(p_key text)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user  uuid := auth.uid();
+  v_skin  skin_definitions%rowtype;
+  v_owned boolean;
+begin
+  if v_user is null then raise exception 'Not authenticated'; end if;
+  select * into v_skin from public.skin_definitions where key = p_key;
+  if not found then raise exception 'Skin not found'; end if;
+
+  -- Free skins are owned by everyone, level/premium need a player_skins row.
+  v_owned := v_skin.category = 'free'
+          or exists (select 1 from public.player_skins
+                      where user_id = v_user and skin_id = v_skin.id);
+  if not v_owned then raise exception 'You don''t own this skin'; end if;
+
+  insert into public.player_equipped_skin (user_id, skin_id, updated_at)
+       values (v_user, v_skin.id, now())
+  on conflict (user_id) do update
+       set skin_id = excluded.skin_id, updated_at = now();
+
+  return jsonb_build_object('skin_key', v_skin.key);
+end;
+$$;
+grant execute on function public.equip_skin(text) to authenticated;
+
+-- =====================================================================
+-- 8. submit_match_result  ·  v3: XP boost from new table + skin unlock
+-- =====================================================================
+
+create or replace function public.submit_match_result(
+  p_score            int,
+  p_mass_collected   int,
+  p_kills            int,
+  p_survival_seconds int,
+  p_rank             int
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_user        uuid := auth.uid();
+  v_score       int  := greatest(coalesce(p_score, 0), 0);
+  v_mass        int  := greatest(coalesce(p_mass_collected, 0), 0);
+  v_kills       int  := greatest(coalesce(p_kills, 0), 0);
+  v_survival    int  := greatest(coalesce(p_survival_seconds, 0), 0);
+  v_rank        int  := greatest(coalesce(p_rank, 9999), 1);
+
+  v_coins_earned int;
+  v_dna_earned   int;
+  v_xp_earned    int;
+  v_xp_mult      numeric := 1.0;
+
+  v_prev_level   int;
+  v_prev_xp      int;
+  v_new_xp       int;
+  v_new_level    int;
+  v_required     int;
+  v_leveled_up   boolean := false;
+  v_levels_gained int := 0;
+  v_level_up_coins int := 0;
+  v_level_up_dna   int := 0;
+
+  v_profile      profiles%rowtype;
+  v_coins_total  int;
+  v_dna_total    int;
+  v_unlocked_skins jsonb := '[]'::jsonb;
+begin
+  if v_user is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  -- Coins and DNA are ONLY earned through leveling up (not per-match).
+  v_coins_earned := 0;
+  v_dna_earned   := 0;
+  v_xp_earned    := (v_score / 3)
+                    + (v_kills * 12)
+                    + (v_survival / 2)
+                    + greatest(0, 50 - v_rank) * 4;
+
+  v_xp_earned    := greatest(v_xp_earned, 1);
+
+  -- Server-side XP boost lookup (v2 active table).
+  delete from public.player_active_boosts
+   where user_id = v_user and expires_at <= now();
+
+  select coalesce(max(multiplier), 1.0) into v_xp_mult
+    from public.player_active_boosts
+   where user_id = v_user and type = 'xp' and expires_at > now();
+
+  v_xp_earned := floor(v_xp_earned * v_xp_mult)::int;
+
+  insert into public.profiles (id, email, coins, dna)
+  values (v_user, (select email from auth.users where id = v_user), 200, 50)
+  on conflict (id) do nothing;
+
+  select * into v_profile from public.profiles where id = v_user for update;
+  v_prev_level := coalesce(v_profile.level, 1);
+  v_prev_xp    := coalesce(v_profile.xp, 0);
+
+  v_new_xp    := v_prev_xp + v_xp_earned;
+  v_new_level := v_prev_level;
+
+  loop
+    v_required := 100 * v_new_level * v_new_level;
+    exit when v_new_xp < v_required;
+    v_new_xp        := v_new_xp - v_required;
+    v_new_level     := v_new_level + 1;
+    v_levels_gained := v_levels_gained + 1;
+    v_leveled_up    := true;
+    v_level_up_coins := v_level_up_coins + 100;
+    v_level_up_dna   := v_level_up_dna   + 20;
+  end loop;
+
+  v_coins_total := coalesce(v_profile.coins, 0) + v_coins_earned + v_level_up_coins;
+  v_dna_total   := coalesce(v_profile.dna,   0) + v_dna_earned   + v_level_up_dna;
+
+  update public.profiles
+     set level      = v_new_level,
+         xp         = v_new_xp,
+         coins      = v_coins_total,
+         dna        = v_dna_total,
+         updated_at = now()
+   where id = v_user;
+
+  insert into public.player_stats (user_id) values (v_user)
+  on conflict (user_id) do nothing;
+
+  update public.player_stats
+     set matches_played         = matches_played + 1,
+         best_score             = greatest(best_score, v_score),
+         total_score            = total_score + v_score,
+         total_mass_collected   = total_mass_collected + v_mass,
+         total_kills            = total_kills + v_kills,
+         total_deaths           = total_deaths + 1,
+         total_survival_seconds = total_survival_seconds + v_survival,
+         wins                   = wins + case when v_rank = 1 then 1 else 0 end,
+         updated_at             = now()
+   where user_id = v_user;
+
+  insert into public.match_history (
+    user_id, score, mass_collected, kills, survival_seconds, rank,
+    coins_earned, dna_earned, xp_earned
+  ) values (
+    v_user, v_score, v_mass, v_kills, v_survival, v_rank,
+    v_coins_earned + v_level_up_coins,
+    v_dna_earned   + v_level_up_dna,
+    v_xp_earned
+  );
+
+  -- Unlock any level skins now reachable.
+  v_unlocked_skins := public.unlock_level_skins_for_user(v_user);
+
+  return jsonb_build_object(
+    'level',                  v_new_level,
+    'xp',                     v_new_xp,
+    'coins',                  v_coins_total,
+    'dna',                    v_dna_total,
+    'coins_earned',           v_coins_earned,
+    'dna_earned',             v_dna_earned,
+    'xp_earned',              v_xp_earned,
+    'xp_multiplier',          v_xp_mult,
+    'level_up_coins_earned',  v_level_up_coins,
+    'level_up_dna_earned',    v_level_up_dna,
+    'levels_gained',          v_levels_gained,
+    'leveled_up',             v_leveled_up,
+    'newly_unlocked_skins',   v_unlocked_skins
+  );
+end;
+$$;
+grant execute on function public.submit_match_result(int, int, int, int, int)
+  to authenticated;
 
 -- =====================================================================
 --  DONE. Test login from the app, play a match, hit "PLAY AGAIN" to

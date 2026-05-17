@@ -44,19 +44,37 @@ class MergeHandler {
   // ------------------------------------------------------------------ cohesion
   void _applyCohesion(Player p, DateTime now, double dt) {
     final center = p.centerOfMass;
+    
+    // Find the largest cell to determine its influence
+    double maxMass = 0;
+    for (final c in p.cells) {
+      if (c.mass > maxMass) maxMass = c.mass;
+    }
+
     for (final c in p.cells) {
       // Fresh splits still riding their burst impulse don't get magnetised.
       if (c.splitImpulse.distance >= 1) continue;
+      
       final dir = center - c.position;
       final dist = dir.distance;
       if (dist == 0) continue;
       final unit = dir / dist;
-      final cooldownFactor = c.canMerge(now)
+      
+      double cohesionFactor = c.canMerge(now)
           ? 1.0
           : GameConstants.cohesionCooldownFactor;
+          
+      // Agar.io Mobile logic: Small cells have much weaker cohesion when 
+      // the player has large cells, allowing them to "float" further out 
+      // for attacking or scouting.
+      if (maxMass > 500 && c.mass < maxMass * 0.2) {
+        // Reduce cohesion for small satellite cells (down to 30% of normal)
+        cohesionFactor *= 0.3;
+      }
+      
       final accelMag = GameConstants.cohesionStrength *
           min(dist, GameConstants.cohesionMaxDistance) *
-          cooldownFactor;
+          cohesionFactor;
       c.velocity += unit * accelMag * dt;
     }
   }
@@ -64,10 +82,16 @@ class MergeHandler {
   // --------------------------------------------------------------- separation
   void _applySeparation(Player p, double dt) {
     final cells = p.cells;
+    final now = DateTime.now();
     for (int i = 0; i < cells.length; i++) {
       final a = cells[i];
       for (int j = i + 1; j < cells.length; j++) {
         final b = cells[j];
+        
+        // Agar.io Logic: If BOTH cells are ready to merge, do NOT apply 
+        // separation force. This allows them to overlap and trigger the merge.
+        if (a.canMerge(now) && b.canMerge(now)) continue;
+
         final delta = a.position - b.position;
         final dist = delta.distance;
         final minDist = a.radius + b.radius + GameConstants.minGap;

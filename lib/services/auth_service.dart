@@ -5,11 +5,12 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/boost.dart';
 import '../models/profile.dart';
+import '../game/game_settings.dart';
 import 'profile_service.dart';
 
-/// Holds the current Supabase session + the player's profile and notifies
-/// listeners when either changes. Use [AuthService.instance] everywhere; do
-/// not construct new instances.
+/// Holds the current Supabase session + the player's profile, boost
+/// inventory, and equipped skin and notifies listeners when anything
+/// changes. Use [AuthService.instance] everywhere; do not construct.
 class AuthService extends ChangeNotifier {
   AuthService._();
   static final AuthService instance = AuthService._();
@@ -28,37 +29,59 @@ class AuthService extends ChangeNotifier {
   bool _loadingProfile = false;
   bool get isLoadingProfile => _loadingProfile;
 
-  // Active boost cache. Refreshed after login, buy, activate, match submit
-  // and whenever the profile screen or game screen opens.
-  List<PlayerBoost> _activeBoosts = [];
-  List<PlayerBoost> get activeBoosts => _activeBoosts;
+  /// Full boost catalogue + per-player owned quantity + active expiries.
+  /// Sourced from `get_boost_inventory()`.
+  List<BoostInventoryEntry> _boostInventory = [];
+  List<BoostInventoryEntry> get boostInventory => _boostInventory;
+
+  /// Server-validated active boosts (one per type at most). Derived from
+  /// the same inventory call, so they auto-refresh together.
+  List<PlayerBoost> get activeBoosts => [
+        for (final e in _boostInventory)
+          if (e.isActive) PlayerBoost.fromInventoryActive(e),
+      ];
 
   PlayerBoost? get activeMassBoost {
-    for (final b in _activeBoosts) {
-      if (b.isMass && b.isActive) return b;
+    for (final b in activeBoosts) {
+      if (b.isMass) return b;
     }
     return null;
   }
 
   PlayerBoost? get activeXpBoost {
-    for (final b in _activeBoosts) {
-      if (b.isXp && b.isActive) return b;
+    for (final b in activeBoosts) {
+      if (b.isXp) return b;
     }
     return null;
   }
 
-  /// 1.0 when no Mass Boost is live, otherwise the boost's multiplier
-  /// (e.g. 2.0 or 3.0). Used by the game engine to scale starting mass.
   double get activeMassMultiplier => activeMassBoost?.multiplier ?? 1.0;
 
-  /// Wire up the auth state listener and hydrate the existing session (if the
-  /// user opened the app while already signed in).
+  String? _equippedSkinKey;
+  String? get equippedSkinKey => _equippedSkinKey;
+
+  /// Pending level-up payload from the last submit_match_result. The main
+  /// menu consumes this on first build after returning from a match and
+  /// pops the LevelUpPopup.
+  MatchSubmitResult? _pendingLevelUp;
+  MatchSubmitResult? get pendingLevelUp => _pendingLevelUp;
+
+  void queueLevelUp(MatchSubmitResult r) {
+    _pendingLevelUp = r;
+    notifyListeners();
+  }
+
+  MatchSubmitResult? consumePendingLevelUp() {
+    final r = _pendingLevelUp;
+    _pendingLevelUp = null;
+    return r;
+  }
+
   void bootstrap() {
     _session = _client.auth.currentSession;
     _sub ??= _client.auth.onAuthStateChange.listen(_onAuthChange);
     if (_session != null) {
-      _refreshProfile();
-      refreshActiveBoosts();
+      _hydrateAuthed();
     }
   }
 
@@ -66,66 +89,120 @@ class AuthService extends ChangeNotifier {
     _session = state.session;
     notifyListeners();
     if (state.session != null) {
-      _refreshProfile();
-      refreshActiveBoosts();
+      _hydrateAuthed();
     } else {
       _profile = null;
-      _activeBoosts = [];
+      _boostInventory = [];
+      _equippedSkinKey = null;
       notifyListeners();
     }
   }
 
-  /// Pull the server-validated active-boost list. The RPC auto-expires
-  /// stale rows, so this also keeps `_activeBoosts` honest if the player
-  /// leaves the app open past an expiration.
+  /// Fired on login and on bootstrap with an existing session. Loads the
+  /// profile, syncs the skin catalogue from local assets, claims any level
+  /// skins the player has already grown into, refreshes the boost cache,
+  /// and grabs the equipped-skin key.
+  Future<void> _hydrateAuthed() async {
+    await _refreshProfile();
+    GameSettings.instance.initFromSupabase();
+    // Fire and forget — order doesn't matter for the UI's first paint.
+    unawaited(refreshActiveBoosts());
+    unawaited(_setupSkins());
+  }
+
+  Future<void> _setupSkins() async {
+    try {
+      await ProfileService.instance.syncSkinCatalogueFromAssets();
+    } catch (e) {
+      debugPrint('syncSkinCatalogueFromAssets failed: $e');
+    }
+    try {
+      await ProfileService.instance.claimLevelSkins();
+    } catch (e) {
+      debugPrint('claimLevelSkins failed: $e');
+    }
+    await refreshEquippedSkin();
+  }
+
   Future<void> refreshActiveBoosts() async {
     if (_session == null) {
-      if (_activeBoosts.isNotEmpty) {
-        _activeBoosts = [];
+      if (_boostInventory.isNotEmpty) {
+        _boostInventory = [];
         notifyListeners();
       }
       return;
     }
     try {
-      _activeBoosts = await ProfileService.instance.getActiveBoosts();
+      _boostInventory = await ProfileService.instance.getBoostInventory();
     } catch (e) {
       debugPrint('refreshActiveBoosts failed: $e');
     }
     notifyListeners();
   }
 
-  /// Step 1 of email login: send the OTP code to the address. Supabase emails
-  /// both a magic link and a 6-digit code with its default template; we use
-  /// the code (deep-link-free flow works everywhere).
-  Future<void> sendLoginCode(String email) async {
-    await _client.auth.signInWithOtp(
-      email: email.trim(),
-      shouldCreateUser: true,
-    );
+  /// Re-read the equipped skin key from the server.
+  Future<void> refreshEquippedSkin() async {
+    if (_session == null) {
+      if (_equippedSkinKey != null) {
+        _equippedSkinKey = null;
+        notifyListeners();
+      }
+      return;
+    }
+    try {
+      final payload = await ProfileService.instance.getPlayerSkins();
+      _equippedSkinKey = payload.equippedKey;
+    } catch (e) {
+      debugPrint('refreshEquippedSkin failed: $e');
+    }
+    notifyListeners();
   }
 
-  /// Step 2: verify the 6-digit code typed by the user.
-  Future<void> verifyLoginCode({
+  // ----------------------------------------------------------- auth ops
+  Future<bool> signInWithPassword({
     required String email,
-    required String code,
+    required String password,
   }) async {
-    final res = await _client.auth.verifyOTP(
+    final res = await _client.auth.signInWithPassword(
       email: email.trim(),
-      token: code.trim(),
-      type: OtpType.email,
+      password: password,
     );
     _session = res.session;
     notifyListeners();
-    await _refreshProfile();
+    if (_session != null) {
+      await _hydrateAuthed();
+      return true;
+    }
+    return false;
+  }
+
+  Future<bool> signUp({
+    required String email,
+    required String password,
+  }) async {
+    final res = await _client.auth.signUp(
+      email: email.trim(),
+      password: password,
+    );
+    _session = res.session;
+    notifyListeners();
+    if (_session != null) {
+      await _hydrateAuthed();
+      return true;
+    }
+    return false;
   }
 
   Future<void> signOut() async {
     await _client.auth.signOut();
     _session = null;
     _profile = null;
+    _boostInventory = [];
+    _equippedSkinKey = null;
     notifyListeners();
   }
 
+  // ----------------------------------------------------- profile cache
   Future<void> _refreshProfile() async {
     final u = _client.auth.currentUser;
     if (u == null) return;
@@ -142,14 +219,17 @@ class AuthService extends ChangeNotifier {
     }
   }
 
-  /// Re-fetch the profile from Supabase. Call this after submit_match_result
-  /// returns updated values so listeners refresh.
   Future<void> refreshProfile() => _refreshProfile();
 
-  /// Replace the in-memory profile (used after submit_match_result returns
-  /// fresh totals — avoids a round-trip).
   void applyProfile(Profile p) {
     _profile = p;
+    notifyListeners();
+  }
+
+  /// Apply a freshly-equipped skin key locally so the menu/game reflect it
+  /// without a re-fetch.
+  void setEquippedSkinKey(String? key) {
+    _equippedSkinKey = key;
     notifyListeners();
   }
 }

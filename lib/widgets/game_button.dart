@@ -34,7 +34,8 @@ class GameButton extends StatefulWidget {
 }
 
 class _GameButtonState extends State<GameButton> {
-  bool _pressed = false;
+  final Set<int> _pointers = {};
+  bool get _pressed => _pointers.isNotEmpty;
 
   @override
   Widget build(BuildContext context) {
@@ -42,78 +43,90 @@ class _GameButtonState extends State<GameButton> {
         ? widget.color.withValues(alpha: 0.9)
         : const Color(0xFF888888).withValues(alpha: 0.7);
 
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapDown: (_) {
-        setState(() => _pressed = true);
-        if (widget.enabled) widget.onPressStart?.call();
+    return Listener(
+      onPointerDown: (e) {
+        if (!widget.enabled) return;
+        final wasEmpty = _pointers.isEmpty;
+        setState(() => _pointers.add(e.pointer));
+        if (wasEmpty) {
+          widget.onPressStart?.call();
+        }
       },
-      onTapCancel: () {
-        setState(() => _pressed = false);
-        if (widget.enabled) widget.onPressEnd?.call();
+      onPointerUp: (e) {
+        final wasPressed = _pointers.isNotEmpty;
+        setState(() => _pointers.remove(e.pointer));
+        if (wasPressed && _pointers.isEmpty) {
+          widget.onPressEnd?.call();
+        }
       },
-      onTapUp: (_) {
-        setState(() => _pressed = false);
-        if (widget.enabled) widget.onPressEnd?.call();
+      onPointerCancel: (e) {
+        final wasPressed = _pointers.isNotEmpty;
+        setState(() => _pointers.remove(e.pointer));
+        if (wasPressed && _pointers.isEmpty) {
+          widget.onPressEnd?.call();
+        }
       },
-      onTap: () {
-        if (widget.enabled) widget.onTap?.call();
-      },
-      child: AnimatedScale(
-        scale: _pressed ? 0.9 : 1.0,
-        duration: const Duration(milliseconds: 80),
-        child: SizedBox(
-          width: widget.size,
-          height: widget.size,
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              Container(
-                width: widget.size,
-                height: widget.size,
-                decoration: BoxDecoration(
-                  color: fillColor,
-                  shape: BoxShape.circle,
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.9),
-                    width: 3,
-                  ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.3),
-                      offset: const Offset(0, 4),
-                      blurRadius: 6,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          if (widget.enabled) widget.onTap?.call();
+        },
+        child: AnimatedScale(
+          scale: _pressed ? 0.9 : 1.0,
+          duration: const Duration(milliseconds: 80),
+          child: SizedBox(
+            width: widget.size,
+            height: widget.size,
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Container(
+                  width: widget.size,
+                  height: widget.size,
+                  decoration: BoxDecoration(
+                    color: fillColor,
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.9),
+                      width: 3,
                     ),
-                  ],
-                ),
-                child: Center(child: widget.builder(context)),
-              ),
-              if (widget.hint != null)
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  bottom: -14,
-                  child: Center(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 6, vertical: 1),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.55),
-                        borderRadius: BorderRadius.circular(8),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.3),
+                        offset: const Offset(0, 4),
+                        blurRadius: 6,
                       ),
-                      child: Text(
-                        widget.hint!,
-                        style: GoogleFonts.baloo2(
-                          color: Colors.white,
-                          fontSize: 9,
-                          fontWeight: FontWeight.w800,
-                          height: 1,
+                    ],
+                  ),
+                  child: Center(child: widget.builder(context)),
+                ),
+                if (widget.hint != null)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: -14,
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.55),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          widget.hint!,
+                          style: GoogleFonts.baloo2(
+                            color: Colors.white,
+                            fontSize: 9,
+                            fontWeight: FontWeight.w800,
+                            height: 1,
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
-            ],
+              ],
+            ),
           ),
         ),
       ),

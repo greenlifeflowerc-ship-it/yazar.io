@@ -26,22 +26,51 @@ class EjectHandler {
     final speedMult = GameSettings.instance.ejectSpeedMultiplier;
     final ejectedRadius = sqrt(GameConstants.ejectMass / pi) * 10;
 
+    int cellIdx = 0;
+    // Macro Logic: If feed speed is very high (> 20), fire multiple pellets
+    // per cell in a single call to achieve insane speeds.
+    final burstCount = (GameSettings.instance.feedSpeedMultiplier / 10).floor().clamp(1, 10);
+
     for (final c in p.cells) {
       if (c.mass < GameConstants.ejectMinMass) continue;
-      c.mass -= GameConstants.ejectCost;
-      final launchPoint = _findClearLaunchPoint(
-        p,
-        sourceCell: c,
-        dir: unit,
-        ejectedRadius: ejectedRadius,
-      );
-      engine.ejectedMasses.add(EjectedMass(
-        ownerId: p.id,
-        position: launchPoint,
-        velocity: unit * GameConstants.ejectVelocityInitial * speedMult,
-        color: _darken(c.color, 0.10),
-      ));
+      
+      for (int i = 0; i < burstCount; i++) {
+        if (c.mass < GameConstants.ejectMinMass) break;
+        c.mass -= GameConstants.ejectCost;
+
+        final randomRad = (rng.nextDouble() * 12 - 6) * (pi / 180);
+        final speedVar = 0.95 + rng.nextDouble() * 0.1;
+
+        final finalDir = Offset(
+          unit.dx * cos(randomRad) - unit.dy * sin(randomRad),
+          unit.dx * sin(randomRad) + unit.dy * cos(randomRad),
+        );
+
+        final launchPoint = _findClearLaunchPoint(
+          p,
+          sourceCell: c,
+          dir: finalDir,
+          ejectedRadius: ejectedRadius,
+        );
+        engine.ejectedMasses.add(EjectedMass(
+          ownerId: p.id,
+          position: launchPoint,
+          velocity: finalDir *
+              (GameConstants.ejectVelocityInitial * speedMult * speedVar),
+          color: _vivid(c.color),
+        ));
+      }
+      cellIdx++;
     }
+  }
+
+  Color _vivid(Color c) {
+    final hsl = HSLColor.fromColor(c);
+    // Increase saturation and lightness slightly to make it pop.
+    return hsl
+        .withSaturation((hsl.saturation * 1.2).clamp(0.0, 1.0))
+        .withLightness((hsl.lightness * 1.1).clamp(0.0, 1.0))
+        .toColor();
   }
 
   Offset _findClearLaunchPoint(
@@ -57,7 +86,7 @@ class EjectHandler {
     // and instantly self-eaten when its immunity window expires.
     Offset launch = sourceCell.position +
         dir * (sourceCell.radius + ejectedRadius + GameConstants.launchOffset);
-    for (int iter = 0; iter < 30; iter++) {
+    for (int iter = 0; iter < 60; iter++) {
       bool blocked = false;
       for (final other in p.cells) {
         if (identical(other, sourceCell)) continue;
@@ -71,17 +100,25 @@ class EjectHandler {
         }
       }
       if (!blocked) break;
-      launch += dir * 2.0;
+      launch += dir * 3.0;
     }
     return launch;
   }
 
-  /// Per-frame motion + friction decay. Ejected mass persists forever once it
-  /// comes to rest — it never expires, only disappears when eaten or absorbed
-  /// by a virus.
+  /// Per-frame motion + friction decay.
   void update(double dt) {
-    final fric =
-        pow(GameConstants.ejectFrictionPerFrame, dt * 60).toDouble();
+    final s = GameSettings.instance;
+    // Decouple speed and distance:
+    // Distance = v0 / (1 - friction).
+    // We want Distance to scale by ejectDistanceMultiplier and v0 by ejectSpeedMultiplier.
+    // So (1 - friction) = (1 - baseFriction) * speedMult / distMult.
+    final baseFric = GameConstants.ejectFrictionPerFrame;
+    final speedMult = s.ejectSpeedMultiplier;
+    final distMult = s.ejectDistanceMultiplier;
+
+    final derivedFric = (1.0 - (1.0 - baseFric) * speedMult / distMult).clamp(0.01, 0.99);
+    final fric = pow(derivedFric, dt * 60).toDouble();
+
     final worldSize = GameConstants.worldSize;
     for (final e in engine.ejectedMasses) {
       if (e.velocity == Offset.zero) continue;
@@ -92,17 +129,17 @@ class EjectHandler {
       final r = e.radius;
       if (e.position.dx < r) {
         e.position = Offset(r, e.position.dy);
-        e.velocity = Offset(-e.velocity.dx * 0.5, e.velocity.dy);
+        e.velocity = Offset(0, e.velocity.dy);
       } else if (e.position.dx > worldSize - r) {
         e.position = Offset(worldSize - r, e.position.dy);
-        e.velocity = Offset(-e.velocity.dx * 0.5, e.velocity.dy);
+        e.velocity = Offset(0, e.velocity.dy);
       }
       if (e.position.dy < r) {
         e.position = Offset(e.position.dx, r);
-        e.velocity = Offset(e.velocity.dx, -e.velocity.dy * 0.5);
+        e.velocity = Offset(e.velocity.dx, 0);
       } else if (e.position.dy > worldSize - r) {
         e.position = Offset(e.position.dx, worldSize - r);
-        e.velocity = Offset(e.velocity.dx, -e.velocity.dy * 0.5);
+        e.velocity = Offset(e.velocity.dx, 0);
       }
     }
   }
@@ -122,21 +159,15 @@ class EjectHandler {
     if (v.mass >= 200) {
       v.feedCount = 0;
       v.mass = GameConstants.virusMass;
+      // Shoot the new virus IN the direction of the feed, not opposite.
       final dir = v.lastFeedDir == Offset.zero
           ? const Offset(1, 0)
-          : -v.lastFeedDir;
+          : v.lastFeedDir;
       engine.viruses.add(Virus(
         id: 'v_shot_${DateTime.now().microsecondsSinceEpoch}_${rng.nextInt(99999)}',
         position: v.position + dir * (v.radius + 30),
         velocity: dir * GameConstants.virusShotInitial,
       ));
     }
-  }
-
-  Color _darken(Color c, double amount) {
-    final hsl = HSLColor.fromColor(c);
-    return hsl
-        .withLightness((hsl.lightness * (1 - amount)).clamp(0.0, 1.0))
-        .toColor();
   }
 }

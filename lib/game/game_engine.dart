@@ -21,7 +21,7 @@ class GameConstants {
   // ---------- World ----------
   static const double worldSize = 14142;
   static const double gridUnit = 50;
-  static const int targetPellets = 3000;
+  static const int targetPellets = 8000;
   static const int targetViruses = 30;
   static const int targetBots = 30;
 
@@ -37,9 +37,9 @@ class GameConstants {
   static const double decayThreshold = 35;
 
   // ---------- Eject ----------
-  static const double ejectCost = 18;         // mass removed from source cell
+  static const double ejectCost = 13;         // mass removed from source cell
   static const double ejectMass = 13;         // mass of the spawned pellet
-  static const double ejectConsumedMass = 12; // mass gained by eater (digestion loss)
+  static const double ejectConsumedMass = 13; // mass gained by eater
   // Eject travel target: ~6 grid spaces (300 world units).
   // distance = v0 / (60 * (1 - friction)) → 1500 / (60 * 0.09) ≈ 278 units.
   static const double ejectVelocityInitial = 1500;
@@ -60,7 +60,7 @@ class GameConstants {
 
   // ---------- Virus ----------
   static const double virusMass = 100;
-  static const double virusShotInitial = 600;
+  static const double virusShotInitial = 1200;
 
   // ---------- Speed ----------
   // Legacy multiplier — kept for compatibility but no longer used since cell
@@ -102,7 +102,8 @@ class GameConstants {
   static const double speedScaleBase = 260.0;
 
   // Merge: trigger when centers are deeply inside each other.
-  static const double mergeDistanceFactor = 0.45;
+  // Changed from 0.45 to 0.75 to make merging much easier and smoother.
+  static const double mergeDistanceFactor = 0.75;
 
   // Radius-based merge cooldown (replaces the flat 30s).
   static const double mergeCooldownBase = 14.0;
@@ -149,6 +150,8 @@ class Player {
 
   Offset aiTargetDir = Offset.zero;
   double aiNextDecideAt = 0;
+  double aiNextSplitAt = 0;
+  double aiNextEjectAt = 0;
 
   double get totalMass {
     double m = 0;
@@ -156,6 +159,22 @@ class Player {
       m += c.mass;
     }
     return m;
+  }
+
+  /// Returns the longest remaining merge cooldown among all cells.
+  /// Used for the HUD timer.
+  Duration get remainingMergeTime {
+    if (cells.length < 2) return Duration.zero;
+    final now = DateTime.now();
+    DateTime latest = now;
+    bool anyWaiting = false;
+    for (final c in cells) {
+      if (c.mergeReadyAt.isAfter(latest)) {
+        latest = c.mergeReadyAt;
+        anyWaiting = true;
+      }
+    }
+    return anyWaiting ? latest.difference(now) : Duration.zero;
   }
 
   Offset get centerOfMass {
@@ -246,10 +265,16 @@ class GameEngine {
   ];
 
   static const List<Color> _palette = [
-    Color(0xFFFF1F2D), Color(0xFF1E9BFF), Color(0xFF34C924),
-    Color(0xFFFFD60A), Color(0xFFFF6A00), Color(0xFFA63CFF),
-    Color(0xFFFF2D87), Color(0xFF00C8E0), Color(0xFFFF9933),
-    Color(0xFF99CC00),
+    Color(0xFFFF0000), // Pure Red
+    Color(0xFF00FF00), // Pure Green
+    Color(0xFF0091FF), // Bright Blue
+    Color(0xFFFFD700), // Vivid Gold
+    Color(0xFFFF00FF), // Neon Magenta
+    Color(0xFF00FFFF), // Cyan
+    Color(0xFFFF6600), // Bright Orange
+    Color(0xFF9D00FF), // Electric Purple
+    Color(0xFF39FF14), // Neon Green
+    Color(0xFFFF1493), // Deep Pink
   ];
 
   // -------------------------------------------------------- public actions
@@ -370,8 +395,9 @@ class GameEngine {
     // Mass Boost: only the human player gets the multiplier; bots spawn at
     // baseline. The multiplier is read fresh on every spawn so a boost that
     // expires between matches won't keep applying.
+    // TEMPORARY: Starting mass set to 1000 for testing as requested.
     final startingMass = p.isHuman
-        ? (34 * AuthService.instance.activeMassMultiplier).clamp(34, 1e9).toDouble()
+        ? (1000 * AuthService.instance.activeMassMultiplier).clamp(1000, 1e9).toDouble()
         : 34.0;
 
     p.cells.clear();
@@ -397,8 +423,9 @@ class GameEngine {
   double _targetZoom() {
     final m = humanPlayer.totalMass.clamp(10, 1e9).toDouble();
     final z = pow(64 / m, 0.25).toDouble();
-    final mult = GameSettings.instance.zoomMultiplier;
-    return (z * mult).clamp(0.1, 4.0);
+    // Inverse Logic: more multiplier = lower scale (see more world)
+    final mult = 1.0 / GameSettings.instance.zoomMultiplier;
+    return (z * mult).clamp(0.01, 4.0);
   }
 
   // ---------------------------------------------------------- main update
@@ -425,6 +452,41 @@ class GameEngine {
           worldSize: GameConstants.worldSize,
         );
         p.aiNextDecideAt = now + 0.2 + _rng.nextDouble() * 0.2;
+      }
+
+      // Bot split: occasionally split toward prey.
+      if (now >= p.aiNextSplitAt) {
+        final doSplit = _ai.decideSplit(
+          center: p.centerOfMass,
+          mass: p.totalMass,
+          ownerId: p.id,
+          cellCount: p.cells.length,
+          cellGrid: cellGrid,
+        );
+        if (doSplit) {
+          _split.splitPlayer(p, p.aiTargetDir);
+          p.aiNextSplitAt = now + 3.0 + _rng.nextDouble() * 5.0;
+        } else {
+          p.aiNextSplitAt = now + 0.8 + _rng.nextDouble() * 0.4;
+        }
+      }
+
+      // Bot eject: feed nearby viruses when a large enemy is present.
+      if (now >= p.aiNextEjectAt) {
+        final doEject = _ai.decideEject(
+          center: p.centerOfMass,
+          mass: p.totalMass,
+          ownerId: p.id,
+          cellGrid: cellGrid,
+          virusGrid: virusGrid,
+          aimDir: p.aiTargetDir,
+        );
+        if (doEject) {
+          _eject.ejectPlayer(p, p.aiTargetDir);
+          p.aiNextEjectAt = now + 1.0 + _rng.nextDouble() * 2.0;
+        } else {
+          p.aiNextEjectAt = now + 0.5 + _rng.nextDouble() * 0.3;
+        }
       }
     }
 
@@ -580,6 +642,17 @@ class GameEngine {
       // Wobble phase.
       c.wobblePhase += dt * 4;
 
+      // Decay jelly bumps
+      if (c.bumps.isNotEmpty) {
+        final decay = exp(-6.0 * dt);
+        for (int i = c.bumps.length - 1; i >= 0; i--) {
+          c.bumps[i].magnitude *= decay;
+          if (c.bumps[i].magnitude < 0.005) {
+            c.bumps.removeAt(i);
+          }
+        }
+      }
+
       // World clamp.
       final r = c.radius;
       c.position = Offset(
@@ -624,6 +697,7 @@ class GameEngine {
         final rSq = c.radius * c.radius;
         for (final pellet in near) {
           if ((pellet.position - c.position).distanceSquared < rSq) {
+            c.addBump(atan2(pellet.position.dy - c.position.dy, pellet.position.dx - c.position.dx), 0.04);
             pellet.position = _randomWorldPos();
             pellet.color = _palette[_rng.nextInt(_palette.length)];
             if (c.mass < GameConstants.maxCellMass) c.mass += Pellet.mass;
@@ -644,10 +718,14 @@ class GameEngine {
         for (final e in near) {
           if (eatenEjected.contains(e)) continue;
           final ageMs = nowDt.difference(e.spawnTime).inMilliseconds;
-          if (ageMs < 500 && e.ownerId == c.ownerId) continue;
+          // Reduced immunity window from 500ms to 200ms to prevent "lost" mass
+          // that doesn't get eaten when intended, while still preventing
+          // instant self-consumption upon spawn.
+          if (ageMs < 200 && e.ownerId == c.ownerId) continue;
           final eatRadius = c.radius - e.radius * 0.4;
           if ((e.position - c.position).distanceSquared <
               eatRadius * eatRadius) {
+            c.addBump(atan2(e.position.dy - c.position.dy, e.position.dx - c.position.dx), 0.08);
             eatenEjected.add(e);
             if (c.mass < GameConstants.maxCellMass) {
               c.mass += GameConstants.ejectConsumedMass;
@@ -657,11 +735,12 @@ class GameEngine {
       }
     }
 
-    // Ejected mass feeds viruses (with the same 150ms safety window so a fresh
-    // eject doesn't collide with a virus inside the source cell).
+    // Ejected mass feeds viruses.
     for (final e in ejectedMasses) {
       if (eatenEjected.contains(e)) continue;
-      if (nowDt.difference(e.spawnTime).inMilliseconds < 500) continue;
+      // Removed the 500ms immunity window for viruses. Ejected mass should
+      // be able to feed viruses immediately to ensure they don't just pass
+      // through or "disappear" without effect.
       final near = virusGrid.queryRadius(e.position, 200);
       for (final v in near) {
         final d = (e.position - v.position).distance;
@@ -693,6 +772,7 @@ class GameEngine {
         final eatRadius = a.radius - b.radius * 0.4;
         if ((b.position - a.position).distanceSquared <
             eatRadius * eatRadius) {
+          a.addBump(atan2(b.position.dy - a.position.dy, b.position.dx - a.position.dx), 0.12);
           if (a.mass < GameConstants.maxCellMass) a.mass += b.mass;
           toRemoveCells.add(b);
           final eater = _findOwner(a.ownerId);
@@ -708,10 +788,12 @@ class GameEngine {
       final near = virusGrid.queryRadius(a.position, a.radius + 150);
       for (final v in near) {
         if (virusesConsumed.contains(v)) continue;
+        // Requirement 3: Explosion happens as soon as the cell "touches" the virus.
+        // We use a more sensitive distance check (virus center entering cell radius).
         if (a.radius <= v.radius * 1.15) continue;
-        final eatRadius = a.radius - v.radius * 0.4;
+        final triggerDistance = a.radius + v.radius * 0.2;
         if ((v.position - a.position).distanceSquared <
-            eatRadius * eatRadius) {
+            triggerDistance * triggerDistance) {
           virusesConsumed.add(v);
           _spawnPopParticles(v.position);
           final owner = _findOwner(a.ownerId);

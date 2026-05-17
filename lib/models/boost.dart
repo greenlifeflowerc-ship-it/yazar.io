@@ -1,4 +1,3 @@
-/// A boost SKU from `boost_definitions` — the store catalogue.
 class BoostDefinition {
   BoostDefinition({
     required this.id,
@@ -43,70 +42,34 @@ class BoostDefinition {
   }
 }
 
-/// A row from `player_boosts` joined with the definition row.
-class PlayerBoost {
-  PlayerBoost({
-    required this.id,
-    required this.boostId,
-    required this.status,
-    required this.activatedAt,
-    required this.expiresAt,
-    required this.key,
-    required this.name,
-    required this.type,
-    required this.multiplier,
-    required this.durationSeconds,
+/// A row from get_boost_inventory: a boost definition + the player's owned
+/// quantity + the expiry of the active instance of this exact SKU (if any).
+class BoostInventoryEntry {
+  BoostInventoryEntry({
+    required this.def,
+    required this.quantity,
+    required this.activeExpiresAt,
   });
 
-  final String id;
-  final String boostId;
-  final String status; // 'owned' | 'active' | 'expired' | 'used'
-  final DateTime? activatedAt;
-  final DateTime? expiresAt;
-  final String key;
-  final String name;
-  final String type; // 'mass' | 'xp'
-  final double multiplier;
-  final int durationSeconds;
+  final BoostDefinition def;
+  final int quantity;
+  final DateTime? activeExpiresAt;
 
-  bool get isMass => type == 'mass';
-  bool get isXp => type == 'xp';
   bool get isActive =>
-      status == 'active' &&
-      expiresAt != null &&
-      DateTime.now().isBefore(expiresAt!);
+      activeExpiresAt != null && DateTime.now().isBefore(activeExpiresAt!);
 
   Duration get remaining {
-    final exp = expiresAt;
-    if (exp == null) return Duration.zero;
-    final r = exp.difference(DateTime.now());
+    final e = activeExpiresAt;
+    if (e == null) return Duration.zero;
+    final r = e.difference(DateTime.now());
     return r.isNegative ? Duration.zero : r;
   }
 
-  /// Used for both `get_active_boosts()` rows (joined columns) and
-  /// `player_boosts` joined with `boost_definitions(*)` rows.
-  factory PlayerBoost.fromJson(Map<String, dynamic> json) {
-    // get_active_boosts returns the joined columns flat. Direct table query
-    // returns the boost_definitions row nested under `boost_definitions`.
-    final nested = json['boost_definitions'];
-    Map<String, dynamic>? def = nested is Map
-        ? nested.cast<String, dynamic>()
-        : null;
-
-    return PlayerBoost(
-      id: json['id'] as String,
-      boostId: (json['boost_id'] ?? def?['id']) as String,
-      status: json['status'] as String? ?? 'owned',
-      activatedAt: _parseTs(json['activated_at']),
-      expiresAt: _parseTs(json['expires_at']),
-      key: (json['key'] ?? def?['key']) as String,
-      name: (json['name'] ?? def?['name']) as String,
-      type: (json['type'] ?? def?['type']) as String,
-      multiplier:
-          ((json['multiplier'] ?? def?['multiplier']) as num).toDouble(),
-      durationSeconds:
-          ((json['duration_seconds'] ?? def?['duration_seconds']) as num)
-              .toInt(),
+  factory BoostInventoryEntry.fromJson(Map<String, dynamic> json) {
+    return BoostInventoryEntry(
+      def: BoostDefinition.fromJson(json),
+      quantity: (json['quantity'] as num?)?.toInt() ?? 0,
+      activeExpiresAt: _parseTs(json['active_expires_at']),
     );
   }
 
@@ -114,5 +77,52 @@ class PlayerBoost {
     if (v == null) return null;
     if (v is DateTime) return v;
     return DateTime.tryParse(v.toString());
+  }
+}
+
+/// View of an active boost (consumed by AuthService + UI badges). Compatible
+/// with the older PlayerBoost surface that the rest of the app expected.
+class PlayerBoost {
+  PlayerBoost({
+    required this.id,
+    required this.boostKey,
+    required this.type,
+    required this.multiplier,
+    required this.activatedAt,
+    required this.expiresAt,
+  });
+
+  final String id;
+  final String boostKey;
+  final String type;
+  final double multiplier;
+  final DateTime activatedAt;
+  final DateTime expiresAt;
+
+  bool get isMass => type == 'mass';
+  bool get isXp => type == 'xp';
+  bool get isActive => DateTime.now().isBefore(expiresAt);
+
+  Duration get remaining {
+    final r = expiresAt.difference(DateTime.now());
+    return r.isNegative ? Duration.zero : r;
+  }
+
+  // For HUD callers from the older code path:
+  String get key => boostKey;
+  String get name => '${multiplier % 1 == 0 ? multiplier.toStringAsFixed(0) : multiplier.toStringAsFixed(1)}x ${type == 'mass' ? 'Mass' : 'XP'} Boost';
+  int get durationSeconds => expiresAt.difference(activatedAt).inSeconds;
+
+  factory PlayerBoost.fromInventoryActive(BoostInventoryEntry e) {
+    return PlayerBoost(
+      id: e.def.key, // good enough for UI keying
+      boostKey: e.def.key,
+      type: e.def.type,
+      multiplier: e.def.multiplier,
+      activatedAt: e.activeExpiresAt!.subtract(
+        Duration(seconds: e.def.durationSeconds),
+      ),
+      expiresAt: e.activeExpiresAt!,
+    );
   }
 }

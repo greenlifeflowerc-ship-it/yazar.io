@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 
@@ -48,6 +49,18 @@ class _GameScreenState extends State<GameScreen>
   bool _minimapOpen = true;
   bool _lastGameOver = false;
 
+  // Draggable button positions — initialised from GameSettings in initState.
+  late final ValueNotifier<Offset> _ejectPos;
+  late final ValueNotifier<Offset> _splitPos;
+  bool _draggingEject = false;
+  bool _draggingSplit = false;
+
+  // PC Mode support
+  final FocusNode _gameFocusNode = FocusNode();
+  Offset _mousePos = Offset.zero;
+  bool _firstMouseHover = false;
+
+  // Hold-to-eject: fires once on touch-down, then every interval until release.
   Timer? _ejectHoldTimer;
 
   static const double _panelWidth = 150;
@@ -64,17 +77,46 @@ class _GameScreenState extends State<GameScreen>
     // expirations — if it produces a new multiplier the next death/respawn
     // will pick it up; we don't yank the player mid-life.
     AuthService.instance.refreshActiveBoosts();
+    _ejectPos = ValueNotifier(GameSettings.instance.ejectBtnFrac);
+    _splitPos = ValueNotifier(GameSettings.instance.splitBtnFrac);
     _engine = GameEngine()..init(nickname: widget.nickname);
     _ticker = createTicker(_onTick)..start();
+
+    if (GameSettings.instance.pcMode) {
+      _gameFocusNode.requestFocus();
+    }
   }
 
   void _onTick(Duration elapsed) {
     final dt = (elapsed - _lastTick).inMicroseconds / 1e6;
+    
+    // FPS Capping logic
+    final cap = GameSettings.instance.fpsCap;
+    final minDt = 1.0 / cap;
+    if (dt < minDt && _lastTick != Duration.zero) return;
+
     _lastTick = elapsed;
     final clamped = dt.clamp(0.0, 0.05);
     if (clamped > 0) {
       _smoothedFps = _smoothedFps * 0.92 + (1.0 / clamped) * 0.08;
     }
+
+    if (GameSettings.instance.pcMode && _firstMouseHover && !(_engine.gameOver)) {
+      final size = MediaQuery.of(context).size;
+      final center = Offset(size.width / 2, size.height / 2);
+      final diff = _mousePos - center;
+      final dist = diff.distance;
+      // max speed reached at 15% of screen height from center
+      final maxRadius = size.shortestSide * 0.15;
+      
+      if (dist < 10) {
+        _engine.moveDir = Offset.zero;
+      } else {
+        final mag = (dist / maxRadius).clamp(0.0, 1.0);
+        _engine.moveDir = (diff / dist) * mag;
+      }
+    }
+
     _engine.update(clamped);
     _frame.value++;
     if (++_hudCounter >= 6) {
@@ -127,6 +169,10 @@ class _GameScreenState extends State<GameScreen>
       } else {
         await AuthService.instance.refreshProfile();
       }
+      // Queue the level-up popup so the main menu can show it once we're back.
+      if (res.leveledUp) {
+        AuthService.instance.queueLevelUp(res);
+      }
     }
   }
 
@@ -137,15 +183,28 @@ class _GameScreenState extends State<GameScreen>
     _frame.dispose();
     _hudTick.dispose();
     _miniTick.dispose();
+    _ejectPos.dispose();
+    _splitPos.dispose();
+    _gameFocusNode.dispose();
     super.dispose();
   }
 
+  // Touch-down → start shooting every 100 ms.
+  // Touch-up / cancel → stop immediately.
   void _startEjectHold() {
-    _engine.attackMode = true; // open the launch lane while shooting
-    _engine.doEject();
-    _ejectHoldTimer?.cancel();
+    if (_draggingEject) return;
+    if (_ejectHoldTimer != null) return; // Already running
+
+    _engine.attackMode = true;
+    _engine.doEject(); // fire on first touch immediately
+    
+    // The timer now respects the user's "Feed speed" setting.
+    // We allow it to go down to 1ms for true macro speed.
+    final speedMult = GameSettings.instance.feedSpeedMultiplier;
+    final ms = (100 / speedMult).round().clamp(1, 500);
+
     _ejectHoldTimer = Timer.periodic(
-      const Duration(milliseconds: 100),
+      Duration(milliseconds: ms),
       (_) => _engine.doEject(),
     );
   }
@@ -157,14 +216,11 @@ class _GameScreenState extends State<GameScreen>
   }
 
   void _onSplitTap() {
-    // Brief attack window so cells spread out of the launch lane during the
-    // split itself.
+    if (_draggingSplit) return;
     _engine.attackMode = true;
     _engine.doSplit();
     Future.delayed(const Duration(milliseconds: 250), () {
-      if (!mounted) return;
-      // Don't override an eject-hold that's still in progress.
-      if (_ejectHoldTimer == null) _engine.attackMode = false;
+      if (mounted) _engine.attackMode = false;
     });
   }
 
@@ -195,240 +251,408 @@ class _GameScreenState extends State<GameScreen>
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
+    final gs = GameSettings.instance;
 
-    return Scaffold(
-      backgroundColor: const Color(0xFFF5F5F5),
-      body: Stack(
-        children: [
-          // World canvas (60 Hz)
-          Positioned.fill(
-            child: RepaintBoundary(
-              child: CustomPaint(
-                painter: GamePainter(engine: _engine, repaint: _frame),
-                size: size,
-              ),
-            ),
-          ),
+    return AnimatedBuilder(
+      animation: gs,
+      builder: (context, _) {
+        final btnScale = gs.buttonScale;
+        final joystickRight = gs.joystickOnRight;
+        final pcMode = gs.pcMode;
 
-          // Joystick on left half
-          Positioned(
-            left: 0,
-            top: 0,
-            bottom: 0,
-            width: size.width * 0.5,
-            child: VirtualJoystick(
-              onChanged: (dir) => _engine.moveDir = dir,
-              onReleased: () => _engine.moveDir = Offset.zero,
-            ),
-          ),
-
-          // Top-left: pause + mass
-          Positioned(
-            left: 12,
-            top: 12,
-            child: Row(
-              children: [
-                _pauseButton(),
-                const SizedBox(width: 10),
-                ValueListenableBuilder<int>(
-                  valueListenable: _hudTick,
-                  builder: (context, value, child) => Text(
-                    'Mass: ${_numberFmt.format(_engine.humanPlayer.totalMass.round())}',
-                    style: GoogleFonts.baloo2(
-                      color: Colors.white,
-                      fontSize: 20,
-                      fontWeight: FontWeight.w900,
-                      shadows: const [
-                        Shadow(
-                            color: Colors.black,
-                            blurRadius: 2,
-                            offset: Offset(1, 1)),
-                        Shadow(
-                            color: Colors.black,
-                            blurRadius: 2,
-                            offset: Offset(-1, -1)),
-                      ],
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          // Active-boost badges, just to the right of the mass HUD.
-          Positioned(
-            top: 14,
-            left: 200,
-            child: IgnorePointer(
-              child: AnimatedBuilder(
-                animation: AuthService.instance,
-                builder: (context, _) {
-                  final boosts = AuthService.instance.activeBoosts;
-                  if (boosts.isEmpty) return const SizedBox.shrink();
-                  return Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      for (final b in boosts) ...[
-                        _GameBoostBadge(boost: b),
-                        const SizedBox(width: 6),
-                      ],
-                    ],
-                  );
-                },
-              ),
-            ),
-          ),
-
-          // Top-center FPS (settings-gated)
-          if (GameSettings.instance.showFps)
-            Positioned(
-              top: 14,
-              left: 0,
-              right: 0,
-              child: IgnorePointer(
-                child: Center(
-                  child: ValueListenableBuilder<int>(
-                    valueListenable: _hudTick,
-                    builder: (context, value, child) => Text(
-                      'FPS ${_smoothedFps.toStringAsFixed(0)}',
-                      style: GoogleFonts.baloo2(
-                        color: Colors.white,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w800,
-                        shadows: const [
-                          Shadow(color: Colors.black87, blurRadius: 2),
-                        ],
+        return Scaffold(
+          backgroundColor: const Color(0xFFF5F5F5),
+          body: Focus(
+            focusNode: _gameFocusNode,
+            autofocus: true,
+            onKeyEvent: (node, event) {
+              if (!pcMode) return KeyEventResult.ignored;
+              
+              final isDown = event is KeyDownEvent;
+              final isUp = event is KeyUpEvent;
+              
+              if (event.logicalKey == LogicalKeyboardKey.space) {
+                if (isDown) _onSplitTap();
+                return KeyEventResult.handled;
+              }
+              
+              if (event.logicalKey == LogicalKeyboardKey.keyW) {
+                if (isDown) {
+                  _startEjectHold();
+                } else if (isUp) {
+                  _endEjectHold();
+                }
+                return KeyEventResult.handled;
+              }
+              
+              return KeyEventResult.ignored;
+            },
+            child: MouseRegion(
+              onHover: (event) {
+                if (pcMode) {
+                  _mousePos = event.localPosition;
+                  _firstMouseHover = true;
+                }
+              },
+              child: Stack(
+                children: [
+                  // World canvas (60 Hz)
+                  Positioned.fill(
+                    child: RepaintBoundary(
+                      child: CustomPaint(
+                        painter: GamePainter(engine: _engine, repaint: _frame),
+                        size: size,
                       ),
                     ),
                   ),
-                ),
-              ),
-            ),
 
-          // === Top-right minimap with slide (settings-gated) ===
-          if (GameSettings.instance.showMinimap) ...[
-            AnimatedPositioned(
-              duration: const Duration(milliseconds: 260),
-              curve: Curves.easeOutCubic,
-              top: _minimapTop,
-              right: _minimapOpen ? 0 : -_panelWidth,
-              width: _panelWidth,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onHorizontalDragEnd: (d) {
-                  final vx = d.velocity.pixelsPerSecond.dx;
-                  if (vx > 200 && _minimapOpen) {
-                    setState(() => _minimapOpen = false);
-                  }
-                },
-                child: Center(
-                  child: RepaintBoundary(
-                    child: ValueListenableBuilder<int>(
-                      valueListenable: _miniTick,
-                      builder: (context, value, child) =>
-                          Minimap(engine: _engine, size: 110),
+                  // Joystick — side controlled by settings
+                  if (!pcMode)
+                    Positioned(
+                      left: joystickRight ? null : 0,
+                      right: joystickRight ? 0 : null,
+                      top: 0,
+                      bottom: 0,
+                      width: size.width * 0.5,
+                      child: VirtualJoystick(
+                        onChanged: (dir) => _engine.moveDir = dir,
+                        onReleased: () => _engine.moveDir = Offset.zero,
+                      ),
+                    ),
+
+                  // Top-left: pause + mass + merge timer
+                  Positioned(
+                    left: 12,
+                    top: 12,
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _pauseButton(),
+                        const SizedBox(width: 10),
+                        ValueListenableBuilder<int>(
+                          valueListenable: _hudTick,
+                          builder: (context, value, child) {
+                            final player = _engine.humanPlayer;
+                            final remaining = player.remainingMergeTime;
+                            final showTimer = remaining > Duration.zero;
+
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  'Mass: ${_numberFmt.format(player.totalMass.round())}',
+                                  style: GoogleFonts.baloo2(
+                                    color: Colors.white,
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.w900,
+                                    shadows: const [
+                                      Shadow(color: Colors.black, blurRadius: 4),
+                                    ],
+                                  ),
+                                ),
+                                if (showTimer)
+                                  Container(
+                                    margin: const EdgeInsets.only(top: 2),
+                                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                    decoration: BoxDecoration(
+                                      color: Colors.black.withValues(alpha: 0.3),
+                                      borderRadius: BorderRadius.circular(4),
+                                    ),
+                                    child: Text(
+                                      'Merge in: ${remaining.inSeconds + 1}s',
+                                      style: GoogleFonts.baloo2(
+                                        color: Colors.orangeAccent,
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w800,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            );
+                          },
+                        ),
+                      ],
                     ),
                   ),
-                ),
-              ),
-            ),
-            AnimatedPositioned(
-              duration: const Duration(milliseconds: 260),
-              curve: Curves.easeOutCubic,
-              top: _minimapTop + 36,
-              right: _minimapOpen ? _panelWidth : 0,
-              child: _ChevronTab(
-                open: _minimapOpen,
-                onTap: () => setState(() => _minimapOpen = !_minimapOpen),
-              ),
-            ),
-          ],
 
-          // === Below minimap: leaderboard with slide ===
-          AnimatedPositioned(
-            duration: const Duration(milliseconds: 260),
-            curve: Curves.easeOutCubic,
-            top: GameSettings.instance.showMinimap ? _leaderboardTop : 12,
-            right: _leaderboardOpen ? 0 : -_panelWidth,
-            width: _panelWidth,
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onHorizontalDragEnd: (d) {
-                final vx = d.velocity.pixelsPerSecond.dx;
-                if (vx > 200 && _leaderboardOpen) {
-                  setState(() => _leaderboardOpen = false);
-                }
-              },
-              child: RepaintBoundary(
-                child: ValueListenableBuilder<int>(
-                  valueListenable: _hudTick,
-                  builder: (context, value, child) =>
-                      LiveLeaderboard(engine: _engine),
-                ),
-              ),
-            ),
-          ),
-          AnimatedPositioned(
-            duration: const Duration(milliseconds: 260),
-            curve: Curves.easeOutCubic,
-            top: (GameSettings.instance.showMinimap ? _leaderboardTop : 12) + 30,
-            right: _leaderboardOpen ? _panelWidth : 0,
-            child: _ChevronTab(
-              open: _leaderboardOpen,
-              onTap: () =>
-                  setState(() => _leaderboardOpen = !_leaderboardOpen),
-            ),
-          ),
-
-          // === Bottom-right: split + eject ===
-          Positioned(
-            right: 16,
-            bottom: 16,
-            child: ValueListenableBuilder<int>(
-              valueListenable: _hudTick,
-              builder: (context, value, child) {
-                final canSplit = _engine.canSplit;
-                final canEject = _engine.canEject;
-                return Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // Eject: tap = 1 shot, hold = continuous 10/s stream.
-                    GameButton(
-                      onPressStart: _startEjectHold,
-                      onPressEnd: _endEjectHold,
-                      color: const Color(0xFFFF7A2F),
-                      size: 60,
-                      enabled: canEject,
-                      builder: (_) => const EjectIcon(),
+                  // Top-center FPS (settings-gated)
+                  if (GameSettings.instance.showFps)
+                    Positioned(
+                      top: 14,
+                      left: 0,
+                      right: 0,
+                      child: IgnorePointer(
+                        child: Center(
+                          child: ValueListenableBuilder<int>(
+                            valueListenable: _hudTick,
+                            builder: (context, value, child) => Text(
+                              'FPS ${_smoothedFps.toStringAsFixed(0)}',
+                              style: GoogleFonts.baloo2(
+                                color: Colors.white,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w800,
+                                shadows: const [
+                                  Shadow(color: Colors.black87, blurRadius: 2),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                     ),
-                    const SizedBox(width: 12),
-                    GameButton(
-                      onTap: _onSplitTap,
-                      color: const Color(0xFF3DA5F5),
-                      size: 70,
-                      enabled: canSplit,
-                      builder: (_) => const SplitIcon(),
+
+                  // === Top-right minimap with slide (settings-gated) ===
+                  if (GameSettings.instance.showMinimap) ...[
+                    AnimatedPositioned(
+                      duration: const Duration(milliseconds: 260),
+                      curve: Curves.easeOutCubic,
+                      top: _minimapTop,
+                      right: _minimapOpen ? 0 : -_panelWidth,
+                      width: _panelWidth,
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onHorizontalDragEnd: (d) {
+                          final vx = d.velocity.pixelsPerSecond.dx;
+                          if (vx > 200 && _minimapOpen) {
+                            setState(() => _minimapOpen = false);
+                          }
+                        },
+                        child: Center(
+                          child: RepaintBoundary(
+                            child: ValueListenableBuilder<int>(
+                              valueListenable: _miniTick,
+                              builder: (context, value, child) =>
+                                  Minimap(engine: _engine, size: 110),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    AnimatedPositioned(
+                      duration: const Duration(milliseconds: 260),
+                      curve: Curves.easeOutCubic,
+                      top: _minimapTop + 36,
+                      right: _minimapOpen ? _panelWidth : 0,
+                      child: _ChevronTab(
+                        open: _minimapOpen,
+                        onTap: () => setState(() => _minimapOpen = !_minimapOpen),
+                      ),
                     ),
                   ],
-                );
-              },
-            ),
-          ),
 
-          // Death overlay
-          if (_engine.gameOver)
-            Positioned.fill(
-              child: DeathScreen(
-                highestMass: _engine.humanPlayer.highestMass,
-                timeSurvived: _engine.timeSurvived,
-                eatenCount: _engine.humanPlayer.eatenCount,
-                rank: _engine.humanRank,
-                onPlayAgain: _playAgain,
-                onMainMenu: _exitToMenu,
+                  // === Below minimap: leaderboard with slide ===
+                  AnimatedPositioned(
+                    duration: const Duration(milliseconds: 260),
+                    curve: Curves.easeOutCubic,
+                    top: GameSettings.instance.showMinimap ? _leaderboardTop : 12,
+                    right: _leaderboardOpen ? 0 : -_panelWidth,
+                    width: _panelWidth,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onHorizontalDragEnd: (d) {
+                        final vx = d.velocity.pixelsPerSecond.dx;
+                        if (vx > 200 && _leaderboardOpen) {
+                          setState(() => _leaderboardOpen = false);
+                        }
+                      },
+                      child: RepaintBoundary(
+                        child: ValueListenableBuilder<int>(
+                          valueListenable: _hudTick,
+                          builder: (context, value, child) =>
+                              LiveLeaderboard(engine: _engine),
+                        ),
+                      ),
+                    ),
+                  ),
+                  AnimatedPositioned(
+                    duration: const Duration(milliseconds: 260),
+                    curve: Curves.easeOutCubic,
+                    top: (GameSettings.instance.showMinimap ? _leaderboardTop : 12) + 30,
+                    right: _leaderboardOpen ? _panelWidth : 0,
+                    child: _ChevronTab(
+                      open: _leaderboardOpen,
+                      onTap: () =>
+                          setState(() => _leaderboardOpen = !_leaderboardOpen),
+                    ),
+                  ),
+
+                  // PC Mode Hint
+                  if (pcMode && !_engine.gameOver)
+                    Positioned(
+                      bottom: 20,
+                      left: 0,
+                      right: 0,
+                      child: IgnorePointer(
+                        child: Center(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.35),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Text(
+                              'PC Mode: Move with mouse • Split: Space • Feed: W',
+                              style: GoogleFonts.baloo2(
+                                color: Colors.white70,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  // ── Eject button — freely draggable ─────────────────────────
+                  if (!pcMode)
+                    ValueListenableBuilder<Offset>(
+                      valueListenable: _ejectPos,
+                      builder: (context, pos, _) {
+                        final half = 30.0 * btnScale;
+                        return Positioned(
+                          left: pos.dx * size.width - half,
+                          top: pos.dy * size.height - half,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onLongPressStart: (_) =>
+                                setState(() => _draggingEject = true),
+                            onLongPressMoveUpdate: (d) {
+                              final newPos = Offset(
+                                (d.globalPosition.dx / size.width).clamp(0.04, 0.96),
+                                (d.globalPosition.dy / size.height).clamp(0.04, 0.96),
+                              );
+                              _ejectPos.value = newPos;
+                              GameSettings.instance.ejectBtnFrac = newPos;
+                            },
+                            onLongPressEnd: (_) =>
+                                setState(() => _draggingEject = false),
+                            child: Stack(
+                              clipBehavior: Clip.none,
+                              children: [
+                                // Drag-mode glow ring
+                                if (_draggingEject)
+                                  Positioned.fill(
+                                    child: IgnorePointer(
+                                      child: Container(
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          border: Border.all(
+                                              color: Colors.yellowAccent, width: 3),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: Colors.yellowAccent
+                                                  .withValues(alpha: 0.45),
+                                              blurRadius: 18,
+                                              spreadRadius: 4,
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ValueListenableBuilder<int>(
+                                  valueListenable: _hudTick,
+                                  builder: (ctx, tick, child) => GameButton(
+                                    onPressStart: _startEjectHold,
+                                    onPressEnd: _endEjectHold,
+                                    color: const Color(0xFFFF7A2F),
+                                    size: 60 * btnScale,
+                                    enabled: _engine.canEject && !_draggingEject,
+                                    hint: _draggingEject ? 'hold & drag' : null,
+                                    builder: (_) => const EjectIcon(),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+
+                  // ── Split button — freely draggable ─────────────────────────
+                  if (!pcMode)
+                    ValueListenableBuilder<Offset>(
+                      valueListenable: _splitPos,
+                      builder: (context, pos, _) {
+                        final half = 35.0 * btnScale;
+                        return Positioned(
+                          left: pos.dx * size.width - half,
+                          top: pos.dy * size.height - half,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onLongPressStart: (_) =>
+                                setState(() => _draggingSplit = true),
+                            onLongPressMoveUpdate: (d) {
+                              final newPos = Offset(
+                                (d.globalPosition.dx / size.width).clamp(0.04, 0.96),
+                                (d.globalPosition.dy / size.height).clamp(0.04, 0.96),
+                              );
+                              _splitPos.value = newPos;
+                              GameSettings.instance.splitBtnFrac = newPos;
+                            },
+                            onLongPressEnd: (_) =>
+                                setState(() => _draggingSplit = false),
+                            child: Stack(
+                              clipBehavior: Clip.none,
+                              children: [
+                                // Drag-mode glow ring
+                                if (_draggingSplit)
+                                  Positioned.fill(
+                                    child: IgnorePointer(
+                                      child: Container(
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          border: Border.all(
+                                              color: Colors.yellowAccent, width: 3),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: Colors.yellowAccent
+                                                  .withValues(alpha: 0.45),
+                                              blurRadius: 18,
+                                              spreadRadius: 4,
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ValueListenableBuilder<int>(
+                                  valueListenable: _hudTick,
+                                  builder: (ctx, tick, child) => GameButton(
+                                    onTap: _onSplitTap,
+                                    color: const Color(0xFF3DA5F5),
+                                    size: 70 * btnScale,
+                                    enabled: _engine.canSplit && !_draggingSplit,
+                                    hint: _draggingSplit ? 'hold & drag' : null,
+                                    builder: (_) => const SplitIcon(),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+
+                  // Death overlay
+                  if (_engine.gameOver)
+                    Positioned.fill(
+                      child: DeathScreen(
+                        highestMass: _engine.humanPlayer.highestMass,
+                        timeSurvived: _engine.timeSurvived,
+                        eatenCount: _engine.humanPlayer.eatenCount,
+                        rank: _engine.humanRank,
+                        onPlayAgain: _playAgain,
+                        onMainMenu: _exitToMenu,
+                      ),
+                    ),
+                ],
               ),
             ),
-        ],
-      ),
+          ),
+        );
+      },
     );
   }
 

@@ -1,10 +1,12 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show AssetManifest, rootBundle;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../models/boost.dart';
 import '../models/match_history_entry.dart';
 import '../models/player_stats.dart';
 import '../models/profile.dart';
+import '../models/skin.dart';
 
 class MatchSubmitResult {
   MatchSubmitResult({
@@ -20,6 +22,7 @@ class MatchSubmitResult {
     required this.levelUpDnaEarned,
     required this.levelsGained,
     required this.leveledUp,
+    required this.newlyUnlockedSkins,
   });
 
   final int level;
@@ -34,8 +37,16 @@ class MatchSubmitResult {
   final int levelUpDnaEarned;
   final int levelsGained;
   final bool leveledUp;
+  final List<UnlockedSkin> newlyUnlockedSkins;
 
   factory MatchSubmitResult.fromJson(Map<String, dynamic> json) {
+    final raw = json['newly_unlocked_skins'];
+    final unlocks = <UnlockedSkin>[];
+    if (raw is List) {
+      for (final r in raw) {
+        if (r is Map) unlocks.add(UnlockedSkin.fromJson(r.cast<String, dynamic>()));
+      }
+    }
     return MatchSubmitResult(
       level: (json['level'] as num?)?.toInt() ?? 1,
       xp: (json['xp'] as num?)?.toInt() ?? 0,
@@ -51,8 +62,15 @@ class MatchSubmitResult {
           (json['level_up_dna_earned'] as num?)?.toInt() ?? 0,
       levelsGained: (json['levels_gained'] as num?)?.toInt() ?? 0,
       leveledUp: json['leveled_up'] as bool? ?? false,
+      newlyUnlockedSkins: unlocks,
     );
   }
+}
+
+class PlayerSkinsPayload {
+  PlayerSkinsPayload({required this.skins, required this.equippedKey});
+  final List<Skin> skins;
+  final String? equippedKey;
 }
 
 class ProfileService {
@@ -61,9 +79,7 @@ class ProfileService {
 
   final SupabaseClient _c = Supabase.instance.client;
 
-  /// Fetch the user's profile row. If the signup trigger hasn't run for some
-  /// reason (legacy account, missed event), upsert a default row so the rest
-  /// of the app has data to render.
+  // ---------------------------------------------------- profile / stats
   Future<Profile> fetchOrCreateProfile(User user) async {
     try {
       final row = await _c
@@ -71,18 +87,11 @@ class ProfileService {
           .select()
           .eq('id', user.id)
           .maybeSingle();
-      if (row != null) {
-        return Profile.fromJson(row);
-      }
+      if (row != null) return Profile.fromJson(row);
     } catch (e) {
       debugPrint('profile fetch failed, attempting upsert: $e');
     }
 
-    // Server-side default — created fresh, no leftover state from anywhere.
-    // CRITICAL: never overwrite an existing row. We try INSERT first, and
-    // if the unique-id check fires we fall through to a plain SELECT. This
-    // guarantees the new-user starter (200 coins, 50 DNA) is applied only
-    // on first creation; existing players keep their current balances.
     try {
       final inserted = await _c
           .from('profiles')
@@ -102,8 +111,6 @@ class ProfileService {
       } catch (_) {}
       return Profile.fromJson(inserted);
     } catch (_) {
-      // Likely a race: the row exists now (the auth trigger beat us). Just
-      // read it as-is and preserve every existing value.
       final row = await _c
           .from('profiles')
           .select()
@@ -167,68 +174,188 @@ class ProfileService {
   }
 
   // ----------------------------------------------------------- boosts
-  Future<List<BoostDefinition>> listBoostDefinitions() async {
-    final rows =
-        await _c.from('boost_definitions').select().order('price_coins');
-    return (rows as List)
-        .cast<Map<String, dynamic>>()
-        .map(BoostDefinition.fromJson)
-        .toList();
-  }
-
-  /// Owned (and historical) boosts for the current user. Status can be
-  /// 'owned', 'active', 'expired', 'used'.
-  Future<List<PlayerBoost>> listOwnedBoosts() async {
-    final user = _c.auth.currentUser;
-    if (user == null) return [];
-    final rows = await _c
-        .from('player_boosts')
-        .select('*, boost_definitions(*)')
-        .eq('user_id', user.id)
-        .order('purchased_at', ascending: false);
-    return (rows as List)
-        .cast<Map<String, dynamic>>()
-        .map(PlayerBoost.fromJson)
-        .toList();
-  }
-
-  /// Server-validated active boosts. The RPC auto-expires stale rows on
-  /// every call so the returned list is always trustworthy.
-  Future<List<PlayerBoost>> getActiveBoosts() async {
+  /// Boost catalogue + per-player owned quantity + active expiry, all in one
+  /// server-validated call (auto-expires stale rows server-side).
+  Future<List<BoostInventoryEntry>> getBoostInventory() async {
     try {
-      final raw = await _c.rpc('get_active_boosts');
+      final raw = await _c.rpc('get_boost_inventory');
       if (raw is List) {
         return raw
             .cast<Map<String, dynamic>>()
-            .map(PlayerBoost.fromJson)
+            .map(BoostInventoryEntry.fromJson)
             .toList();
       }
     } catch (e) {
-      debugPrint('get_active_boosts failed: $e');
+      debugPrint('get_boost_inventory failed: $e');
     }
     return [];
   }
 
-  /// Returns the new player_boost id + updated coin/dna totals.
-  /// Throws on insufficient currency or unknown key — caller should surface
-  /// the error message to the user.
   Future<Map<String, dynamic>> buyBoost(String key) async {
     final raw = await _c.rpc('buy_boost', params: {'p_key': key});
     if (raw is Map) return raw.cast<String, dynamic>();
     throw Exception('Unexpected response from buy_boost');
   }
 
-  Future<Map<String, dynamic>> activateBoost(String playerBoostId) async {
-    final raw = await _c.rpc(
-      'activate_boost',
-      params: {'p_player_boost_id': playerBoostId},
-    );
+  Future<Map<String, dynamic>> activateBoost(String key) async {
+    final raw = await _c.rpc('activate_boost', params: {'p_key': key});
     if (raw is Map) return raw.cast<String, dynamic>();
     throw Exception('Unexpected response from activate_boost');
   }
 
-  /// Call the server-side RPC that calculates rewards atomically. The
-  /// frontend cannot directly modify coins/DNA/XP — this is the only path.
+  /// Returns `{mass_multiplier, xp_multiplier, mass_expires_at, xp_expires_at}`.
+  Future<Map<String, dynamic>> getMatchStartModifiers() async {
+    try {
+      final raw = await _c.rpc('get_match_start_modifiers');
+      if (raw is Map) return raw.cast<String, dynamic>();
+    } catch (e) {
+      debugPrint('get_match_start_modifiers failed: $e');
+    }
+    return {'mass_multiplier': 1.0, 'xp_multiplier': 1.0};
+  }
+
+  // ------------------------------------------------------------- skins
+  /// Scan the asset manifest, compute deterministic prices/levels, and push
+  /// the catalogue to Supabase. Idempotent — safe to call on every launch.
+  Future<void> syncSkinCatalogueFromAssets() async {
+    final manifest = await AssetManifest.loadFromAssetBundle(rootBundle);
+    final all = manifest.listAssets();
+
+    bool isImg(String p) {
+      final s = p.toLowerCase();
+      return s.endsWith('.png') ||
+          s.endsWith('.jpg') ||
+          s.endsWith('.jpeg') ||
+          s.endsWith('.webp');
+    }
+
+    List<String> pick(String prefix) =>
+        all.where((p) => p.startsWith(prefix) && isImg(p)).toList()..sort();
+
+    final levels = pick('assets/skins/level/');
+    final premiums = pick('assets/skins/premium/');
+    final frees = pick('assets/skins/free/');
+
+    final items = <Map<String, dynamic>>[];
+
+    // Level skins: unlock every 5 levels starting at 5, capped at 150.
+    for (int i = 0; i < levels.length; i++) {
+      final unlockLvl = ((i + 1) * 5).clamp(5, 150);
+      items.add({
+        'key': _keyOf(levels[i]),
+        'name': _nameOf(levels[i]),
+        'category': 'level',
+        'image_path': levels[i],
+        'unlock_level': unlockLvl,
+        'price_coins': 0,
+        'sort_order': i,
+      });
+    }
+
+    // Premium skins: 50 → 9999 ascending by filename.
+    if (premiums.isNotEmpty) {
+      final n = premiums.length;
+      for (int i = 0; i < n; i++) {
+        final t = n == 1 ? 0.0 : i / (n - 1);
+        final price = (50 + t * (9999 - 50)).round();
+        items.add({
+          'key': _keyOf(premiums[i]),
+          'name': _nameOf(premiums[i]),
+          'category': 'premium',
+          'image_path': premiums[i],
+          'unlock_level': 0,
+          'price_coins': price,
+          'sort_order': i,
+        });
+      }
+    }
+
+    // Free skins: owned by everyone.
+    for (int i = 0; i < frees.length; i++) {
+      items.add({
+        'key': _keyOf(frees[i]),
+        'name': _nameOf(frees[i]),
+        'category': 'free',
+        'image_path': frees[i],
+        'unlock_level': 0,
+        'price_coins': 0,
+        'sort_order': i,
+      });
+    }
+
+    if (items.isEmpty) return;
+    try {
+      await _c.rpc('sync_skin_catalogue', params: {'p_items': items});
+    } catch (e) {
+      debugPrint('sync_skin_catalogue failed: $e');
+    }
+  }
+
+  String _keyOf(String path) {
+    // `assets/skins/level/foo_bar.png` → `level/foo_bar`
+    final s = path.replaceFirst('assets/skins/', '');
+    final dot = s.lastIndexOf('.');
+    return dot > 0 ? s.substring(0, dot) : s;
+  }
+
+  String _nameOf(String path) {
+    final file = path.split('/').last;
+    final dot = file.lastIndexOf('.');
+    final stem = dot > 0 ? file.substring(0, dot) : file;
+    return stem.replaceAll(RegExp(r'^skin_\d+_'), '').replaceAll('_', ' ');
+  }
+
+  Future<PlayerSkinsPayload> getPlayerSkins() async {
+    try {
+      final raw = await _c.rpc('get_player_skins');
+      if (raw is Map) {
+        final map = raw.cast<String, dynamic>();
+        final list = map['skins'];
+        final skins = <Skin>[];
+        if (list is List) {
+          for (final r in list) {
+            if (r is Map) skins.add(Skin.fromJson(r.cast<String, dynamic>()));
+          }
+        }
+        return PlayerSkinsPayload(
+          skins: skins,
+          equippedKey: map['equipped_key'] as String?,
+        );
+      }
+    } catch (e) {
+      debugPrint('get_player_skins failed: $e');
+    }
+    return PlayerSkinsPayload(skins: [], equippedKey: null);
+  }
+
+  Future<Map<String, dynamic>> buyPremiumSkin(String key) async {
+    final raw = await _c.rpc('buy_premium_skin', params: {'p_key': key});
+    if (raw is Map) return raw.cast<String, dynamic>();
+    throw Exception('Unexpected response from buy_premium_skin');
+  }
+
+  Future<Map<String, dynamic>> equipSkin(String key) async {
+    final raw = await _c.rpc('equip_skin', params: {'p_key': key});
+    if (raw is Map) return raw.cast<String, dynamic>();
+    throw Exception('Unexpected response from equip_skin');
+  }
+
+  Future<List<UnlockedSkin>> claimLevelSkins() async {
+    try {
+      final raw = await _c.rpc('claim_level_skins');
+      if (raw is List) {
+        return raw
+            .cast<Map<String, dynamic>>()
+            .map(UnlockedSkin.fromJson)
+            .toList();
+      }
+    } catch (e) {
+      debugPrint('claim_level_skins failed: $e');
+    }
+    return [];
+  }
+
+  // ------------------------------------------------------ submit match
   Future<MatchSubmitResult?> submitMatchResult({
     required int score,
     required int massCollected,
@@ -246,9 +373,7 @@ class ProfileService {
         'p_survival_seconds': survivalSeconds,
         'p_rank': rank,
       });
-      if (raw is Map<String, dynamic>) {
-        return MatchSubmitResult.fromJson(raw);
-      }
+      if (raw is Map) return MatchSubmitResult.fromJson(raw.cast<String, dynamic>());
       if (raw is List && raw.isNotEmpty && raw.first is Map) {
         return MatchSubmitResult.fromJson(
             (raw.first as Map).cast<String, dynamic>());

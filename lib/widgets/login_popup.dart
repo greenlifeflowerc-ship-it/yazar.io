@@ -1,12 +1,11 @@
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../services/auth_service.dart';
 
-enum _Step { email, code }
+enum _Mode { signIn, signUp }
 
 class LoginPopup extends StatefulWidget {
   const LoginPopup({super.key, this.dismissible = true});
@@ -40,28 +39,30 @@ class LoginPopup extends StatefulWidget {
 
 class _LoginPopupState extends State<LoginPopup> {
   final _emailCtl = TextEditingController();
-  final _codeCtl = TextEditingController();
-  final _formKey = GlobalKey<FormState>();
-  _Step _step = _Step.email;
+  final _pwdCtl = TextEditingController();
+  _Mode _mode = _Mode.signIn;
   bool _busy = false;
+  bool _hidePwd = true;
   String? _error;
   String? _info;
 
   @override
   void dispose() {
     _emailCtl.dispose();
-    _codeCtl.dispose();
+    _pwdCtl.dispose();
     super.dispose();
   }
 
-  bool _isValidEmail(String s) {
-    final v = s.trim();
-    return RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(v);
-  }
+  bool _isValidEmail(String s) =>
+      RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(s.trim());
 
-  Future<void> _sendCode() async {
+  Future<void> _submit() async {
     if (!_isValidEmail(_emailCtl.text)) {
       setState(() => _error = 'Enter a valid email');
+      return;
+    }
+    if (_pwdCtl.text.length < 6) {
+      setState(() => _error = 'Password must be at least 6 characters');
       return;
     }
     setState(() {
@@ -70,34 +71,37 @@ class _LoginPopupState extends State<LoginPopup> {
       _info = null;
     });
     try {
-      await AuthService.instance.sendLoginCode(_emailCtl.text);
-      setState(() {
-        _step = _Step.code;
-        _info = 'Code sent. Check your inbox.';
-      });
-    } catch (e) {
-      setState(() => _error = _humanError(e));
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _verifyCode() async {
-    final code = _codeCtl.text.trim();
-    if (code.length < 4) {
-      setState(() => _error = 'Enter the code from your email');
-      return;
-    }
-    setState(() {
-      _busy = true;
-      _error = null;
-    });
-    try {
-      await AuthService.instance.verifyLoginCode(
-        email: _emailCtl.text,
-        code: code,
-      );
-      if (mounted) Navigator.of(context).pop(true);
+      if (_mode == _Mode.signIn) {
+        final ok = await AuthService.instance.signInWithPassword(
+          email: _emailCtl.text,
+          password: _pwdCtl.text,
+        );
+        if (!mounted) return;
+        if (ok) {
+          Navigator.of(context).pop(true);
+          return;
+        }
+        // Edge case: session null but no exception — usually means email
+        // not yet confirmed.
+        setState(() =>
+            _error = 'Email not confirmed yet. Check your inbox.');
+      } else {
+        final ok = await AuthService.instance.signUp(
+          email: _emailCtl.text,
+          password: _pwdCtl.text,
+        );
+        if (!mounted) return;
+        if (ok) {
+          Navigator.of(context).pop(true);
+          return;
+        }
+        // Confirmation email path.
+        setState(() {
+          _info =
+              'Account created. Check ${_emailCtl.text} to confirm, then sign in.';
+          _mode = _Mode.signIn;
+        });
+      }
     } catch (e) {
       setState(() => _error = _humanError(e));
     } finally {
@@ -107,26 +111,40 @@ class _LoginPopupState extends State<LoginPopup> {
 
   String _humanError(Object e) {
     final s = e.toString();
-    if (s.contains('Invalid login credentials')) return 'Invalid code.';
-    if (s.contains('Email rate limit')) return 'Too many tries — wait a minute.';
-    if (s.contains('Invalid OTP') || s.contains('token has expired')) {
-      return 'Code is wrong or expired.';
+    if (s.contains('Invalid login credentials')) {
+      return 'Wrong email or password.';
     }
-    return s.replaceAll('Exception: ', '').replaceAll('AuthException: ', '');
+    if (s.contains('User already registered') ||
+        s.contains('user_already_exists')) {
+      return 'An account with that email already exists. Try signing in.';
+    }
+    if (s.contains('Email not confirmed')) {
+      return 'Email not confirmed yet. Check your inbox.';
+    }
+    if (s.contains('Password should be at least')) {
+      return 'Password must be at least 6 characters.';
+    }
+    if (s.contains('rate limit') ||
+        s.contains('over_email_send_rate_limit')) {
+      return 'Too many requests, please wait a minute.';
+    }
+    return s
+        .replaceAll('Exception: ', '')
+        .replaceAll('AuthException: ', '')
+        .replaceAll('AuthApiException(message: ', '')
+        .replaceAll(RegExp(r', statusCode:.*$'), '');
   }
 
   @override
   Widget build(BuildContext context) {
-    // showGeneralDialog gives no Material ancestor, but the TextField below
-    // requires one for ink/text rendering. A transparent Material satisfies
-    // it without altering the glass look.
     return Material(
       type: MaterialType.transparency,
       child: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 460),
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 18),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 24, vertical: 18),
             child: ClipRRect(
               borderRadius: BorderRadius.circular(22),
               child: BackdropFilter(
@@ -159,27 +177,35 @@ class _LoginPopupState extends State<LoginPopup> {
   }
 
   Widget _form() {
-    return Form(
-      key: _formKey,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _header(),
-          const SizedBox(height: 14),
-          if (_step == _Step.email) ..._emailFields() else ..._codeFields(),
-          if (_error != null) ...[
-            const SizedBox(height: 10),
-            _bar(_error!, const Color(0xFFFF4D5E), Icons.error_outline),
-          ],
-          if (_info != null && _error == null) ...[
-            const SizedBox(height: 10),
-            _bar(_info!, const Color(0xFF34C924), Icons.check_circle_outline),
-          ],
-          const SizedBox(height: 14),
-          _primaryButton(),
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _header(),
+        const SizedBox(height: 12),
+        _modeTabs(),
+        const SizedBox(height: 12),
+        _label('Email'),
+        _input(
+          controller: _emailCtl,
+          hint: 'you@example.com',
+          keyboardType: TextInputType.emailAddress,
+          autofill: const [AutofillHints.email],
+        ),
+        const SizedBox(height: 10),
+        _label('Password'),
+        _passwordField(),
+        if (_error != null) ...[
+          const SizedBox(height: 10),
+          _bar(_error!, const Color(0xFFFF4D5E), Icons.error_outline),
         ],
-      ),
+        if (_info != null && _error == null) ...[
+          const SizedBox(height: 10),
+          _bar(_info!, const Color(0xFF34C924), Icons.check_circle_outline),
+        ],
+        const SizedBox(height: 14),
+        _primaryButton(),
+      ],
     );
   }
 
@@ -201,7 +227,8 @@ class _LoginPopupState extends State<LoginPopup> {
               ),
             ],
           ),
-          child: const Icon(Icons.shield_moon, color: Colors.white, size: 20),
+          child:
+              const Icon(Icons.shield_moon, color: Colors.white, size: 20),
         ),
         const SizedBox(width: 12),
         Expanded(
@@ -219,9 +246,9 @@ class _LoginPopupState extends State<LoginPopup> {
                 ),
               ),
               Text(
-                _step == _Step.email
-                    ? 'Sign in with email to keep your coins, DNA, XP, level, skins and achievements.'
-                    : 'We sent a 6-digit code to ${_emailCtl.text}. Enter it below.',
+                _mode == _Mode.signIn
+                    ? 'Sign in with email + password to keep your coins, DNA, XP, level, skins, boosts and achievements.'
+                    : 'Create an account to save your coins, DNA, XP, level, boosts, skins and match history.',
                 style: GoogleFonts.baloo2(
                   color: Colors.white.withValues(alpha: 0.72),
                   fontSize: 12,
@@ -234,8 +261,8 @@ class _LoginPopupState extends State<LoginPopup> {
         if (widget.dismissible)
           IconButton(
             onPressed: _busy ? null : () => Navigator.of(context).pop(),
-            icon:
-                const Icon(Icons.close, color: Colors.white70, size: 20),
+            icon: const Icon(Icons.close,
+                color: Colors.white70, size: 20),
             padding: EdgeInsets.zero,
             constraints: const BoxConstraints(),
           ),
@@ -243,51 +270,65 @@ class _LoginPopupState extends State<LoginPopup> {
     );
   }
 
-  List<Widget> _emailFields() {
-    return [
-      _label('Email'),
-      _input(
-        controller: _emailCtl,
-        hint: 'you@example.com',
-        keyboardType: TextInputType.emailAddress,
-        autofillHints: const [AutofillHints.email],
+  Widget _modeTabs() {
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+            color: Colors.white.withValues(alpha: 0.10), width: 1),
       ),
-    ];
+      child: Row(
+        children: [
+          _tab('SIGN IN', _mode == _Mode.signIn,
+              () => _setMode(_Mode.signIn)),
+          _tab('SIGN UP', _mode == _Mode.signUp,
+              () => _setMode(_Mode.signUp)),
+        ],
+      ),
+    );
   }
 
-  List<Widget> _codeFields() {
-    return [
-      _label('Login Code'),
-      _input(
-        controller: _codeCtl,
-        hint: '6-digit code',
-        keyboardType: TextInputType.number,
-        inputFormatters: [
-          FilteringTextInputFormatter.digitsOnly,
-          LengthLimitingTextInputFormatter(6),
-        ],
-        autofillHints: const [AutofillHints.oneTimeCode],
-      ),
-      const SizedBox(height: 4),
-      TextButton(
-        onPressed: _busy
-            ? null
-            : () => setState(() {
-                  _step = _Step.email;
-                  _error = null;
-                  _info = null;
-                  _codeCtl.clear();
-                }),
-        child: Text(
-          'Change email',
-          style: GoogleFonts.baloo2(
-            color: const Color(0xFF1E9BFF),
-            fontSize: 12,
-            fontWeight: FontWeight.w800,
+  Widget _tab(String label, bool selected, VoidCallback onTap) {
+    return Expanded(
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: _busy ? null : onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          height: 32,
+          decoration: BoxDecoration(
+            gradient: selected
+                ? const LinearGradient(colors: [
+                    Color(0xFFA63CFF),
+                    Color(0xFF1E9BFF),
+                  ])
+                : null,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            label,
+            style: GoogleFonts.baloo2(
+              color: selected ? Colors.white : Colors.white70,
+              fontSize: 12,
+              fontWeight: FontWeight.w900,
+              letterSpacing: 1.2,
+            ),
           ),
         ),
       ),
-    ];
+    );
+  }
+
+  void _setMode(_Mode m) {
+    if (_busy || _mode == m) return;
+    setState(() {
+      _mode = m;
+      _error = null;
+      _info = null;
+    });
   }
 
   Widget _label(String text) => Padding(
@@ -307,8 +348,7 @@ class _LoginPopupState extends State<LoginPopup> {
     required TextEditingController controller,
     required String hint,
     TextInputType? keyboardType,
-    List<TextInputFormatter>? inputFormatters,
-    Iterable<String>? autofillHints,
+    Iterable<String>? autofill,
   }) {
     return Container(
       decoration: BoxDecoration(
@@ -320,8 +360,7 @@ class _LoginPopupState extends State<LoginPopup> {
       child: TextField(
         controller: controller,
         keyboardType: keyboardType,
-        inputFormatters: inputFormatters,
-        autofillHints: autofillHints,
+        autofillHints: autofill,
         enabled: !_busy,
         style: GoogleFonts.baloo2(
           color: Colors.white,
@@ -340,6 +379,62 @@ class _LoginPopupState extends State<LoginPopup> {
           ),
           border: InputBorder.none,
         ),
+      ),
+    );
+  }
+
+  Widget _passwordField() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+            color: Colors.white.withValues(alpha: 0.15), width: 1),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _pwdCtl,
+              obscureText: _hidePwd,
+              enabled: !_busy,
+              autofillHints: _mode == _Mode.signIn
+                  ? const [AutofillHints.password]
+                  : const [AutofillHints.newPassword],
+              style: GoogleFonts.baloo2(
+                color: Colors.white,
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+              ),
+              decoration: InputDecoration(
+                isCollapsed: true,
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                hintText: _mode == _Mode.signIn
+                    ? 'Your password'
+                    : 'At least 6 characters',
+                hintStyle: GoogleFonts.baloo2(
+                  color: Colors.white30,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                ),
+                border: InputBorder.none,
+              ),
+              onSubmitted: (_) => _submit(),
+            ),
+          ),
+          IconButton(
+            tooltip: _hidePwd ? 'Show password' : 'Hide password',
+            onPressed: _busy
+                ? null
+                : () => setState(() => _hidePwd = !_hidePwd),
+            icon: Icon(
+              _hidePwd ? Icons.visibility_off : Icons.visibility,
+              color: Colors.white54,
+              size: 18,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -372,9 +467,9 @@ class _LoginPopupState extends State<LoginPopup> {
   }
 
   Widget _primaryButton() {
-    final label = _step == _Step.email ? 'SEND LOGIN LINK' : 'VERIFY & SIGN IN';
+    final label = _mode == _Mode.signIn ? 'SIGN IN' : 'CREATE ACCOUNT';
     return GestureDetector(
-      onTap: _busy ? null : (_step == _Step.email ? _sendCode : _verifyCode),
+      onTap: _busy ? null : _submit,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 160),
         height: 50,
@@ -395,8 +490,7 @@ class _LoginPopupState extends State<LoginPopup> {
               ? []
               : [
                   BoxShadow(
-                    color:
-                        const Color(0xFF1E9BFF).withValues(alpha: 0.45),
+                    color: const Color(0xFF1E9BFF).withValues(alpha: 0.45),
                     blurRadius: 18,
                     offset: const Offset(0, 6),
                   ),

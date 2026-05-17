@@ -4,9 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 
-import 'dart:async';
-
-import '../models/boost.dart';
 import '../models/match_history_entry.dart';
 import '../models/player_stats.dart';
 import '../models/profile.dart';
@@ -14,27 +11,21 @@ import '../services/auth_service.dart';
 import '../services/profile_service.dart';
 
 class ProfileScreen extends StatefulWidget {
-  const ProfileScreen({super.key});
+  const ProfileScreen({super.key, this.initialTab = 0});
+  final int initialTab;
 
   @override
   State<ProfileScreen> createState() => _ProfileScreenState();
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
-  int _tab = 0;
+  late int _tab = widget.initialTab.clamp(0, 4);
 
   // Tab data caches
   PlayerStats? _stats;
   List<MatchHistoryEntry>? _history;
   List<Map<String, dynamic>>? _inventory;
   List<Map<String, dynamic>>? _achievements;
-
-  // Boost state
-  List<BoostDefinition>? _boostStore;
-  List<PlayerBoost>? _ownedBoosts;
-  bool _loadingBoosts = false;
-  String? _boostBusyId; // id of an in-flight buy/activate
-  Timer? _countdownTimer; // ticks once a second to refresh the countdown UI
 
   bool _loadingStats = false;
   bool _loadingHistory = false;
@@ -47,18 +38,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
   void initState() {
     super.initState();
     _loadAll();
-    AuthService.instance.refreshActiveBoosts();
-    // 1Hz tick to update the countdown text without rebuilding the whole
-    // screen.
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
-    });
-  }
-
-  @override
-  void dispose() {
-    _countdownTimer?.cancel();
-    super.dispose();
   }
 
   Future<void> _loadAll() async {
@@ -66,73 +45,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _loadHistory();
     _loadInventory();
     _loadAchievements();
-    _loadBoosts();
-  }
-
-  Future<void> _loadBoosts() async {
-    setState(() => _loadingBoosts = true);
-    try {
-      final defs = await ProfileService.instance.listBoostDefinitions();
-      final owned = await ProfileService.instance.listOwnedBoosts();
-      if (!mounted) return;
-      setState(() {
-        _boostStore = defs;
-        _ownedBoosts = owned;
-      });
-    } catch (_) {
-      if (mounted) {
-        setState(() {
-          _boostStore = null;
-          _ownedBoosts = null;
-        });
-      }
-    }
-    if (mounted) setState(() => _loadingBoosts = false);
-  }
-
-  Future<void> _buyBoost(BoostDefinition def) async {
-    if (_boostBusyId != null) return;
-    setState(() => _boostBusyId = def.id);
-    try {
-      await ProfileService.instance.buyBoost(def.key);
-      await AuthService.instance.refreshProfile();
-      await _loadBoosts();
-    } catch (e) {
-      _toast(_humanError(e));
-    }
-    if (mounted) setState(() => _boostBusyId = null);
-  }
-
-  Future<void> _activateBoost(PlayerBoost pb) async {
-    if (_boostBusyId != null) return;
-    setState(() => _boostBusyId = pb.id);
-    try {
-      await ProfileService.instance.activateBoost(pb.id);
-      await AuthService.instance.refreshActiveBoosts();
-      await _loadBoosts();
-    } catch (e) {
-      _toast(_humanError(e));
-    }
-    if (mounted) setState(() => _boostBusyId = null);
-  }
-
-  String _humanError(Object e) {
-    final s = e.toString();
-    if (s.contains('Not enough Coins')) return 'Not enough Coins.';
-    if (s.contains('Not enough DNA')) return 'Not enough DNA.';
-    if (s.contains('already active')) return 'A boost of this type is already active.';
-    return s.replaceAll('Exception: ', '').replaceAll('PostgrestException: ', '');
-  }
-
-  void _toast(String msg) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        backgroundColor: const Color(0xFF1B1247),
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 2),
-      ),
-    );
   }
 
   Future<void> _loadStats() async {
@@ -355,10 +267,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 ),
                 const SizedBox(height: 6),
                 _xpBar(profile),
-                if (AuthService.instance.activeBoosts.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  _activeBoostStrip(),
-                ],
               ],
             ),
           ),
@@ -377,69 +285,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
         ],
       ),
     );
-  }
-
-  Widget _activeBoostStrip() {
-    final boosts = AuthService.instance.activeBoosts;
-    return Wrap(
-      spacing: 6,
-      runSpacing: 6,
-      children: [
-        for (final b in boosts) _activeBoostBadge(b),
-      ],
-    );
-  }
-
-  Widget _activeBoostBadge(PlayerBoost b) {
-    final color = b.isMass
-        ? const Color(0xFFFF6A00)
-        : const Color(0xFF00C8E0);
-    final icon = b.isMass ? Icons.fitness_center : Icons.bolt;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(colors: [
-          color.withValues(alpha: 0.30),
-          color.withValues(alpha: 0.10),
-        ]),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withValues(alpha: 0.6), width: 1),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, color: color, size: 12),
-          const SizedBox(width: 4),
-          Text(
-            '${b.multiplier.toStringAsFixed(b.multiplier % 1 == 0 ? 0 : 1)}× ${b.isMass ? 'MASS' : 'XP'}',
-            style: GoogleFonts.baloo2(
-              color: Colors.white,
-              fontSize: 10,
-              fontWeight: FontWeight.w900,
-              letterSpacing: 0.8,
-            ),
-          ),
-          const SizedBox(width: 6),
-          Text(
-            _formatCountdown(b.remaining),
-            style: GoogleFonts.baloo2(
-              color: Colors.white70,
-              fontSize: 10,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  static String _formatCountdown(Duration d) {
-    if (d.inSeconds <= 0) return '00:00';
-    final h = d.inHours;
-    final m = d.inMinutes.remainder(60);
-    final s = d.inSeconds.remainder(60);
-    if (h > 0) return '${h}h ${m.toString().padLeft(2, '0')}m';
-    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 
   Widget _avatar(Profile? profile) {
@@ -581,7 +426,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
 
   // ----------------------------------------------------------------- tabs
   Widget _tabBar() {
-    const labels = ['Overview', 'Stats', 'Boosts', 'Inventory', 'Achievements', 'History'];
+    const labels = ['Overview', 'Stats', 'Inventory', 'Achievements', 'History'];
     return SizedBox(
       height: 36,
       child: Row(
@@ -635,12 +480,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
       case 1:
         return _statsTab();
       case 2:
-        return _boostsTab();
-      case 3:
         return _inventoryTab();
-      case 4:
+      case 3:
         return _achievementsTab();
-      case 5:
+      case 4:
         return _historyTab();
     }
     return const SizedBox.shrink();
@@ -711,368 +554,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
         ),
       ),
     );
-  }
-
-  // ------------------------------------------------------------- boosts tab
-  Widget _boostsTab() {
-    if (_loadingBoosts && _boostStore == null) return _loading();
-    final store = _boostStore ?? const <BoostDefinition>[];
-    final owned = (_ownedBoosts ?? const <PlayerBoost>[])
-        .where((b) => b.status == 'owned')
-        .toList();
-    final active = AuthService.instance.activeBoosts;
-
-    return SingleChildScrollView(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // -------- active ----------------------------------------------
-          if (active.isNotEmpty) ...[
-            _sectionTitle('ACTIVE'),
-            const SizedBox(height: 8),
-            for (final b in active) _activeBoostCard(b),
-            const SizedBox(height: 14),
-          ],
-
-          // -------- owned -----------------------------------------------
-          _sectionTitle('OWNED'),
-          const SizedBox(height: 8),
-          if (owned.isEmpty)
-            _emptyInline('No owned boosts yet. Buy one below.')
-          else
-            for (final b in owned) _ownedBoostCard(b),
-          const SizedBox(height: 14),
-
-          // -------- store ----------------------------------------------
-          _sectionTitle('STORE'),
-          const SizedBox(height: 8),
-          if (store.isEmpty)
-            _emptyInline('No boosts available right now.')
-          else
-            for (final def in store) _storeBoostCard(def),
-        ],
-      ),
-    );
-  }
-
-  Widget _activeBoostCard(PlayerBoost b) {
-    final color = b.isMass
-        ? const Color(0xFFFF6A00)
-        : const Color(0xFF00C8E0);
-    return Container(
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(colors: [
-          color.withValues(alpha: 0.22),
-          color.withValues(alpha: 0.06),
-        ]),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: color.withValues(alpha: 0.5), width: 1),
-      ),
-      child: Row(
-        children: [
-          _boostIcon(b.type, color, big: true),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  '${_mult(b.multiplier)}× ${b.isMass ? 'Mass Boost' : 'XP Boost'}',
-                  style: GoogleFonts.baloo2(
-                    color: Colors.white,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-                Text(
-                  'Ends in ${_formatCountdown(b.remaining)}',
-                  style: GoogleFonts.baloo2(
-                    color: Colors.white70,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 0.4),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Text(
-              'ACTIVE',
-              style: GoogleFonts.baloo2(
-                color: Colors.white,
-                fontSize: 10,
-                fontWeight: FontWeight.w900,
-                letterSpacing: 1,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _ownedBoostCard(PlayerBoost b) {
-    final color = b.isMass
-        ? const Color(0xFFFF6A00)
-        : const Color(0xFF00C8E0);
-    final hasSameTypeActive = AuthService.instance.activeBoosts
-        .any((a) => a.type == b.type);
-    final busy = _boostBusyId == b.id;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.05),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-            color: Colors.white.withValues(alpha: 0.10), width: 1),
-      ),
-      child: Row(
-        children: [
-          _boostIcon(b.type, color),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  '${_mult(b.multiplier)}× ${b.isMass ? 'Mass Boost' : 'XP Boost'}',
-                  style: GoogleFonts.baloo2(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-                Text(
-                  'Duration: ${_durationLabel(b.durationSeconds)}',
-                  style: GoogleFonts.baloo2(
-                    color: Colors.white60,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          _smallButton(
-            label: hasSameTypeActive ? 'LOCKED' : 'ACTIVATE',
-            enabled: !hasSameTypeActive && !busy,
-            busy: busy,
-            color: color,
-            onTap: () => _activateBoost(b),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _storeBoostCard(BoostDefinition def) {
-    final color = def.isMass
-        ? const Color(0xFFFF6A00)
-        : const Color(0xFF00C8E0);
-    final coins = AuthService.instance.profile?.coins ?? 0;
-    final dna = AuthService.instance.profile?.dna ?? 0;
-    final affordable = def.priceCoins > 0
-        ? coins >= def.priceCoins
-        : dna >= def.priceDna;
-    final busy = _boostBusyId == def.id;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.05),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-            color: Colors.white.withValues(alpha: 0.10), width: 1),
-      ),
-      child: Row(
-        children: [
-          _boostIcon(def.type, color),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  '${_mult(def.multiplier)}× ${def.isMass ? 'Mass Boost' : 'XP Boost'}',
-                  style: GoogleFonts.baloo2(
-                    color: Colors.white,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-                Text(
-                  _durationLabel(def.durationSeconds),
-                  style: GoogleFonts.baloo2(
-                    color: Colors.white60,
-                    fontSize: 11,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          _pricePill(def),
-          const SizedBox(width: 8),
-          _smallButton(
-            label: 'BUY',
-            enabled: affordable && !busy,
-            busy: busy,
-            color: color,
-            onTap: () => _buyBoost(def),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _pricePill(BoostDefinition def) {
-    final isDna = def.priceDna > 0;
-    final value = isDna ? def.priceDna : def.priceCoins;
-    final color = isDna ? const Color(0xFFFFD60A) : const Color(0xFF34C924);
-    final icon = isDna ? Icons.bubble_chart : Icons.monetization_on;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.25),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: color.withValues(alpha: 0.4), width: 1),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, color: color, size: 14),
-          const SizedBox(width: 4),
-          Text(
-            _fmt.format(value),
-            style: GoogleFonts.baloo2(
-              color: Colors.white,
-              fontSize: 11,
-              fontWeight: FontWeight.w900,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _boostIcon(String type, Color color, {bool big = false}) {
-    final size = big ? 40.0 : 32.0;
-    return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(
-        gradient: LinearGradient(colors: [
-          color.withValues(alpha: 0.9),
-          color.withValues(alpha: 0.55),
-        ]),
-        shape: BoxShape.circle,
-        boxShadow: [
-          BoxShadow(
-            color: color.withValues(alpha: 0.45),
-            blurRadius: 12,
-          ),
-        ],
-      ),
-      child: Icon(
-        type == 'mass' ? Icons.fitness_center : Icons.bolt,
-        color: Colors.white,
-        size: big ? 22 : 18,
-      ),
-    );
-  }
-
-  Widget _smallButton({
-    required String label,
-    required bool enabled,
-    required bool busy,
-    required Color color,
-    required VoidCallback onTap,
-  }) {
-    return GestureDetector(
-      onTap: enabled ? onTap : null,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 140),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          gradient: enabled
-              ? LinearGradient(colors: [
-                  color,
-                  color.withValues(alpha: 0.7),
-                ])
-              : const LinearGradient(
-                  colors: [Color(0xFF555575), Color(0xFF3F3F5C)]),
-          borderRadius: BorderRadius.circular(10),
-          boxShadow: enabled
-              ? [
-                  BoxShadow(
-                    color: color.withValues(alpha: 0.4),
-                    blurRadius: 10,
-                  ),
-                ]
-              : null,
-        ),
-        child: busy
-            ? const SizedBox(
-                width: 14,
-                height: 14,
-                child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  valueColor:
-                      AlwaysStoppedAnimation<Color>(Colors.white),
-                ),
-              )
-            : Text(
-                label,
-                style: GoogleFonts.baloo2(
-                  color: Colors.white,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w900,
-                  letterSpacing: 1,
-                ),
-              ),
-      ),
-    );
-  }
-
-  Widget _emptyInline(String msg) => Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.04),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-              color: Colors.white.withValues(alpha: 0.08), width: 1),
-        ),
-        child: Text(
-          msg,
-          style: GoogleFonts.baloo2(
-            color: Colors.white60,
-            fontSize: 11,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-      );
-
-  static String _mult(double m) =>
-      m % 1 == 0 ? m.toStringAsFixed(0) : m.toStringAsFixed(1);
-
-  static String _durationLabel(int seconds) {
-    if (seconds >= 3600) {
-      final h = seconds / 3600;
-      return h == h.toInt() ? '${h.toInt()} hour${h == 1 ? '' : 's'}' : '${h.toStringAsFixed(1)}h';
-    }
-    final m = (seconds / 60).round();
-    return '$m min';
   }
 
   Widget _inventoryTab() {

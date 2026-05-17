@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../game/game_settings.dart';
+
 class AppColors {
   AppColors._();
 
@@ -48,4 +50,27 @@ class AppColors {
     Color(0xFFFF2D87), // pink
     Color(0xFF00C8E0), // cyan
   ];
+
+  // ── Dark-mode adaptive getters ──────────────────────────────────────────
+  static bool get isDark => GameSettings.instance.darkMode;
+
+  /// Main screen scaffold background.
+  static Color get screenBg =>
+      isDark ? const Color(0xFF0D0D1A) : background;
+
+  /// Card/panel background.
+  static Color get cardBg =>
+      isDark ? const Color(0xFF171730) : Colors.white;
+
+  /// Primary text.
+  static Color get primaryText =>
+      isDark ? Colors.white : textDark;
+
+  /// Secondary / muted text.
+  static Color get secondaryText =>
+      isDark ? const Color(0xFFAAAAAA) : textMuted;
+
+  /// Card border.
+  static Color get cardBorderColor =>
+      isDark ? const Color(0xFF252550) : cardBorder;
 }

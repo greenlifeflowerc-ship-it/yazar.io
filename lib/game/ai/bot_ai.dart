@@ -99,4 +99,66 @@ class BotAI {
     final mag = dir.distance;
     return mag > 0 ? dir / mag : Offset.zero;
   }
+
+  /// Returns true if this bot should split now toward its current target.
+  bool decideSplit({
+    required Offset center,
+    required double mass,
+    required String ownerId,
+    required int cellCount,
+    required SpatialGrid<Cell> cellGrid,
+  }) {
+    if (cellCount >= 8) return false; // don't over-split
+    if (mass < 70) return false;      // need enough mass to split usefully
+
+    final myRadius = sqrt(mass / pi) * 10;
+    final near = cellGrid.queryRadius(center, 700);
+    for (final c in near) {
+      if (c.ownerId == ownerId) continue;
+      final dist = (c.position - center).distance;
+      // Prey is edible, in split-reach range (1.1x–2.6x radius), not already inside eating range.
+      if (mass > c.mass * 1.35 &&
+          dist > myRadius * 1.1 &&
+          dist < myRadius * 2.6) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Returns true if this bot should eject toward the current aim direction.
+  /// Bots eject to feed a nearby virus in order to split a large enemy.
+  bool decideEject({
+    required Offset center,
+    required double mass,
+    required String ownerId,
+    required SpatialGrid<Cell> cellGrid,
+    required SpatialGrid<Virus> virusGrid,
+    required Offset aimDir,
+  }) {
+    if (mass < 140) return false; // only big bots eject
+
+    // Is there a large dangerous enemy nearby that we can't eat?
+    bool hasLargeEnemy = false;
+    final nearby = cellGrid.queryRadius(center, 500);
+    for (final c in nearby) {
+      if (c.ownerId == ownerId) continue;
+      if (c.mass > mass * 1.4) {
+        hasLargeEnemy = true;
+        break;
+      }
+    }
+    if (!hasLargeEnemy) return false;
+
+    // Is there a virus roughly in the aim direction within 400 units?
+    final viruses = virusGrid.queryRadius(center, 400);
+    for (final v in viruses) {
+      final d = v.position - center;
+      final mag = d.distance;
+      if (mag < 20) continue;
+      final aligned = (d / mag).dx * aimDir.dx + (d / mag).dy * aimDir.dy;
+      if (aligned > 0.5) return true; // virus is roughly in front
+    }
+    return false;
+  }
 }

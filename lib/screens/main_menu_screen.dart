@@ -5,8 +5,13 @@ import '../utils/app_colors.dart';
 import '../widgets/background_painter.dart';
 import '../widgets/currency_display.dart';
 import '../widgets/main_action_button.dart';
+import 'dart:async';
+
 import '../game/skin_settings.dart';
+import '../models/boost.dart';
 import '../services/auth_service.dart';
+import '../widgets/boost_panel.dart';
+import '../widgets/level_up_popup.dart';
 import '../widgets/login_popup.dart';
 import '../widgets/menu_icon_button.dart';
 import '../widgets/shop_button.dart';
@@ -40,7 +45,26 @@ class _MainMenuScreenState extends State<MainMenuScreen> {
     // Refresh boost state (auto-expires stale rows on the server) every time
     // we land on the main menu.
     AuthService.instance.refreshActiveBoosts();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _maybeShowLoginPopup());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _maybeShowLoginPopup();
+      _maybeShowLevelUp();
+    });
+  }
+
+  /// Pull any pending level-up payload (queued by the game screen after
+  /// submit_match_result) and show the popup. Runs every time we land on the
+  /// main menu, but is a no-op when there's nothing to show.
+  Future<void> _maybeShowLevelUp() async {
+    final r = AuthService.instance.consumePendingLevelUp();
+    if (r == null || !mounted) return;
+    await LevelUpPopup.show(
+      context,
+      newLevel: r.level,
+      levelsGained: r.levelsGained,
+      coinsAwarded: r.levelUpCoinsEarned,
+      dnaAwarded: r.levelUpDnaEarned,
+      unlockedSkins: r.newlyUnlockedSkins,
+    );
   }
 
   void _onAuthChanged() {
@@ -53,6 +77,11 @@ class _MainMenuScreenState extends State<MainMenuScreen> {
         username.isNotEmpty &&
         _nicknameController.text.isEmpty) {
       _nicknameController.text = username;
+    }
+    // If a level-up was queued while we were not the active route (e.g. game
+    // screen submitted), show it now.
+    if (AuthService.instance.pendingLevelUp != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _maybeShowLevelUp());
     }
   }
 
@@ -198,135 +227,47 @@ class _MainMenuScreenState extends State<MainMenuScreen> {
       top: 0,
       bottom: 0,
       child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            _boostTile(
-              icon: Icons.star,
-              color: AppColors.starYellow,
-              shadowColor: AppColors.starYellowShadow,
-              count: '3X',
-              label: '763',
-              onTap: () => debugPrint('Level boost pressed'),
-            ),
-            const SizedBox(height: 10),
-            _boostTile(
-              icon: Icons.bolt,
-              color: AppColors.massPurple,
-              shadowColor: AppColors.massPurpleShadow,
-              count: '2X',
-              label: '35',
-              showM: true,
-              onTap: () => debugPrint('Mass boost pressed'),
-            ),
-          ],
+        // Both tiles are wired to AuthService so the multiplier badge +
+        // countdown appear/disappear as boosts activate and expire.
+        child: AnimatedBuilder(
+          animation: AuthService.instance,
+          builder: (context, _) => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _MenuBoostTile(
+                kind: _BoostKind.xp,
+                activeBoost: AuthService.instance.activeXpBoost,
+                ownedQuantity: _ownedTotal('xp'),
+                onTap: () => _openBoostPanel(context, 'xp'),
+              ),
+              const SizedBox(height: 14),
+              _MenuBoostTile(
+                kind: _BoostKind.mass,
+                activeBoost: AuthService.instance.activeMassBoost,
+                ownedQuantity: _ownedTotal('mass'),
+                onTap: () => _openBoostPanel(context, 'mass'),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
-  Widget _boostTile({
-    required IconData icon,
-    required Color color,
-    required Color shadowColor,
-    required String count,
-    required String label,
-    bool showM = false,
-    required VoidCallback onTap,
-  }) {
-    return GestureDetector(
-      onTap: onTap,
-      child: SizedBox(
-        width: 56,
-        height: 56,
-        child: Stack(
-          clipBehavior: Clip.none,
-          children: [
-            Positioned(
-              left: 0,
-              right: 0,
-              top: 4,
-              bottom: 0,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: shadowColor,
-                  borderRadius: BorderRadius.circular(14),
-                ),
-              ),
-            ),
-            Positioned(
-              left: 0,
-              right: 0,
-              top: 0,
-              bottom: 4,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: color,
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: Center(
-                  child: showM
-                      ? Text(
-                          'M',
-                          style: GoogleFonts.baloo2(
-                            color: Colors.white,
-                            fontSize: 28,
-                            fontWeight: FontWeight.w900,
-                            height: 1,
-                          ),
-                        )
-                      : Icon(icon, color: Colors.white, size: 28),
-                ),
-              ),
-            ),
-            Positioned(
-              right: -6,
-              top: -6,
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: AppColors.classicOrange,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.white, width: 1.5),
-                ),
-                child: Text(
-                  count,
-                  style: GoogleFonts.baloo2(
-                    color: Colors.white,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w900,
-                    height: 1,
-                  ),
-                ),
-              ),
-            ),
-            Positioned(
-              left: -2,
-              bottom: -8,
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: AppColors.cardBorder, width: 1.2),
-                ),
-                child: Text(
-                  label,
-                  style: GoogleFonts.baloo2(
-                    color: AppColors.textDark,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w800,
-                    height: 1,
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+  int _ownedTotal(String type) {
+    var n = 0;
+    for (final e in AuthService.instance.boostInventory) {
+      if (e.def.type == type) n += e.quantity;
+    }
+    return n;
+  }
+
+  void _openBoostPanel(BuildContext context, String type) {
+    if (AuthService.instance.isLoggedIn) {
+      BoostPanel.show(context, type);
+    } else {
+      LoginPopup.show(context, dismissible: true);
+    }
   }
 
   Widget _center(double titleSize, double buttonWidth, double buttonHeight) {
@@ -524,5 +465,243 @@ class _MainMenuScreenState extends State<MainMenuScreen> {
         ],
       ),
     );
+  }
+}
+
+enum _BoostKind { xp, mass }
+
+/// Left-middle menu tile that doubles as a live boost indicator.
+///
+/// When no boost is active it renders as the original gold star / purple "M"
+/// chip — no multiplier badge, no timer.
+/// When a boost IS active it gets a corner multiplier badge ("2X" / "3X")
+/// and a small countdown pill sitting OUTSIDE the icon (below it).
+class _MenuBoostTile extends StatefulWidget {
+  const _MenuBoostTile({
+    required this.kind,
+    required this.activeBoost,
+    required this.ownedQuantity,
+    required this.onTap,
+  });
+
+  final _BoostKind kind;
+  final PlayerBoost? activeBoost;
+  final int ownedQuantity;
+  final VoidCallback onTap;
+
+  @override
+  State<_MenuBoostTile> createState() => _MenuBoostTileState();
+}
+
+class _MenuBoostTileState extends State<_MenuBoostTile> {
+  Timer? _ticker;
+
+  @override
+  void initState() {
+    super.initState();
+    _restartTicker();
+  }
+
+  @override
+  void didUpdateWidget(covariant _MenuBoostTile old) {
+    super.didUpdateWidget(old);
+    if (widget.activeBoost?.id != old.activeBoost?.id) _restartTicker();
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  void _restartTicker() {
+    _ticker?.cancel();
+    if (widget.activeBoost == null) return;
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final boost = widget.activeBoost;
+    final isXp = widget.kind == _BoostKind.xp;
+    final color = isXp ? AppColors.starYellow : AppColors.massPurple;
+    final shadow =
+        isXp ? AppColors.starYellowShadow : AppColors.massPurpleShadow;
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: widget.onTap,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 52,
+            height: 52,
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                // 3D shadow under the tile.
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  top: 4,
+                  bottom: 0,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: shadow,
+                      borderRadius: BorderRadius.circular(13),
+                    ),
+                  ),
+                ),
+                // Tile face.
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  top: 0,
+                  bottom: 4,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: color,
+                      borderRadius: BorderRadius.circular(13),
+                      // Soft outer glow while a boost of this type is live.
+                      boxShadow: boost != null
+                          ? [
+                              BoxShadow(
+                                color: color.withValues(alpha: 0.6),
+                                blurRadius: 14,
+                                spreadRadius: 1,
+                              ),
+                            ]
+                          : null,
+                    ),
+                    child: Center(
+                      child: isXp
+                          ? const Icon(Icons.star,
+                              color: Colors.white, size: 26)
+                          : Text(
+                              'M',
+                              style: GoogleFonts.baloo2(
+                                color: Colors.white,
+                                fontSize: 26,
+                                fontWeight: FontWeight.w900,
+                                height: 1,
+                              ),
+                            ),
+                    ),
+                  ),
+                ),
+                // Multiplier corner badge — only when a boost is active.
+                if (boost != null)
+                  Positioned(
+                    right: -6,
+                    top: -6,
+                    child: _multBadge(boost.multiplier),
+                  ),
+                // Owned-quantity badge bottom-left when player has SKUs but
+                // none is active. Helps the player see they actually have
+                // boosts to spend.
+                if (boost == null && widget.ownedQuantity > 0)
+                  Positioned(
+                    left: -6,
+                    bottom: 0,
+                    child: _qtyBadge(widget.ownedQuantity),
+                  ),
+              ],
+            ),
+          ),
+          // Countdown pill — sits outside/below the tile, only when active.
+          if (boost != null) ...[
+            const SizedBox(height: 5),
+            _countdownPill(boost.remaining),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _multBadge(double m) {
+    final txt = m % 1 == 0 ? m.toStringAsFixed(0) : m.toStringAsFixed(1);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFFFFC107), Color(0xFFFF6A00)],
+        ),
+        borderRadius: BorderRadius.circular(7),
+        border: Border.all(color: Colors.white, width: 1.5),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFFFF6A00).withValues(alpha: 0.45),
+            blurRadius: 6,
+          ),
+        ],
+      ),
+      child: Text(
+        '${txt}X',
+        style: GoogleFonts.baloo2(
+          color: Colors.white,
+          fontSize: 10,
+          fontWeight: FontWeight.w900,
+          height: 1,
+          letterSpacing: 0.3,
+        ),
+      ),
+    );
+  }
+
+  Widget _qtyBadge(int qty) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.7),
+        borderRadius: BorderRadius.circular(7),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.4), width: 1),
+      ),
+      child: Text(
+        '×$qty',
+        style: GoogleFonts.baloo2(
+          color: Colors.white,
+          fontSize: 10,
+          fontWeight: FontWeight.w900,
+          height: 1,
+        ),
+      ),
+    );
+  }
+
+  Widget _countdownPill(Duration d) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+            color: Colors.white.withValues(alpha: 0.15), width: 1),
+      ),
+      child: Text(
+        _formatRemaining(d),
+        style: GoogleFonts.baloo2(
+          color: Colors.white,
+          fontSize: 10,
+          fontWeight: FontWeight.w900,
+          height: 1,
+          letterSpacing: 0.5,
+        ),
+      ),
+    );
+  }
+
+  static String _formatRemaining(Duration d) {
+    final secs = d.inSeconds.clamp(0, 1 << 30);
+    if (secs >= 3600) {
+      final h = d.inHours;
+      final m = d.inMinutes.remainder(60);
+      return '${h}h ${m.toString().padLeft(2, '0')}m';
+    }
+    final m = d.inMinutes;
+    final s = d.inSeconds.remainder(60);
+    return '${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 }

@@ -3,7 +3,11 @@
     "allow": [
       "Bash(flutter pub *)",
       "Bash(flutter analyze *)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(git -C \"C:/Users/green/AndroidStudioProjects/agarioyz\" remote -v)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }

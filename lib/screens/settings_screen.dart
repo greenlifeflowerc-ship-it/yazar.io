@@ -18,7 +18,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: AppColors.background,
+      backgroundColor: AppColors.screenBg,
       body: SafeArea(
         child: Stack(
           children: [
@@ -43,6 +43,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                   _backgroundSection(),
                                   const SizedBox(height: 10),
                                   _displaySection(),
+                                  const SizedBox(height: 10),
+                                  _performanceSection(),
+                                  const SizedBox(height: 10),
+                                  _themeSection(),
                                 ],
                               ),
                             ),
@@ -52,6 +56,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                 crossAxisAlignment: CrossAxisAlignment.stretch,
                                 children: [
                                   _gameplaySection(),
+                                  const SizedBox(height: 10),
+                                  _controlsSection(),
                                   const SizedBox(height: 10),
                                   _resetButton(),
                                 ],
@@ -84,7 +90,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         Text(
           'SETTINGS',
           style: GoogleFonts.baloo2(
-            color: AppColors.textDark,
+            color: AppColors.primaryText,
             fontSize: 28,
             fontWeight: FontWeight.w900,
             letterSpacing: 1.5,
@@ -98,9 +104,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Container(
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: AppColors.cardBg,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppColors.cardBorder, width: 1.5),
+        border: Border.all(color: AppColors.cardBorderColor, width: 1.5),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withValues(alpha: 0.06),
@@ -116,7 +122,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           Text(
             title,
             style: GoogleFonts.baloo2(
-              color: AppColors.textDark,
+              color: AppColors.primaryText,
               fontSize: 13,
               fontWeight: FontWeight.w900,
               letterSpacing: 1.2,
@@ -195,15 +201,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _sliderRow(
             'Zoom',
             _s.zoomMultiplier,
-            min: 0.5,
-            max: 2.0,
+            min: 0.2,
+            max: 10.0,
             onChanged: (v) => _s.zoomMultiplier = v,
+          ),
+          _sliderRow(
+            'Eject distance',
+            _s.ejectDistanceMultiplier,
+            min: 0.5,
+            max: 2.5,
+            onChanged: (v) => _s.ejectDistanceMultiplier = v,
+          ),
+          _sliderRow(
+            'Feed speed',
+            _s.feedSpeedMultiplier,
+            min: 0.5,
+            max: 100.0,
+            onChanged: (v) => _s.feedSpeedMultiplier = v,
           ),
           _sliderRow(
             'Eject speed',
             _s.ejectSpeedMultiplier,
             min: 0.5,
-            max: 2.0,
+            max: 2.5,
             onChanged: (v) => _s.ejectSpeedMultiplier = v,
           ),
           _toggleRow(
@@ -225,7 +245,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Text(
               label,
               style: GoogleFonts.baloo2(
-                color: AppColors.textDark,
+                color: AppColors.primaryText,
                 fontSize: 13,
                 fontWeight: FontWeight.w700,
               ),
@@ -263,7 +283,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 child: Text(
                   label,
                   style: GoogleFonts.baloo2(
-                    color: AppColors.textDark,
+                    color: AppColors.primaryText,
                     fontSize: 13,
                     fontWeight: FontWeight.w700,
                   ),
@@ -293,6 +313,139 @@ class _SettingsScreenState extends State<SettingsScreen> {
               max: max,
               value: value.clamp(min, max),
               onChanged: onChanged,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _controlsSection() {
+    return _card(
+      title: 'CONTROLS',
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _sliderRow(
+            'Button size',
+            _s.buttonScale,
+            min: 0.6,
+            max: 1.5,
+            onChanged: (v) => _s.buttonScale = v,
+          ),
+          _toggleRow(
+            'Joystick on right',
+            _s.joystickOnRight,
+            (v) => _s.joystickOnRight = v,
+          ),
+          _toggleRow(
+            'PC Mode',
+            _s.pcMode,
+            (v) => _s.pcMode = v,
+          ),
+          if (_s.pcMode)
+            Padding(
+              padding: const EdgeInsets.only(left: 4, bottom: 4),
+              child: Text(
+                'Use mouse movement with Space to split and W to feed.',
+                style: GoogleFonts.baloo2(
+                  color: AppColors.textMuted,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _themeSection() {
+    return _card(
+      title: 'THEME',
+      child: _toggleRow(
+        'Night mode',
+        _s.darkMode,
+        (v) => _s.darkMode = v,
+      ),
+    );
+  }
+
+  Widget _performanceSection() {
+    return _card(
+      title: 'PERFORMANCE',
+      child: Column(
+        children: [
+          _segmentedRow<int>(
+            'Quality',
+            _s.graphicsQuality,
+            {0: 'Low', 1: 'Med', 2: 'High'},
+            (v) => _s.graphicsQuality = v!,
+          ),
+          const SizedBox(height: 8),
+          _segmentedRow<int>(
+            'FPS Cap',
+            _s.fpsCap,
+            {60: '60', 90: '90', 120: '120'},
+            (v) => _s.fpsCap = v!,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _segmentedRow<T>(
+    String label,
+    T value,
+    Map<T, String> options,
+    ValueChanged<T?> onChanged,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            label,
+            style: GoogleFonts.baloo2(
+              color: AppColors.primaryText,
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Container(
+            height: 32,
+            decoration: BoxDecoration(
+              color: AppColors.cardBorder.withValues(alpha: 0.1),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(
+              children: options.entries.map((e) {
+                final isSelected = e.key == value;
+                return Expanded(
+                  child: GestureDetector(
+                    onTap: () => onChanged(e.key),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: isSelected ? AppColors.classicOrange : Colors.transparent,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Center(
+                        child: Text(
+                          e.value,
+                          style: GoogleFonts.baloo2(
+                            color: isSelected ? Colors.white : AppColors.primaryText,
+                            fontSize: 12,
+                            fontWeight: isSelected ? FontWeight.w900 : FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }).toList(),
             ),
           ),
         ],
