@@ -1,0 +1,41 @@
+# Check out the documentation at https://docs.codemagic.io/yaml/configuration/ for more details
+
+workflows:
+  ios-release:
+    name: iOS Release
+    instance_type: mac_mini_m1
+    max_build_duration: 60
+    environment:
+      flutter: stable
+      xcode: latest # or a specific version like 15.0
+      groups:
+        # Add your environment variables groups here (e.g. for App Store Connect API keys)
+        - app_store_credentials 
+    scripts:
+      - name: Set up code signing settings on Codemagic
+        script: | 
+          # This script is used if you have set up automatic code signing.
+          # If you haven't, you can build without code signing for testing.
+          # keychain initialize
+          # app-store-connect fetch-signing-files "YOUR_BUNDLE_ID" --type IOS_APP_STORE --create
+          # keychain add-certificates
+          # xcode-project use-profiles
+          echo "Setting up code signing..."
+      - name: Get Flutter packages
+        script: | 
+          flutter packages pub get
+      - name: Build Flutter iOS
+        script: | 
+          # To build a signed IPA, you need to configure code signing.
+          # For now, we build without signing to verify the build process.
+          flutter build ipa --release --no-codesign
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com # Update with your email
+        notify:
+          success: true
+          failure: true
