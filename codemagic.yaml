@@ -7,13 +7,6 @@ workflows:
       xcode: latest
       cocoapods: default
 
-      ios_signing:
-        distribution_type: ad_hoc
-        bundle_identifier: com.yazar.yazario
-
-    integrations:
-      app_store_connect: codemagic
-
     scripts:
       - name: Flutter Pub Get
         script: |
@@ -23,12 +16,16 @@ workflows:
       - name: Install Pods
         script: |
           cd ios
+          rm -rf Pods
+          rm -f Podfile.lock
+          pod deintegrate || true
           pod install --repo-update
           cd ..
 
       - name: Build IPA
         script: |
-          flutter build ipa --release
+          flutter build ipa --release --export-method ad-hoc
 
     artifacts:
       - build/ios/ipa/*.ipa
+      - build/ios/archive/*.xcarchive
