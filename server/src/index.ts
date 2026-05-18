@@ -16,14 +16,8 @@ import { WebSocketServer, WebSocket } from "ws";
 const PORT = Number(process.env.PORT ?? 2567);
 const MAP_W = 8000;
 const MAP_H = 8000;
-// 50 Hz tick = 20 ms simulation step. Matches the client's 20 ms input pump
-// and snapshot cadence, giving Agar.io-style real-time feel.
-const TICK_RATE = 50;
+const TICK_RATE = 30; // Hz — matched to the client's 30 Hz input pump.
 const TICK_MS = 1000 / TICK_RATE;
-// Snapshots go out every Nth tick. We keep pellets/viruses at half-rate
-// because they barely move — saves ~50% bandwidth without hurting feel.
-const SNAPSHOT_EVERY_N_TICKS = 1;            // 50 Hz state snapshots
-const SLOW_SNAPSHOT_EVERY_N_TICKS = 2;       // 25 Hz pellet/virus refresh
 
 const PELLET_TARGET = 900;
 const VIRUS_TARGET = 15;
@@ -439,10 +433,10 @@ function tryEatPellets(p: Player): void {
       const dx = pe.x - c.x, dy = pe.y - c.y;
       if (dx * dx + dy * dy < r2) {
         if (c.mass < MAX_MASS) c.mass += pe.mass;
-        // Respawn pellet elsewhere instead of removing — keeps array stable.
-        pe.x = rand(20, MAP_W - 20);
-        pe.y = rand(20, MAP_H - 20);
-        pe.color = pickColor();
+        // Replace with a brand-new pellet (new ID) so the client's local
+        // prediction can safely remove the eaten ID from its map without
+        // ever seeing the "teleporting pellet" flicker.
+        pellets[i] = spawnPellet();
       }
     }
   }
@@ -765,11 +759,7 @@ function buildLeaderboard(): LeaderboardEntry[] {
   return list.slice(0, LEADERBOARD_SIZE);
 }
 
-function sendSnapshotTo(
-  p: Player,
-  leaderboard: LeaderboardEntry[],
-  includeSlow: boolean,
-): void {
+function sendSnapshotTo(p: Player, leaderboard: LeaderboardEntry[]): void {
   if (p.isBot || !p.socket || p.socket.readyState !== WebSocket.OPEN) return;
   // Pick the viewer center: human's center of mass or world center if dead.
   let vx = MAP_W / 2, vy = MAP_H / 2;
@@ -807,37 +797,19 @@ function sendSnapshotTo(
     }
   }
 
-  // Pellets / viruses change rarely — only resend them on slow ticks.
-  // Ejected mass is fast-moving, so it always goes out.
-  let visiblePellets:
-    | Array<{ id: string; x: number; y: number; color: string }>
-    | undefined;
-  let visibleViruses: SnapshotEntity[] | undefined;
-  if (includeSlow) {
-    visiblePellets = [];
-    for (const pe of pellets) {
-      const dx = pe.x - vx, dy = pe.y - vy;
-      if (dx * dx + dy * dy > r2) continue;
-      visiblePellets.push({
-        id: pe.id,
-        x: Math.round(pe.x),
-        y: Math.round(pe.y),
-        color: pe.color,
-      });
-    }
-    visibleViruses = [];
-    for (const v of viruses) {
-      const dx = v.x - vx, dy = v.y - vy;
-      if (dx * dx + dy * dy > r2 * 1.2) continue;
-      visibleViruses.push({
-        id: v.id,
-        x: Math.round(v.x),
-        y: Math.round(v.y),
-        mass: v.mass,
-        radius: Math.round(radius(v.mass)),
-        color: v.color,
-      });
-    }
+  // Pellets are always mass=1, radius=6 — strip those redundant fields and
+  // let the client default them. Saves ~30 % on the per-pellet payload,
+  // which is the bulk of the snapshot.
+  const visiblePellets: Array<{ id: string; x: number; y: number; color: string }> = [];
+  for (const pe of pellets) {
+    const dx = pe.x - vx, dy = pe.y - vy;
+    if (dx * dx + dy * dy > r2) continue;
+    visiblePellets.push({
+      id: pe.id,
+      x: Math.round(pe.x),
+      y: Math.round(pe.y),
+      color: pe.color,
+    });
   }
 
   const visibleEjected: SnapshotEntity[] = [];
@@ -854,10 +826,24 @@ function sendSnapshotTo(
     });
   }
 
+  const visibleViruses: SnapshotEntity[] = [];
+  for (const v of viruses) {
+    const dx = v.x - vx, dy = v.y - vy;
+    if (dx * dx + dy * dy > r2 * 1.2) continue;
+    visibleViruses.push({
+      id: v.id,
+      x: Math.round(v.x),
+      y: Math.round(v.y),
+      mass: v.mass,
+      radius: Math.round(radius(v.mass)),
+      color: v.color,
+    });
+  }
+
   let selfMass = 0;
   if (!p.dead) for (const c of p.cells) selfMass += c.mass;
 
-  const payload: Record<string, unknown> = {
+  const payload = {
     type: "state",
     serverTime: Date.now(),
     self: {
@@ -868,14 +854,12 @@ function sendSnapshotTo(
       y: Math.round(vy),
     },
     players: cells,
+    pellets: visiblePellets,
+    viruses: visibleViruses,
     ejected: visibleEjected,
     leaderboard,
     online: [...players.values()].filter((q) => !q.isBot).length,
   };
-  // Pellets / viruses are only attached on slow ticks. Clients keep the last
-  // known list between updates.
-  if (visiblePellets) payload.pellets = visiblePellets;
-  if (visibleViruses) payload.viruses = visibleViruses;
   try {
     p.socket.send(JSON.stringify(payload));
   } catch {
@@ -885,12 +869,10 @@ function sendSnapshotTo(
 
 // ────────────────────────────────────────────────────────── main loop
 let last = Date.now();
-let tickCount = 0;
 setInterval(() => {
   const now = Date.now();
   const dt = clamp((now - last) / 1000, 0, 0.1);
   last = now;
-  tickCount++;
 
   // Bot decisions
   for (const p of players.values()) {
@@ -925,13 +907,8 @@ setInterval(() => {
   }
 
   const lb = buildLeaderboard();
-  // Fast snapshots = every tick (cells + ejected). Slow snapshots = every
-  // SLOW_SNAPSHOT_EVERY_N_TICKS ticks (pellets + viruses).
-  const sendSlow = tickCount % SLOW_SNAPSHOT_EVERY_N_TICKS === 0;
-  if (tickCount % SNAPSHOT_EVERY_N_TICKS === 0) {
-    for (const p of players.values()) {
-      if (!p.isBot) sendSnapshotTo(p, lb, sendSlow);
-    }
+  for (const p of players.values()) {
+    if (!p.isBot) sendSnapshotTo(p, lb);
   }
 
   // Stale human cleanup (>15 s without messages)
