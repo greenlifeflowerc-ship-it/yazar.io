@@ -21,23 +21,34 @@ class BotAI {
     required SpatialGrid<Virus> virusGrid,
     required Offset currentDir,
     required double worldSize,
+    bool Function(String otherOwnerId)? isAlly,
+    bool canHunt = true,
+    double aggression = 1.0,
   }) {
     Cell? biggestThreat;
     double threatDistSq = double.infinity;
     Cell? closestPrey;
     double preyDistSq = double.infinity;
 
-    // Increased search radius for threats and prey to make bots more aware.
-    final near = cellGrid.queryRadius(center, 900); // from 700
+    // Search radius scales mildly with aggression — more aggressive bots scan
+    // farther for prey.
+    final scanR = 900.0 * (1.0 + (aggression - 1.0) * 0.25);
+    final near = cellGrid.queryRadius(center, scanR);
     for (final c in near) {
       if (c.ownerId == ownerId) continue;
+      // Teams / role allies: skip for both threat and prey targeting.
+      if (isAlly != null && isAlly(c.ownerId)) continue;
       final dsq = (c.position - center).distanceSquared;
       // Bot is more cautious: considers threats farther away.
       if (c.mass > mass * 1.25 && dsq < 750 * 750 && dsq < threatDistSq) { // from 600*600
         biggestThreat = c;
         threatDistSq = dsq;
-        // More aggressive: hunts for prey farther away.
-      } else if (mass > c.mass * 1.25 && dsq < 700 * 700 && dsq < preyDistSq) { // from 500*500
+        // More aggressive bots hunt prey from farther away. canHunt=false
+        // (hider role) disables prey targeting entirely.
+      } else if (canHunt &&
+          mass > c.mass * 1.25 &&
+          dsq < (700 * aggression) * (700 * aggression) &&
+          dsq < preyDistSq) {
         closestPrey = c;
         preyDistSq = dsq;
       }
@@ -111,6 +122,7 @@ class BotAI {
     required String ownerId,
     required int cellCount,
     required SpatialGrid<Cell> cellGrid,
+    bool Function(String otherOwnerId)? isAlly,
   }) {
     if (cellCount >= 6) return false; // More conservative about over-splitting
     if (mass < 60) return false;      // Lowered mass requirement for splitting
@@ -119,6 +131,7 @@ class BotAI {
     final near = cellGrid.queryRadius(center, 800); // Increased search radius
     for (final c in near) {
       if (c.ownerId == ownerId) continue;
+      if (isAlly != null && isAlly(c.ownerId)) continue;
       final dist = (c.position - center).distance;
       // More aggressive split condition: will split for smaller advantages and at greater distances.
       if (mass > c.mass * 1.3 &&
@@ -139,6 +152,7 @@ class BotAI {
     required SpatialGrid<Cell> cellGrid,
     required SpatialGrid<Virus> virusGrid,
     required Offset aimDir,
+    bool Function(String otherOwnerId)? isAlly,
   }) {
     if (mass < 140) return false; // only big bots eject
 
@@ -148,6 +162,7 @@ class BotAI {
     final nearby = cellGrid.queryRadius(center, 600); // from 500
     for (final c in nearby) {
       if (c.ownerId == ownerId) continue;
+      if (isAlly != null && isAlly(c.ownerId)) continue;
       if (c.mass > mass * 1.4) {
         hasLargeEnemy = true;
         break;

@@ -7,6 +7,7 @@ import '../widgets/currency_display.dart';
 import '../widgets/main_action_button.dart';
 import 'dart:async';
 
+import '../game/game_mode_type.dart';
 import '../game/skin_settings.dart';
 import '../models/boost.dart';
 import '../services/auth_service.dart';
@@ -15,7 +16,9 @@ import '../widgets/level_up_popup.dart';
 import '../widgets/login_popup.dart';
 import '../widgets/menu_icon_button.dart';
 import '../widgets/shop_button.dart';
+import '../widgets/game_modes_dropdown.dart';
 import 'game_screen.dart';
+import 'online_classic_screen.dart';
 import 'profile_screen.dart';
 import 'settings_screen.dart';
 import 'skin_chooser_screen.dart';
@@ -37,6 +40,7 @@ class _MainMenuScreenState extends State<MainMenuScreen> {
   static const double _guestXpProgress = 0.0;
 
   bool _autoPopupShown = false;
+  bool _moreDropdownOpen = false;
 
   @override
   void initState() {
@@ -118,6 +122,66 @@ class _MainMenuScreenState extends State<MainMenuScreen> {
         builder: (_) => GameScreen(nickname: _nicknameController.text),
       ),
     );
+  }
+
+  void _onGameModeSelected(String modeId) {
+    debugPrint('Game mode selected: $modeId');
+    // Online Classic is the only mode that runs server-authoritative: it gets
+    // its own screen and bypasses the offline engine entirely.
+    if (modeId == 'online_classic') {
+      setState(() => _moreDropdownOpen = false);
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => OnlineClassicScreen(
+            nickname: _nicknameController.text,
+          ),
+        ),
+      );
+      return;
+    }
+    // Resolve the mode id (from the dropdown card) to an engine GameMode.
+    // Unmapped ids still no-op so other mode cards stay inert until wired up.
+    final mode = _modeForId(modeId);
+    if (mode == null) return;
+    // Collapse the dropdown so the menu doesn't sit open under the game.
+    setState(() => _moreDropdownOpen = false);
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GameScreen(
+          nickname: _nicknameController.text,
+          mode: mode,
+        ),
+      ),
+    );
+  }
+
+  GameMode? _modeForId(String modeId) {
+    switch (modeId) {
+      case 'teams':
+        return GameMode.teams;
+      case 'turbo':
+        return GameMode.turbo;
+      case 'battle_royale':
+        return GameMode.battleRoyale;
+      case 'zombie_infection':
+        return GameMode.zombieInfection;
+      case 'hardcore':
+        return GameMode.hardcore;
+      case 'ranked_arena':
+        return GameMode.rankedArena;
+      case 'coin_rush':
+        return GameMode.coinRush;
+      case 'black_hole':
+        return GameMode.blackHole;
+      case 'hide_seek':
+        return GameMode.hideSeek;
+      case 'chaos_mode':
+        return GameMode.chaosMode;
+      default:
+        return null;
+    }
   }
 
   @override
@@ -273,47 +337,56 @@ class _MainMenuScreenState extends State<MainMenuScreen> {
   Widget _center(double titleSize, double buttonWidth, double buttonHeight) {
     return Positioned.fill(
       child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              'YAZAR.IO',
-              style: GoogleFonts.baloo2(
-                color: AppColors.textDark,
-                fontSize: titleSize,
-                fontWeight: FontWeight.w900,
-                letterSpacing: 1.5,
-                height: 1,
-              ),
-            ),
-            const SizedBox(height: 14),
-            _nicknameRow(),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                MainActionButton(
-                  label: 'Classic',
-                  icon: Icons.play_arrow,
-                  color: AppColors.classicOrange,
-                  shadowColor: AppColors.classicOrangeShadow,
-                  width: buttonWidth,
-                  height: buttonHeight,
-                  onTap: _openGame,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'YAZAR.IO',
+                style: GoogleFonts.baloo2(
+                  color: AppColors.textDark,
+                  fontSize: titleSize,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 1.5,
+                  height: 1,
                 ),
-                const SizedBox(width: 16),
-                MainActionButton(
-                  label: 'More',
-                  icon: Icons.star,
-                  color: AppColors.moreBlue,
-                  shadowColor: AppColors.moreBlueShadow,
-                  width: buttonWidth,
-                  height: buttonHeight,
-                  onTap: () => debugPrint('More pressed'),
+              ),
+              const SizedBox(height: 14),
+              _nicknameRow(),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  MainActionButton(
+                    label: 'Classic',
+                    icon: Icons.play_arrow,
+                    color: AppColors.classicOrange,
+                    shadowColor: AppColors.classicOrangeShadow,
+                    width: buttonWidth,
+                    height: buttonHeight,
+                    onTap: _openGame,
+                  ),
+                  const SizedBox(width: 16),
+                  MainActionButton(
+                    label: 'More',
+                    icon: Icons.star,
+                    color: AppColors.moreBlue,
+                    shadowColor: AppColors.moreBlueShadow,
+                    width: buttonWidth,
+                    height: buttonHeight,
+                    onTap: () => setState(() => _moreDropdownOpen = !_moreDropdownOpen),
+                  ),
+                ],
+              ),
+              if (_moreDropdownOpen) ...[
+                const SizedBox(height: 16),
+                GameModesDropdown(
+                  isOpen: _moreDropdownOpen,
+                  onModeSelected: _onGameModeSelected,
                 ),
               ],
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

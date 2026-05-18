@@ -5,10 +5,14 @@ import 'package:flutter/material.dart';
 
 import '../services/auth_service.dart';
 import 'ai/bot_ai.dart';
+import 'chaos_events.dart';
+import 'entities/black_hole.dart';
 import 'entities/cell.dart';
+import 'entities/coin.dart';
 import 'entities/ejected_mass.dart';
 import 'entities/pellet.dart';
 import 'entities/virus.dart';
+import 'game_mode_type.dart';
 import 'game_settings.dart';
 import 'mechanics/eject_handler.dart';
 import 'mechanics/merge_handler.dart';
@@ -130,12 +134,18 @@ class Player {
     required this.name,
     required this.color,
     required this.isHuman,
+    this.team = Team.none,
+    this.role = PlayerRole.none,
   });
 
   final String id;
   final String name;
   Color color;
   final bool isHuman;
+  Team team;
+  PlayerRole role;
+  int coinScore = 0;
+  int rankedPoints = 0;
   final List<Cell> cells = [];
 
   /// Pre-decoded skin image used by the painter. Human pulls this from
@@ -214,6 +224,118 @@ class LeaderboardEntry {
 
 class GameEngine {
   GameEngine();
+
+  /// Active game mode for the running session. Set by [init].
+  GameMode mode = GameMode.classic;
+
+  /// Per-mode tunables resolved once in [init].
+  ModeConfig modeConfig = const ModeConfig();
+
+  /// Owner-id → team lookup, rebuilt on init. Empty when not in teams mode.
+  /// Kept as a hot map so collision/AI checks stay O(1).
+  final Map<String, Team> _teamByOwner = {};
+
+  // ── Mode-specific live state ──────────────────────────────────────────────
+  /// Coins on the field (Coin Rush only).
+  final List<Coin> coins = [];
+  final SpatialGrid<Coin> coinGrid = SpatialGrid<Coin>(300);
+
+  /// Black holes on the field (Black Hole mode only).
+  final List<BlackHole> blackHoles = [];
+
+  /// Battle Royale safe-zone state. Center stays at world center; radius
+  /// shrinks linearly from `initial` to `final` across the match timer.
+  double safeZoneRadius = GameConstants.worldSize;
+  final Offset safeZoneCenter =
+      const Offset(GameConstants.worldSize / 2, GameConstants.worldSize / 2);
+
+  /// Remaining match time in seconds (modes with timers). -1 = no timer.
+  double matchTimeRemaining = -1;
+
+  /// True once a winning condition has been met. The HUD reads this; the
+  /// engine itself just stops respawning, etc.
+  bool matchEnded = false;
+  String matchEndMessage = '';
+
+  /// Counts kept for HUD use, updated in collision phase.
+  int aliveBotCount = 0;
+  int aliveSurvivorCount = 0;
+  int aliveZombieCount = 0;
+  int aliveHiderCount = 0;
+  int aliveSeekerCount = 0;
+
+  /// Chaos scheduler state. Initialised lazily so non-chaos modes carry zero
+  /// overhead.
+  ChaosState? _chaos;
+  ChaosState? get chaos => _chaos;
+
+  bool get isTeamsMode => mode == GameMode.teams;
+
+  Team teamOf(String ownerId) =>
+      _teamByOwner[ownerId] ?? Team.none;
+
+  /// Role of the player owning [ownerId]. `PlayerRole.none` when unknown or
+  /// when the active mode doesn't use roles — cheap to call every frame.
+  PlayerRole roleOf(String ownerId) {
+    if (!modeConfig.zombieMode && !modeConfig.hideSeekMode) {
+      return PlayerRole.none;
+    }
+    for (final p in players) {
+      if (p.id == ownerId) return p.role;
+    }
+    return PlayerRole.none;
+  }
+
+  /// True when both owners are on the same non-none team. Always false in
+  /// non-teams modes — Classic stays identical.
+  bool isSameTeam(String ownerA, String ownerB) {
+    if (!isTeamsMode) return false;
+    final ta = _teamByOwner[ownerA];
+    if (ta == null || ta == Team.none) return false;
+    return ta == _teamByOwner[ownerB];
+  }
+
+  /// True if `eater` is allowed to consume `prey` under current mode rules.
+  /// Classic: always true. Teams: false for teammates. Zombie: zombies can't
+  /// eat zombies. Hide & Seek: only seekers can eat hiders (and vice versa
+  /// is blocked).
+  bool canEat(String eaterOwner, String preyOwner) {
+    if (eaterOwner == preyOwner) return false;
+    if (isSameTeam(eaterOwner, preyOwner)) return false;
+    if (modeConfig.zombieMode) {
+      final ea = _findOwner(eaterOwner);
+      final pr = _findOwner(preyOwner);
+      if (ea != null && pr != null) {
+        // Zombies don't infect other zombies (no eating between zombies).
+        if (ea.role == PlayerRole.zombie && pr.role == PlayerRole.zombie) {
+          return false;
+        }
+      }
+    }
+    if (modeConfig.hideSeekMode) {
+      final ea = _findOwner(eaterOwner);
+      final pr = _findOwner(preyOwner);
+      if (ea != null && pr != null) {
+        // Hiders cannot eat anyone (only collect pellets).
+        if (ea.role == PlayerRole.hider) return false;
+        // Seekers cannot eat seekers.
+        if (ea.role == PlayerRole.seeker && pr.role == PlayerRole.seeker) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /// Sum of every alive cell's mass for the given team.
+  double getTeamMass(Team team) {
+    double total = 0;
+    for (final p in players) {
+      if (p.team != team || p.isDead) continue;
+      total += p.totalMass;
+    }
+    return total;
+  }
 
   final Random _rng = Random();
   late final BotAI _ai = BotAI(_rng);
@@ -316,47 +438,143 @@ class GameEngine {
   }
 
   // ------------------------------------------------------------- lifecycle
-  void init({required String nickname}) {
+  void init({
+    required String nickname,
+    GameMode mode = GameMode.classic,
+  }) {
+    this.mode = mode;
+    modeConfig = ModeConfig.forMode(mode);
+    _teamByOwner.clear();
     players.clear();
     pellets.clear();
     viruses.clear();
     ejectedMasses.clear();
     particles.clear();
+    coins.clear();
+    coinGrid.clear();
+    blackHoles.clear();
     leaderboard.clear();
     elapsed = 0;
     gameOver = false;
+    matchEnded = false;
+    matchEndMessage = '';
+    matchTimeRemaining =
+        modeConfig.matchTimerSeconds?.toDouble() ?? -1;
+    safeZoneRadius = GameConstants.worldSize;
+    _chaos = modeConfig.chaosMode ? ChaosState(_rng) : null;
+    _chaos?.scheduleNext(0);
     moveDir = Offset.zero;
     lastNonZeroDir = const Offset(1, 0);
+
+    // Human's team: random pick in teams mode so the player gets variety.
+    final humanTeam = isTeamsMode
+        ? TeamConfig.playable[_rng.nextInt(TeamConfig.playable.length)]
+        : Team.none;
+    final humanColor = isTeamsMode
+        ? TeamConfig.color(humanTeam)
+        : _palette[_rng.nextInt(_palette.length)];
 
     humanPlayer = Player(
       id: 'human',
       name: nickname.trim().isEmpty ? 'Player' : nickname.trim(),
-      color: _palette[_rng.nextInt(_palette.length)],
+      color: humanColor,
       isHuman: true,
+      team: humanTeam,
     )..skinImage = SkinSettings.instance.skinImage;
     players.add(humanPlayer);
+    if (isTeamsMode) _teamByOwner[humanPlayer.id] = humanTeam;
     _spawnPlayer(humanPlayer);
 
     for (int i = 0; i < GameConstants.targetBots; i++) {
+      // Distribute bots evenly across the three teams in teams mode.
+      final botTeam = isTeamsMode
+          ? TeamConfig.playable[i % TeamConfig.playable.length]
+          : Team.none;
+      final botColor = isTeamsMode
+          ? TeamConfig.color(botTeam)
+          : _palette[_rng.nextInt(_palette.length)];
       final bot = Player(
         id: 'bot$i',
         name: _botNames[i % _botNames.length],
-        color: _palette[_rng.nextInt(_palette.length)],
+        color: botColor,
         isHuman: false,
+        team: botTeam,
       )..skinImage = SkinRegistry.instance.randomSkin(_rng);
       players.add(bot);
+      if (isTeamsMode) _teamByOwner[bot.id] = botTeam;
       _spawnPlayer(bot);
     }
 
-    while (pellets.length < GameConstants.targetPellets) {
+    final targetPellets =
+        (GameConstants.targetPellets * modeConfig.pelletMultiplier).round();
+    while (pellets.length < targetPellets) {
       pellets.add(_spawnPellet());
     }
-    for (int i = 0; i < GameConstants.targetViruses; i++) {
+    final targetViruses =
+        (GameConstants.targetViruses * modeConfig.virusMultiplier).round();
+    for (int i = 0; i < targetViruses; i++) {
       viruses.add(Virus(id: 'v$i', position: _randomWorldPos()));
     }
 
+    if (modeConfig.coinMode) _spawnInitialCoins();
+    if (modeConfig.blackHoleMode) _spawnBlackHoles();
+    if (modeConfig.zombieMode) _assignZombieRoles();
+    if (modeConfig.hideSeekMode) _assignHideSeekRoles();
+
     cameraPos = humanPlayer.centerOfMass;
     cameraZoom = _targetZoom();
+  }
+
+  void _spawnInitialCoins() {
+    for (int i = 0; i < modeConfig.coinCount; i++) {
+      coins.add(Coin(
+        position: _randomWorldPos(),
+        pulsePhase: _rng.nextDouble() * pi * 2,
+      ));
+    }
+  }
+
+  void _spawnBlackHoles() {
+    const margin = 1500.0;
+    for (int i = 0; i < modeConfig.blackHoleCount; i++) {
+      blackHoles.add(BlackHole(
+        id: 'bh$i',
+        position: _randomWorldPos(margin: margin),
+        pullRadius: 900,
+        dangerRadius: 160,
+        phase: _rng.nextDouble() * pi * 2,
+      ));
+    }
+  }
+
+  /// Zombie Infection seed roles: every player starts Survivor, then N of the
+  /// bots are flipped to Zombie. The human starts as Survivor every match.
+  void _assignZombieRoles() {
+    humanPlayer.role = PlayerRole.survivor;
+    final bots = players.where((p) => !p.isHuman).toList();
+    bots.shuffle(_rng);
+    final n = modeConfig.initialZombieCount.clamp(0, bots.length);
+    for (int i = 0; i < bots.length; i++) {
+      bots[i].role = i < n ? PlayerRole.zombie : PlayerRole.survivor;
+      if (bots[i].role == PlayerRole.zombie) {
+        bots[i].color = RoleConfig.color(PlayerRole.zombie)!;
+      }
+    }
+  }
+
+  /// Hide & Seek seed roles: human is always Hider; N bots are flipped to
+  /// Seeker, the rest are Hiders.
+  void _assignHideSeekRoles() {
+    humanPlayer.role = PlayerRole.hider;
+    final bots = players.where((p) => !p.isHuman).toList();
+    bots.shuffle(_rng);
+    final n = modeConfig.seekerCount.clamp(0, bots.length);
+    for (int i = 0; i < bots.length; i++) {
+      final isSeeker = i < n;
+      bots[i].role = isSeeker ? PlayerRole.seeker : PlayerRole.hider;
+      final c = RoleConfig.color(bots[i].role);
+      if (c != null) bots[i].color = c;
+    }
   }
 
   Offset _randomWorldPos({double margin = 200}) {
@@ -440,7 +658,10 @@ class GameEngine {
     for (final p in players) {
       if (p.isHuman || p.isDead) continue;
       if (now >= p.aiNextDecideAt) {
-        p.aiTargetDir = _ai.decide(
+        // Hiders in Hide & Seek can't eat — disable prey targeting so they
+        // focus on pellets + threat avoidance.
+        final canHunt = !(modeConfig.hideSeekMode && p.role == PlayerRole.hider);
+        var dir = _ai.decide(
           center: p.centerOfMass,
           mass: p.totalMass,
           ownerId: p.id,
@@ -450,8 +671,41 @@ class GameEngine {
           virusGrid: virusGrid,
           currentDir: p.aiTargetDir,
           worldSize: GameConstants.worldSize,
+          isAlly: _isAllyOf(p.id),
+          canHunt: canHunt,
+          aggression: modeConfig.botAggression,
         );
-        p.aiNextDecideAt = now + 0.2 + _rng.nextDouble() * 0.2;
+        // Battle Royale: steer bots back toward the safe zone center if
+        // they're outside (or close to the edge).
+        if (modeConfig.shrinkingZone) {
+          final toCenter = safeZoneCenter - p.centerOfMass;
+          final d = toCenter.distance;
+          if (d > safeZoneRadius - 200) {
+            final pull = d > 0 ? toCenter / d : Offset.zero;
+            // Heavier blend the further out the bot is.
+            final weight = ((d - (safeZoneRadius - 200)) / 400).clamp(0.2, 1.4);
+            dir = (dir + pull * weight);
+            final m = dir.distance;
+            if (m > 0) dir = dir / m;
+          }
+        }
+        // Black Hole: nudge bots away from any pull-radius they're inside.
+        if (modeConfig.blackHoleMode) {
+          for (final bh in blackHoles) {
+            final away = p.centerOfMass - bh.position;
+            final d = away.distance;
+            if (d > 0 && d < bh.pullRadius * 0.85) {
+              final weight = 1.0 - (d / bh.pullRadius);
+              dir = dir + (away / d) * weight * 1.2;
+              final m = dir.distance;
+              if (m > 0) dir = dir / m;
+            }
+          }
+        }
+        p.aiTargetDir = dir;
+        // More aggressive → more frequent decisions.
+        final cadence = 0.2 / modeConfig.botAggression;
+        p.aiNextDecideAt = now + cadence + _rng.nextDouble() * cadence;
       }
 
       // Bot split: occasionally split toward prey.
@@ -462,6 +716,7 @@ class GameEngine {
           ownerId: p.id,
           cellCount: p.cells.length,
           cellGrid: cellGrid,
+          isAlly: _isAllyOf(p.id),
         );
         if (doSplit) {
           _split.splitPlayer(p, p.aiTargetDir);
@@ -480,6 +735,7 @@ class GameEngine {
           cellGrid: cellGrid,
           virusGrid: virusGrid,
           aimDir: p.aiTargetDir,
+          isAlly: _isAllyOf(p.id),
         );
         if (doEject) {
           _eject.ejectPlayer(p, p.aiTargetDir);
@@ -537,6 +793,9 @@ class GameEngine {
     for (final p in pellets) {
       p.pulsePhase += dt * 3;
     }
+    for (final c in coins) {
+      c.pulsePhase += dt * 4;
+    }
     final partFric = pow(0.92, dt * 60).toDouble();
     for (final p in particles) {
       p.position += p.velocity * dt;
@@ -544,6 +803,9 @@ class GameEngine {
       p.life -= dt;
     }
     particles.removeWhere((p) => p.life <= 0);
+
+    // Mode tick: match timer, shrinking zone, black-hole forces, chaos.
+    _tickModeSystems(dt);
 
     _rebuildGrids();
 
@@ -562,13 +824,36 @@ class GameEngine {
     }
 
     // Maintain world: pellet count, bot respawn.
-    while (pellets.length < GameConstants.targetPellets) {
+    final pelletTarget =
+        (GameConstants.targetPellets * modeConfig.pelletMultiplier).round() +
+            ((_chaos?.active == ChaosEvent.pelletFlood &&
+                    _chaos!.isActiveAt(elapsed))
+                ? 4000
+                : 0);
+    while (pellets.length < pelletTarget) {
       pellets.add(_spawnPellet());
+    }
+    // Maintain coin count in Coin Rush.
+    if (modeConfig.coinMode) {
+      while (coins.length < modeConfig.coinCount) {
+        coins.add(Coin(
+          position: _safeCoinPosition(),
+          pulsePhase: _rng.nextDouble() * pi * 2,
+        ));
+      }
     }
     for (final p in players) {
       // Bots respawn faster: delay reduced from 3s to 0.5s.
       if (!p.isHuman && p.isDead && now - p.deathTime > 0.5) {
+        if (!modeConfig.canBotsRespawn) continue;
         _spawnPlayer(p);
+        // Reapply role colour so respawned bots keep their identity.
+        if (p.role == PlayerRole.zombie ||
+            p.role == PlayerRole.seeker ||
+            p.role == PlayerRole.hider) {
+          final c = RoleConfig.color(p.role);
+          if (c != null) p.color = c;
+        }
       }
     }
 
@@ -600,10 +885,25 @@ class GameEngine {
     final mag = rawDir.distance;
     if (mag < 0.05) return;
     final unit = rawDir / mag;
-    final f = unit * GameConstants.inputMoveStrength * dt;
+    final f = unit *
+        GameConstants.inputMoveStrength *
+        _activeSpeedMultiplier() *
+        dt;
     for (final c in p.cells) {
       c.velocity += f;
     }
+  }
+
+  /// Composite multiplier applied to movement force + speed clamp.
+  /// Bakes in mode config + transient chaos modifiers.
+  double _activeSpeedMultiplier() {
+    double m = modeConfig.speedMultiplier;
+    final c = _chaos;
+    if (c != null && c.isActiveAt(elapsed)) {
+      if (c.active == ChaosEvent.speedBoost) m *= 1.6;
+      if (c.active == ChaosEvent.slowMotion) m *= 0.55;
+    }
+    return m;
   }
 
   /// Step 3 of the force-based update: split-impulse decay, damping, speed
@@ -625,7 +925,8 @@ class GameEngine {
       c.velocity = c.velocity * dampingFactor;
 
       // Clamp max speed per radius (small cells fast, big cells slow).
-      final maxSpeed = GameConstants.maxSpeedForRadius(c.radius);
+      final maxSpeed =
+          GameConstants.maxSpeedForRadius(c.radius) * _activeSpeedMultiplier();
       final vMag = c.velocity.distance;
       if (vMag > maxSpeed) {
         c.velocity = c.velocity * (maxSpeed / vMag);
@@ -675,6 +976,7 @@ class GameEngine {
     pelletGrid.clear();
     virusGrid.clear();
     ejectGrid.clear();
+    coinGrid.clear();
     for (final p in players) {
       if (p.isDead) continue;
       for (final c in p.cells) {
@@ -690,11 +992,266 @@ class GameEngine {
     for (final e in ejectedMasses) {
       ejectGrid.insert(e, e.position);
     }
+    for (final c in coins) {
+      coinGrid.insert(c, c.position);
+    }
+  }
+
+  // ---------------------------------------------------------- mode tick
+  /// Single entry point for every mode-specific per-frame system. Keeps the
+  /// main `update()` loop clean and lets early-outs (when a flag is off) cost
+  /// effectively nothing for Classic / Teams.
+  void _tickModeSystems(double dt) {
+    if (matchTimeRemaining > 0) {
+      matchTimeRemaining -= dt;
+      if (matchTimeRemaining <= 0) {
+        matchTimeRemaining = 0;
+        _evaluateTimerEnd();
+      }
+    }
+    if (modeConfig.shrinkingZone) _tickShrinkingZone(dt);
+    if (modeConfig.blackHoleMode) _tickBlackHoles(dt);
+    if (modeConfig.chaosMode) _tickChaos(dt);
+    if (modeConfig.coinMode ||
+        modeConfig.zombieMode ||
+        modeConfig.hideSeekMode ||
+        mode == GameMode.battleRoyale) {
+      _recomputeAliveCounts();
+    }
+    if (mode == GameMode.battleRoyale) _checkBattleRoyaleEnd();
+    if (modeConfig.zombieMode) _checkZombieEnd();
+    if (modeConfig.hideSeekMode) _checkHideSeekEnd();
+  }
+
+  void _tickShrinkingZone(double dt) {
+    final total = (modeConfig.matchTimerSeconds ?? 240).toDouble();
+    final elapsedMatch = total - matchTimeRemaining.clamp(0, total);
+    // Shrink from full world diagonal radius to ~700u.
+    const initial = GameConstants.worldSize * 0.55;
+    const finalR = 700.0;
+    final t = (elapsedMatch / total).clamp(0.0, 1.0);
+    safeZoneRadius = initial + (finalR - initial) * t;
+
+    // Apply edge damage to anyone outside the zone.
+    for (final p in players) {
+      if (p.isDead) continue;
+      for (final c in p.cells) {
+        final d = (c.position - safeZoneCenter).distance;
+        if (d > safeZoneRadius) {
+          final over = (d - safeZoneRadius);
+          final dps = 6.0 + over * 0.02; // ramps with distance outside
+          c.mass = max(GameConstants.decayThreshold, c.mass - dps * dt);
+        }
+      }
+    }
+  }
+
+  void _tickBlackHoles(double dt) {
+    for (final bh in blackHoles) {
+      bh.advance(dt);
+      for (final p in players) {
+        if (p.isDead) continue;
+        for (final c in p.cells) {
+          final r = bh.pullVector(c.position);
+          if (r.dist > bh.pullRadius || r.dist <= 0) continue;
+          // Pull force falls off linearly with distance.
+          final strength =
+              BlackHole.pullStrength * (1 - r.dist / bh.pullRadius);
+          c.velocity += r.dir * strength * dt;
+          if (r.dist < bh.dangerRadius) {
+            c.mass = max(
+              GameConstants.decayThreshold,
+              c.mass - BlackHole.damagePerSecond * dt,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  void _tickChaos(double dt) {
+    final c = _chaos;
+    if (c == null) return;
+    if (c.active != null && !c.isActiveAt(elapsed)) {
+      _endChaosEvent();
+    }
+    if (c.active == null && elapsed >= c.nextEventAt) {
+      _startChaosEvent(c.pickRandom());
+    }
+  }
+
+  void _startChaosEvent(ChaosEvent e) {
+    final c = _chaos!;
+    c.start(e, elapsed);
+    if (e == ChaosEvent.virusStorm) {
+      // Add ~10 temporary viruses; tagged so we can remove them on end.
+      for (int i = 0; i < 10; i++) {
+        final id = 'chaos_v_${elapsed.toStringAsFixed(3)}_$i';
+        viruses.add(Virus(id: id, position: _randomWorldPos()));
+        c.tempVirusIds.add(id);
+      }
+    } else if (e == ChaosEvent.massRain) {
+      // Sprinkle ejected-mass projectiles around the human's screen so the
+      // effect is visible to the player.
+      final center = humanPlayer.cells.isNotEmpty
+          ? humanPlayer.centerOfMass
+          : cameraPos;
+      for (int i = 0; i < 60; i++) {
+        final ang = _rng.nextDouble() * pi * 2;
+        final dist = 200 + _rng.nextDouble() * 800;
+        final pos = center + Offset(cos(ang) * dist, sin(ang) * dist);
+        ejectedMasses.add(EjectedMass(
+          ownerId: 'world',
+          position: Offset(
+            pos.dx.clamp(50, GameConstants.worldSize - 50),
+            pos.dy.clamp(50, GameConstants.worldSize - 50),
+          ),
+          velocity: Offset.zero,
+          color: const Color(0xFFFFD600),
+        ));
+      }
+    }
+  }
+
+  void _endChaosEvent() {
+    final c = _chaos!;
+    if (c.active == ChaosEvent.virusStorm) {
+      viruses.removeWhere((v) => c.tempVirusIds.contains(v.id));
+    }
+    c.clear();
+    c.scheduleNext(elapsed);
+  }
+
+  void _recomputeAliveCounts() {
+    aliveBotCount = 0;
+    aliveSurvivorCount = 0;
+    aliveZombieCount = 0;
+    aliveHiderCount = 0;
+    aliveSeekerCount = 0;
+    for (final p in players) {
+      if (p.isDead) continue;
+      if (!p.isHuman) aliveBotCount++;
+      switch (p.role) {
+        case PlayerRole.survivor:
+          aliveSurvivorCount++;
+          break;
+        case PlayerRole.zombie:
+          aliveZombieCount++;
+          break;
+        case PlayerRole.hider:
+          aliveHiderCount++;
+          break;
+        case PlayerRole.seeker:
+          aliveSeekerCount++;
+          break;
+        case PlayerRole.none:
+          break;
+      }
+    }
+  }
+
+  void _checkBattleRoyaleEnd() {
+    if (matchEnded) return;
+    int alive = 0;
+    Player? lastAlive;
+    for (final p in players) {
+      if (!p.isDead) {
+        alive++;
+        lastAlive = p;
+      }
+    }
+    if (alive <= 1) {
+      matchEnded = true;
+      matchEndMessage = lastAlive != null
+          ? (lastAlive.isHuman ? 'Victory Royale!' : '${lastAlive.name} wins')
+          : 'No survivors';
+    }
+  }
+
+  void _checkZombieEnd() {
+    if (matchEnded) return;
+    // Zombies win if no survivors remain.
+    if (aliveSurvivorCount == 0) {
+      matchEnded = true;
+      matchEndMessage = 'Zombies win — all infected';
+    }
+  }
+
+  void _checkHideSeekEnd() {
+    if (matchEnded) return;
+    if (aliveHiderCount == 0) {
+      matchEnded = true;
+      matchEndMessage = 'Seekers win';
+    }
+  }
+
+  /// Called once when [matchTimeRemaining] crosses zero. Mode decides the
+  /// winning message; the engine doesn't force-kill anyone — players keep
+  /// roaming, but `matchEnded` is set so the HUD can show the result.
+  void _evaluateTimerEnd() {
+    if (matchEnded) return;
+    if (modeConfig.zombieMode) {
+      matchEnded = true;
+      matchEndMessage =
+          'Survivors win ($aliveSurvivorCount alive)';
+    } else if (modeConfig.hideSeekMode) {
+      matchEnded = true;
+      matchEndMessage = 'Hiders win ($aliveHiderCount alive)';
+    } else if (modeConfig.coinMode) {
+      matchEnded = true;
+      // Winner = highest coin score.
+      Player? top;
+      for (final p in players) {
+        if (top == null || p.coinScore > top.coinScore) top = p;
+      }
+      matchEndMessage = top != null
+          ? '${top.isHuman ? "You" : top.name} wins with ${top.coinScore} coins'
+          : 'Time up';
+    } else if (mode == GameMode.battleRoyale) {
+      // Shouldn't normally hit this since we end on last-alive, but cover it.
+      matchEnded = true;
+      matchEndMessage = 'Match over';
+    }
+  }
+
+  /// Find a coin spawn position that doesn't overlap a virus.
+  Offset _safeCoinPosition() {
+    for (int attempt = 0; attempt < 10; attempt++) {
+      final pos = _randomWorldPos();
+      bool clear = true;
+      for (final v in viruses) {
+        if ((v.position - pos).distance < v.radius + 30) {
+          clear = false;
+          break;
+        }
+      }
+      if (clear) return pos;
+    }
+    return _randomWorldPos();
   }
 
   void _resolveCollisions(double now) {
     final toRemoveCells = <Cell>{};
     final eatenEjected = <EjectedMass>{};
+    final toInfect = <Player>{}; // owners to flip to zombie after this tick
+
+    // Cells eat coins (Coin Rush). Cheap radius query, mirrors pellet logic.
+    if (modeConfig.coinMode && coins.isNotEmpty) {
+      for (final p in players) {
+        if (p.isDead) continue;
+        for (final c in p.cells) {
+          final near = coinGrid.queryRadius(c.position, c.radius + 25);
+          final rSq = c.radius * c.radius;
+          for (final coin in near) {
+            if ((coin.position - c.position).distanceSquared < rSq) {
+              coin.position = _safeCoinPosition();
+              p.coinScore += Coin.scoreValue;
+              if (c.mass < GameConstants.maxCellMass) c.mass += Coin.mass;
+            }
+          }
+        }
+      }
+    }
 
     // Cells eat pellets.
     for (final p in players) {
@@ -772,6 +1329,8 @@ class GameEngine {
         if (identical(a, b)) continue;
         if (toRemoveCells.contains(b)) continue;
         if (a.ownerId == b.ownerId) continue;
+        // Teams mode: teammates can't damage each other.
+        if (!canEat(a.ownerId, b.ownerId)) continue;
         if (a.radius <= b.radius) continue;
         // Split cells need 33% bigger; whole cells need only 25% bigger.
         final ratio = a.isFreshSplit ? 1.33 : 1.25;
@@ -783,7 +1342,21 @@ class GameEngine {
           if (a.mass < GameConstants.maxCellMass) a.mass += b.mass;
           toRemoveCells.add(b);
           final eater = _findOwner(a.ownerId);
+          final prey = _findOwner(b.ownerId);
           if (eater != null) eater.eatenCount++;
+          if (modeConfig.rankedScoring && eater != null) {
+            eater.rankedPoints += 10 + (b.mass / 10).round();
+          }
+          // Zombie infection: when a zombie eats a survivor cell, queue the
+          // survivor owner for conversion. We can't mutate during iteration,
+          // so flush after this loop.
+          if (modeConfig.zombieMode &&
+              eater != null &&
+              prey != null &&
+              eater.role == PlayerRole.zombie &&
+              prey.role == PlayerRole.survivor) {
+            toInfect.add(prey);
+          }
         }
       }
     }
@@ -816,6 +1389,22 @@ class GameEngine {
       if (p.cells.isEmpty && !p.isDead) {
         p.isDead = true;
         p.deathTime = elapsed;
+        // Ranked: small penalty per death so spamming is discouraged.
+        if (modeConfig.rankedScoring) {
+          p.rankedPoints = max(0, p.rankedPoints - 30);
+        }
+      }
+    }
+
+    // Zombie Infection: flip queued survivors. We respawn them immediately as
+    // a zombie so they keep playing under the new role.
+    if (toInfect.isNotEmpty) {
+      for (final p in toInfect) {
+        p.role = PlayerRole.zombie;
+        p.color = RoleConfig.color(PlayerRole.zombie)!;
+        if (p.isDead || p.cells.isEmpty) {
+          _spawnPlayer(p);
+        }
       }
     }
     for (final em in eatenEjected) {
@@ -851,8 +1440,44 @@ class GameEngine {
     return null;
   }
 
+  /// Returns a predicate that tells the bot which other ownerIds are friendly.
+  /// Combines team affiliation (Teams mode) with shared role (Zombie/Hide &
+  /// Seek). Cheap closure — returns a no-op when no mode wants ally checks.
+  bool Function(String otherOwnerId) _isAllyOf(String selfOwnerId) {
+    final teamMode = isTeamsMode;
+    final roleMode = modeConfig.zombieMode || modeConfig.hideSeekMode;
+    if (!teamMode && !roleMode) return (_) => false;
+
+    final myTeam = _teamByOwner[selfOwnerId];
+    final me = _findOwner(selfOwnerId);
+    final myRole = me?.role ?? PlayerRole.none;
+    return (other) {
+      if (other == selfOwnerId) return false;
+      if (teamMode && myTeam != null && myTeam != Team.none) {
+        if (_teamByOwner[other] == myTeam) return true;
+      }
+      if (roleMode && myRole != PlayerRole.none) {
+        final o = _findOwner(other);
+        if (o != null && o.role == myRole) return true;
+      }
+      return false;
+    };
+  }
+
   // -------------------------------------------------------- leaderboard
   void _rebuildLeaderboard() {
+    if (isTeamsMode) {
+      _rebuildTeamLeaderboard();
+      return;
+    }
+    if (modeConfig.coinMode) {
+      _rebuildCoinLeaderboard();
+      return;
+    }
+    if (modeConfig.rankedScoring) {
+      _rebuildRankedLeaderboard();
+      return;
+    }
     final entries = <LeaderboardEntry>[];
     for (final p in players) {
       if (p.isDead) continue;
@@ -873,9 +1498,110 @@ class GameEngine {
     if (!found) humanRank = -1;
   }
 
+  /// Coin Rush: rank by coinScore, mass breaks ties.
+  void _rebuildCoinLeaderboard() {
+    final ps = <Player>[];
+    for (final p in players) {
+      if (p.isDead) continue;
+      ps.add(p);
+    }
+    ps.sort((a, b) {
+      final s = b.coinScore.compareTo(a.coinScore);
+      if (s != 0) return s;
+      return b.totalMass.compareTo(a.totalMass);
+    });
+    final entries = <LeaderboardEntry>[];
+    for (final p in ps.take(10)) {
+      entries.add(LeaderboardEntry(
+        '${p.name} · ${p.coinScore}c',
+        p.totalMass,
+        p.isHuman,
+      ));
+    }
+    leaderboard = entries;
+    int rank = 1;
+    humanRank = -1;
+    for (final p in ps) {
+      if (p.isHuman) {
+        humanRank = rank;
+        break;
+      }
+      rank++;
+    }
+  }
+
+  /// Ranked Arena: rank by rankedPoints.
+  void _rebuildRankedLeaderboard() {
+    final ps = <Player>[];
+    for (final p in players) {
+      if (p.isDead) continue;
+      ps.add(p);
+    }
+    ps.sort((a, b) {
+      final s = b.rankedPoints.compareTo(a.rankedPoints);
+      if (s != 0) return s;
+      return b.totalMass.compareTo(a.totalMass);
+    });
+    final entries = <LeaderboardEntry>[];
+    for (final p in ps.take(10)) {
+      entries.add(LeaderboardEntry(
+        '${p.name} · ${p.rankedPoints}p',
+        p.totalMass,
+        p.isHuman,
+      ));
+    }
+    leaderboard = entries;
+    int rank = 1;
+    humanRank = -1;
+    for (final p in ps) {
+      if (p.isHuman) {
+        humanRank = rank;
+        break;
+      }
+      rank++;
+    }
+  }
+
+  /// Teams leaderboard: 3 entries — one per playable team. `isHuman` flags
+  /// the team the player belongs to so the leaderboard widget can highlight
+  /// it. `humanRank` becomes the human team's standing (1-based).
+  void _rebuildTeamLeaderboard() {
+    final entries = <LeaderboardEntry>[];
+    for (final t in TeamConfig.playable) {
+      entries.add(LeaderboardEntry(
+        TeamConfig.displayName(t),
+        getTeamMass(t),
+        t == humanPlayer.team,
+      ));
+    }
+    entries.sort((a, b) => b.mass.compareTo(a.mass));
+    leaderboard = entries;
+    int rank = 1;
+    bool found = false;
+    for (final e in entries) {
+      if (e.isHuman) {
+        humanRank = rank;
+        found = true;
+        break;
+      }
+      rank++;
+    }
+    if (!found) humanRank = -1;
+  }
+
   // -------------------------------------------------------- public reset
+  /// Returns true if the human is allowed to respawn under current mode rules.
+  bool get canRespawnHuman => modeConfig.canHumanRespawn && !matchEnded;
+
   void respawnHuman() {
+    if (!canRespawnHuman) return;
     _spawnPlayer(humanPlayer);
+    // Re-apply role color if applicable (zombie/seeker).
+    if (humanPlayer.role == PlayerRole.zombie ||
+        humanPlayer.role == PlayerRole.seeker) {
+      final c = RoleConfig.color(humanPlayer.role);
+      if (c != null) humanPlayer.color = c;
+    }
     gameOver = false;
     timeSurvived = 0;
   }

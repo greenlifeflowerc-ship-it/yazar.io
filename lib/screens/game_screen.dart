@@ -7,6 +7,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 
 import '../game/game_engine.dart';
+import '../game/game_mode_type.dart';
 import '../game/game_settings.dart';
 import '../game/painters/game_painter.dart';
 import '../models/boost.dart';
@@ -16,12 +17,18 @@ import '../widgets/death_screen.dart';
 import '../widgets/game_button.dart';
 import '../widgets/live_leaderboard.dart';
 import '../widgets/minimap.dart';
+import '../widgets/mode_hud.dart';
 import '../widgets/pause_menu.dart';
 import '../widgets/virtual_joystick.dart';
 
 class GameScreen extends StatefulWidget {
-  const GameScreen({super.key, this.nickname = ''});
+  const GameScreen({
+    super.key,
+    this.nickname = '',
+    this.mode = GameMode.classic,
+  });
   final String nickname;
+  final GameMode mode;
 
   @override
   State<GameScreen> createState() => _GameScreenState();
@@ -83,7 +90,8 @@ class _GameScreenState extends State<GameScreen>
     _ejectPos = ValueNotifier(GameSettings.instance.ejectBtnFrac);
     _ejectPos2 = ValueNotifier(GameSettings.instance.ejectBtnFrac2);
     _splitPos = ValueNotifier(GameSettings.instance.splitBtnFrac);
-    _engine = GameEngine()..init(nickname: widget.nickname);
+    _engine = GameEngine()
+      ..init(nickname: widget.nickname, mode: widget.mode);
     _ticker = createTicker(_onTick)..start();
 
     if (GameSettings.instance.pcMode) {
@@ -268,6 +276,11 @@ class _GameScreenState extends State<GameScreen>
   }
 
   void _playAgain() {
+    if (!_engine.canRespawnHuman) {
+      // Modes with no in-match respawn (battle royale): kick back to menu.
+      _exitToMenu();
+      return;
+    }
     _engine.respawnHuman();
     _lastGameOver = false;
     _submittedThisMatch = false;
@@ -439,8 +452,21 @@ class _GameScreenState extends State<GameScreen>
                       ),
                     ),
 
+                  // Mode-specific status chips at top-center.
+                  Positioned(
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    child: ValueListenableBuilder<int>(
+                      valueListenable: _hudTick,
+                      builder: (context, value, child) =>
+                          ModeHud(engine: _engine),
+                    ),
+                  ),
+
                   // === Top-right minimap with slide (settings-gated) ===
-                  if (GameSettings.instance.showMinimap) ...[
+                  if (GameSettings.instance.showMinimap &&
+                      _engine.modeConfig.showHelperUi) ...[
                     AnimatedPositioned(
                       duration: const Duration(milliseconds: 260),
                       curve: Curves.easeOutCubic,
@@ -482,7 +508,7 @@ class _GameScreenState extends State<GameScreen>
                   AnimatedPositioned(
                     duration: const Duration(milliseconds: 260),
                     curve: Curves.easeOutCubic,
-                    top: GameSettings.instance.showMinimap ? _leaderboardTop : 12,
+                    top: (GameSettings.instance.showMinimap && _engine.modeConfig.showHelperUi) ? _leaderboardTop : 12,
                     right: _leaderboardOpen ? 0 : -_panelWidth,
                     width: _panelWidth,
                     child: GestureDetector(
@@ -505,7 +531,7 @@ class _GameScreenState extends State<GameScreen>
                   AnimatedPositioned(
                     duration: const Duration(milliseconds: 260),
                     curve: Curves.easeOutCubic,
-                    top: (GameSettings.instance.showMinimap ? _leaderboardTop : 12) + 30,
+                    top: ((GameSettings.instance.showMinimap && _engine.modeConfig.showHelperUi) ? _leaderboardTop : 12) + 30,
                     right: _leaderboardOpen ? _panelWidth : 0,
                     child: _ChevronTab(
                       open: _leaderboardOpen,

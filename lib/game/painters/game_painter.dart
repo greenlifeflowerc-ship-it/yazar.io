@@ -3,11 +3,14 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
+import '../entities/black_hole.dart';
 import '../entities/cell.dart';
+import '../entities/coin.dart';
 import '../entities/ejected_mass.dart';
 import '../entities/pellet.dart';
 import '../entities/virus.dart';
 import '../game_engine.dart';
+import '../game_mode_type.dart';
 import '../game_settings.dart';
 
 class GamePainter extends CustomPainter {
@@ -46,9 +49,15 @@ class GamePainter extends CustomPainter {
 
     if (settings.showGrid) _drawGrid(canvas, viewport, settings.gridColor);
     _drawWorldBorder(canvas, settings.borderColor);
-    
+
+    // Mode-specific world overlays drawn under the entities so cells/pellets
+    // still read on top of them.
+    if (engine.modeConfig.shrinkingZone) _drawSafeZone(canvas);
+    if (engine.modeConfig.blackHoleMode) _drawBlackHoles(canvas);
+
     // Using Grid Querying for everything to optimize performance
     _drawPellets(canvas, viewport);
+    if (engine.modeConfig.coinMode) _drawCoins(canvas, viewport);
     _drawEjected(canvas, viewport);
     _drawParticles(canvas, viewport);
 
@@ -56,6 +65,93 @@ class GamePainter extends CustomPainter {
     _drawEntities(canvas, viewport);
 
     canvas.restore();
+  }
+
+  void _drawSafeZone(Canvas canvas) {
+    final r = engine.safeZoneRadius;
+    if (r <= 0 || r >= GameConstants.worldSize) return;
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 12 / engine.cameraZoom
+      ..color = const Color(0xFFFFD600).withValues(alpha: 0.75);
+    canvas.drawCircle(engine.safeZoneCenter, r, paint);
+    final dangerPaint = Paint()
+      ..color = const Color(0xFFFF1F2D).withValues(alpha: 0.10);
+    // Soft red wash beyond the boundary at a coarse approximation.
+    canvas.drawCircle(
+      engine.safeZoneCenter,
+      r + 4000,
+      Paint()
+        ..color = const Color(0xFFFF1F2D).withValues(alpha: 0.04)
+        ..blendMode = BlendMode.srcOver,
+    );
+    canvas.drawCircle(engine.safeZoneCenter, r + 30 / engine.cameraZoom,
+        dangerPaint);
+  }
+
+  void _drawBlackHoles(Canvas canvas) {
+    for (final bh in engine.blackHoles) {
+      // Outer pull-radius hint ring.
+      final pullPaint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2 / engine.cameraZoom
+        ..color = const Color(0xFF40C4FF).withValues(alpha: 0.25);
+      canvas.drawCircle(bh.position, bh.pullRadius, pullPaint);
+
+      // Vortex rings rotating with phase.
+      for (int i = 0; i < 4; i++) {
+        final t = (bh.phase + i * 0.5) % (pi * 2);
+        final ringR = bh.dangerRadius * (1 + i * 0.7);
+        final ringPaint = Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = max(1.0, 4 / engine.cameraZoom)
+          ..color = const Color(0xFF80D8FF)
+              .withValues(alpha: (0.55 - i * 0.12).clamp(0.0, 1.0));
+        canvas.drawArc(
+          Rect.fromCircle(center: bh.position, radius: ringR),
+          t,
+          pi * 1.4,
+          false,
+          ringPaint,
+        );
+      }
+
+      // Inky core.
+      final corePaint = Paint()
+        ..shader = ui.Gradient.radial(
+          bh.position,
+          bh.dangerRadius,
+          [
+            const Color(0xFF000000),
+            const Color(0xFF1A1A2E),
+            const Color(0xFF1A1A2E).withValues(alpha: 0.0),
+          ],
+          [0.0, 0.6, 1.0],
+        );
+      canvas.drawCircle(bh.position, bh.dangerRadius, corePaint);
+    }
+  }
+
+  void _drawCoins(Canvas canvas, Rect view) {
+    final paint = Paint();
+    for (final Coin c in engine.coinGrid.queryRect(view)) {
+      final pulse = 1 + sin(c.pulsePhase) * 0.12;
+      final r = Coin.radius * pulse;
+      paint.shader = ui.Gradient.radial(
+        c.position,
+        r,
+        [
+          const Color(0xFFFFF59D),
+          const Color(0xFFFFC107),
+          const Color(0xFFFF8F00),
+        ],
+        [0.0, 0.6, 1.0],
+      );
+      canvas.drawCircle(c.position, r, paint);
+      paint.shader = null;
+      paint.color = const Color(0xFFFFE082).withValues(alpha: 0.85);
+      canvas.drawCircle(c.position, r * 0.45, paint);
+    }
   }
 
   void _drawGrid(Canvas canvas, Rect view, Color gridColor) {
@@ -297,6 +393,45 @@ class GamePainter extends CustomPainter {
       } else {
         canvas.drawCircle(pos, r, fillPaint);
         canvas.drawCircle(pos, r, strokePaint);
+      }
+    }
+
+    // Teams mode: draw a soft team-coloured glow ring just behind the cell so
+    // allies and enemies read instantly regardless of skin. Costs one extra
+    // circle per cell — negligible.
+    if (engine.isTeamsMode) {
+      final team = engine.teamOf(c.ownerId);
+      if (team != Team.none) {
+        final glow = Paint()
+          ..color = TeamConfig.glowColor(team).withValues(alpha: 0.55)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = max(3.0, c.radius * 0.12)
+          ..maskFilter = MaskFilter.blur(
+            BlurStyle.normal,
+            max(2.0, c.radius * 0.18),
+          );
+        canvas.drawCircle(c.position, baseR + max(2.0, c.radius * 0.06), glow);
+      }
+    }
+
+    // Role-based glow (Zombie Infection, Hide & Seek). Same trick as team
+    // glow — Survivors get nothing so original skin is preserved.
+    if (engine.modeConfig.zombieMode || engine.modeConfig.hideSeekMode) {
+      final role = engine.roleOf(c.ownerId);
+      final glowColor = RoleConfig.glowColor(role);
+      if (glowColor != Colors.transparent &&
+          role != PlayerRole.none &&
+          role != PlayerRole.survivor) {
+        final glow = Paint()
+          ..color = glowColor.withValues(alpha: 0.6)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = max(3.0, c.radius * 0.14)
+          ..maskFilter = MaskFilter.blur(
+            BlurStyle.normal,
+            max(2.0, c.radius * 0.22),
+          );
+        canvas.drawCircle(
+            c.position, baseR + max(2.0, c.radius * 0.08), glow);
       }
     }
 
