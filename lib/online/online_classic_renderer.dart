@@ -116,7 +116,6 @@ class OnlineClassicPainter extends CustomPainter {
     final paint = Paint();
     for (final p in controller.pellets.values) {
       if (!p.x.isFinite || !p.y.isFinite || p.radius <= 0) continue;
-      if (controller.isPelletEatenLocally(p.id)) continue;
       if (!view.contains(Offset(p.x, p.y))) continue;
       // Pulse animation — identical to offline GamePainter._drawPellets.
       final pulse = 1 + sin(p.pulsePhase) * 0.05;

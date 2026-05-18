@@ -45,13 +45,15 @@ class OnlineClassicController {
   final Map<String, ui.Image?> _skinCache = {};
 
   // ── Client-side pellet eat prediction.
-  // Pellet id → ms timestamp until which we keep it hidden locally. We pair
-  // each entry with a small mass delta that's added to the displayed mass
-  // until the next server snapshot bumps the authoritative figure.
-  final Map<String, int> _eatenPelletExpiry = {};
+  // When a pellet overlaps one of our cells we immediately remove it from
+  // the `pellets` map and record its id here with an expiry timestamp.
+  // `_applyState` skips any server update for that id until it expires —
+  // prevents "teleporting pellet" flicker because the server now gives each
+  // respawned pellet a brand-new id.
+  final Map<String, int> _locallyEatenPellets = {};
   int _predictedMassDelta = 0;
   int _lastServerMass = 0;
-  static const int _predictedEatTtlMs = 500;
+  static const int _predictedEatTtlMs = 1200;
 
   // Self / world info.
   String? selfId;
@@ -183,13 +185,6 @@ class OnlineClassicController {
 
   /// Displayed mass = server mass + unconfirmed predicted pellet eats.
   int get displayedMass => selfMass + _predictedMassDelta;
-
-  /// True while a local prediction is hiding this pellet.
-  bool isPelletEatenLocally(String id) {
-    final exp = _eatenPelletExpiry[id];
-    if (exp == null) return false;
-    return DateTime.now().millisecondsSinceEpoch < exp;
-  }
 
   // ── Camera helpers ─────────────────────────────────────────────────────────
 
@@ -352,23 +347,27 @@ class OnlineClassicController {
     }
     if (selfCells.isEmpty) return;
     final now = DateTime.now().millisecondsSinceEpoch;
-    // Expire stale entries.
-    _eatenPelletExpiry.removeWhere((id, expiry) {
+    // Expire stale predictions and retire their mass delta contribution.
+    _locallyEatenPellets.removeWhere((id, expiry) {
       if (expiry > now) return false;
       _predictedMassDelta -= 1;
       if (_predictedMassDelta < 0) _predictedMassDelta = 0;
       return true;
     });
-    for (final p in pellets.values) {
-      if (_eatenPelletExpiry.containsKey(p.id)) continue;
+    // Walk a snapshot of keys because we mutate the map inside the loop.
+    final ids = pellets.keys.toList(growable: false);
+    for (final id in ids) {
+      final p = pellets[id];
+      if (p == null) continue;
       for (final c in selfCells) {
         final dx = p.x - c.renderX;
         final dy = p.y - c.renderY;
         final rr = c.renderRadius;
         if (dx * dx + dy * dy < rr * rr) {
-          _eatenPelletExpiry[p.id] = now + _predictedEatTtlMs;
+          // Immediately remove — no flicker waiting for server confirmation.
+          pellets.remove(id);
+          _locallyEatenPellets[id] = now + _predictedEatTtlMs;
           _predictedMassDelta += 1;
-          // Jelly bump at the angle of the eaten pellet — mirrors offline.
           c.addBump(atan2(dy, dx), 0.04);
           break;
         }
@@ -448,7 +447,7 @@ class OnlineClassicController {
         selfY = serverSelfY;
         cameraX = serverSelfX;
         cameraY = serverSelfY;
-        _eatenPelletExpiry.clear();
+        _locallyEatenPellets.clear();
         _predictedMassDelta = 0;
       }
     }
@@ -484,9 +483,20 @@ class OnlineClassicController {
     // ── pellets / viruses (half-rate)
     final pelletsRaw = msg['pellets'];
     if (pelletsRaw is List) {
+      // Expire stale local predictions before reconciling.
+      final nowMs2 = DateTime.now().millisecondsSinceEpoch;
+      _locallyEatenPellets.removeWhere((id, expiry) {
+        if (expiry > nowMs2) return false;
+        _predictedMassDelta -= 1;
+        if (_predictedMassDelta < 0) _predictedMassDelta = 0;
+        return true;
+      });
       for (final raw in pelletsRaw) {
         final j = raw as Map<String, dynamic>;
         final id = j['id'] as String;
+        // Skip while locally predicted eaten — server now gives fresh IDs on
+        // respawn, so this id is guaranteed to be the old (consumed) pellet.
+        if (_locallyEatenPellets.containsKey(id)) continue;
         final existing = pellets[id];
         if (existing == null) {
           final e = OnlinePellet.fromJson(j);
@@ -572,7 +582,7 @@ class OnlineClassicController {
     viruses.clear();
     ejected.clear();
     _skinCache.clear();
-    _eatenPelletExpiry.clear();
+    _locallyEatenPellets.clear();
     _predictedMassDelta = 0;
     _lastServerMass = 0;
     leaderboard = const [];
