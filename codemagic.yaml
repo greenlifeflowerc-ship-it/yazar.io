@@ -18,14 +18,31 @@ workflows:
           - "yazar"
 
     scripts:
-      - name: Get Flutter packages
+      - name: Clean and regenerate Flutter iOS config
         script: |
+          rm -f ios/Flutter/Generated.xcconfig
+          rm -f ios/Flutter/flutter_export_environment.sh
+          flutter clean
           flutter pub get
+          flutter precache --ios
+          flutter build ios --config-only --release
+
+          FLUTTER_ROOT_PATH="$(dirname "$(dirname "$(which flutter)")")"
+          mkdir -p ios/Flutter
+          touch ios/Flutter/Generated.xcconfig
+
+          if ! grep -q "^FLUTTER_ROOT=" ios/Flutter/Generated.xcconfig; then
+            echo "FLUTTER_ROOT=$FLUTTER_ROOT_PATH" >> ios/Flutter/Generated.xcconfig
+          fi
+
+          echo "Generated.xcconfig content:"
+          cat ios/Flutter/Generated.xcconfig
 
       - name: Install CocoaPods
         script: |
           cd ios
-          pod install
+          pod deintegrate || true
+          pod install --repo-update
           cd ..
 
       - name: Set up iOS code signing
@@ -38,7 +55,13 @@ workflows:
 
       - name: Build Ad Hoc IPA
         script: |
-          flutter build ipa --release \
+          FLUTTER_ROOT_PATH="$(dirname "$(dirname "$(which flutter)")")"
+
+          if ! grep -q "^FLUTTER_ROOT=" ios/Flutter/Generated.xcconfig; then
+            echo "FLUTTER_ROOT=$FLUTTER_ROOT_PATH" >> ios/Flutter/Generated.xcconfig
+          fi
+
+          flutter build ipa --release --no-pub \
             --build-name=1.0.0 \
             --build-number=$PROJECT_BUILD_NUMBER \
             --export-options-plist=/Users/builder/export_options.plist
