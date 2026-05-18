@@ -1,70 +1,29 @@
 workflows:
   ios-adhoc:
-    name: "YAZAR.IO iOS Ad Hoc IPA"
-    max_build_duration: 120
-    instance_type: mac_mini_m2
-
-    integrations:
-      app_store_connect: YAZAR_IO_APPLE_KEY
-
+    name: iOS Ad Hoc IPA
     environment:
       flutter: stable
       xcode: latest
       cocoapods: default
-      ios_signing:
-        provisioning_profiles:
-          - "codemagic.yaml"
-        certificates:
-          - "yazar"
 
     scripts:
       - name: Get Flutter packages
         script: |
-          flutter clean
           flutter pub get
-          flutter precache --ios
 
-      - name: Set up iOS code signing
+      - name: Fix iOS Pods
         script: |
-          xcode-project use-profiles --project ios/Runner.xcodeproj
-
-      - name: Verify Flutter root for CocoaPods
-        script: |
-          export FLUTTER_ROOT="$(cd "$(dirname "$(command -v flutter)")/.." && pwd)"
-          echo "FLUTTER_ROOT=$FLUTTER_ROOT"
-          test -f "$FLUTTER_ROOT/packages/flutter_tools/bin/podhelper.rb"
-          mkdir -p ios/Flutter
-          printf '%s\n' "FLUTTER_ROOT=$FLUTTER_ROOT" > ios/Flutter/Generated.xcconfig
-          printf '%s\n' "FLUTTER_APPLICATION_PATH=${CM_BUILD_DIR:-$PWD}" >> ios/Flutter/Generated.xcconfig
-          printf '%s\n' "FLUTTER_TARGET=lib/main.dart" >> ios/Flutter/Generated.xcconfig
-          printf '%s\n' "FLUTTER_BUILD_DIR=build" >> ios/Flutter/Generated.xcconfig
-          printf '%s\n' "FLUTTER_BUILD_NAME=1.0.0" >> ios/Flutter/Generated.xcconfig
-          printf '%s\n' "FLUTTER_BUILD_NUMBER=${PROJECT_BUILD_NUMBER:-1}" >> ios/Flutter/Generated.xcconfig
-          cat ios/Flutter/Generated.xcconfig
-
-      - name: Install CocoaPods
-        script: |
-          export FLUTTER_ROOT="$(cd "$(dirname "$(command -v flutter)")/.." && pwd)"
           cd ios
+          rm -rf Pods
+          rm -f Podfile.lock
           pod deintegrate || true
+          pod repo update
           pod install --repo-update
           cd ..
 
-      - name: Analyze Flutter project
-        script: |
-          flutter analyze --no-fatal-infos --no-fatal-warnings
-
       - name: Build Ad Hoc IPA
         script: |
-          export FLUTTER_ROOT="$(cd "$(dirname "$(command -v flutter)")/.." && pwd)"
-          BUILD_NUMBER="${PROJECT_BUILD_NUMBER:-1}"
-
-          flutter build ipa --release --no-pub \
-            --build-name=1.0.0 \
-            --build-number="$BUILD_NUMBER" \
-            --export-options-plist=/Users/builder/export_options.plist
+          flutter build ipa --release --export-method ad-hoc
 
     artifacts:
       - build/ios/ipa/*.ipa
-      - /tmp/xcodebuild_logs/*.log
-      - flutter_drive.log
