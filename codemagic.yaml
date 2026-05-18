@@ -18,24 +18,52 @@ workflows:
           - "yazar"
 
     scripts:
-      - name: Clean and regenerate Flutter iOS config
+      - name: Get Flutter packages
         script: |
-          rm -f ios/Flutter/Generated.xcconfig
-          rm -f ios/Flutter/flutter_export_environment.sh
           flutter clean
           flutter pub get
           flutter precache --ios
-          flutter build ios --config-only --release
 
-          FLUTTER_ROOT_PATH="$(dirname "$(dirname "$(which flutter)")")"
+      - name: Force Flutter iOS Generated.xcconfig
+        script: |
+          FLUTTER_ROOT_PATH="$(cd "$(dirname "$(command -v flutter)")/.." && pwd)"
+          APP_PATH="${CM_BUILD_DIR:-$PWD}"
+          BUILD_NUMBER="${PROJECT_BUILD_NUMBER:-1}"
+
           mkdir -p ios/Flutter
-          touch ios/Flutter/Generated.xcconfig
 
-          if ! grep -q "^FLUTTER_ROOT=" ios/Flutter/Generated.xcconfig; then
-            echo "FLUTTER_ROOT=$FLUTTER_ROOT_PATH" >> ios/Flutter/Generated.xcconfig
-          fi
+          cat > ios/Flutter/Generated.xcconfig <<EOF
+FLUTTER_ROOT=$FLUTTER_ROOT_PATH
+FLUTTER_APPLICATION_PATH=$APP_PATH
+COCOAPODS_PARALLEL_CODE_SIGN=true
+FLUTTER_TARGET=lib/main.dart
+FLUTTER_BUILD_DIR=build
+FLUTTER_BUILD_NAME=1.0.0
+FLUTTER_BUILD_NUMBER=$BUILD_NUMBER
+DART_OBFUSCATION=false
+TRACK_WIDGET_CREATION=false
+TREE_SHAKE_ICONS=true
+PACKAGE_CONFIG=.dart_tool/package_config.json
+EOF
 
-          echo "Generated.xcconfig content:"
+          cat > ios/Flutter/flutter_export_environment.sh <<EOF
+#!/bin/sh
+export FLUTTER_ROOT="$FLUTTER_ROOT_PATH"
+export FLUTTER_APPLICATION_PATH="$APP_PATH"
+export COCOAPODS_PARALLEL_CODE_SIGN=true
+export FLUTTER_TARGET="lib/main.dart"
+export FLUTTER_BUILD_DIR="build"
+export FLUTTER_BUILD_NAME="1.0.0"
+export FLUTTER_BUILD_NUMBER="$BUILD_NUMBER"
+export DART_OBFUSCATION=false
+export TRACK_WIDGET_CREATION=false
+export TREE_SHAKE_ICONS=true
+export PACKAGE_CONFIG=".dart_tool/package_config.json"
+EOF
+
+          chmod +x ios/Flutter/flutter_export_environment.sh
+
+          echo "Generated.xcconfig:"
           cat ios/Flutter/Generated.xcconfig
 
       - name: Install CocoaPods
@@ -55,15 +83,29 @@ workflows:
 
       - name: Build Ad Hoc IPA
         script: |
-          FLUTTER_ROOT_PATH="$(dirname "$(dirname "$(which flutter)")")"
+          FLUTTER_ROOT_PATH="$(cd "$(dirname "$(command -v flutter)")/.." && pwd)"
+          APP_PATH="${CM_BUILD_DIR:-$PWD}"
+          BUILD_NUMBER="${PROJECT_BUILD_NUMBER:-1}"
 
-          if ! grep -q "^FLUTTER_ROOT=" ios/Flutter/Generated.xcconfig; then
-            echo "FLUTTER_ROOT=$FLUTTER_ROOT_PATH" >> ios/Flutter/Generated.xcconfig
-          fi
+          mkdir -p ios/Flutter
+
+          cat > ios/Flutter/Generated.xcconfig <<EOF
+FLUTTER_ROOT=$FLUTTER_ROOT_PATH
+FLUTTER_APPLICATION_PATH=$APP_PATH
+COCOAPODS_PARALLEL_CODE_SIGN=true
+FLUTTER_TARGET=lib/main.dart
+FLUTTER_BUILD_DIR=build
+FLUTTER_BUILD_NAME=1.0.0
+FLUTTER_BUILD_NUMBER=$BUILD_NUMBER
+DART_OBFUSCATION=false
+TRACK_WIDGET_CREATION=false
+TREE_SHAKE_ICONS=true
+PACKAGE_CONFIG=.dart_tool/package_config.json
+EOF
 
           flutter build ipa --release --no-pub \
             --build-name=1.0.0 \
-            --build-number=$PROJECT_BUILD_NUMBER \
+            --build-number=$BUILD_NUMBER \
             --export-options-plist=/Users/builder/export_options.plist
 
     artifacts:
