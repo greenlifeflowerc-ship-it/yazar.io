@@ -1,44 +1,34 @@
 workflows:
-  ios-adhoc:
-    name: iOS Ad Hoc IPA
-    max_build_duration: 60
+  ios-ipa:
+    name: Build iOS IPA
 
     environment:
       flutter: stable
       xcode: latest
       cocoapods: default
 
-    cache:
-      cache_paths:
-        - $HOME/.pub-cache
-        - ios/Pods
+      ios_signing:
+        distribution_type: ad_hoc
+        bundle_identifier: com.yazar.yazario
+
+    integrations:
+      app_store_connect: codemagic
 
     scripts:
-      - name: Clean project
+      - name: Flutter Pub Get
         script: |
           flutter clean
           flutter pub get
 
-      - name: Fix iOS Pods
+      - name: Install Pods
         script: |
           cd ios
-          rm -rf Pods
-          rm -f Podfile.lock
-          pod deintegrate || true
           pod install --repo-update
           cd ..
 
-      - name: Build iOS
+      - name: Build IPA
         script: |
-          if [ -d "$CM_PROVISIONING_PROFILE_PATH" ] || [ -n "$CM_CERTIFICATE_PATH" ]; then
-            echo "Code signing found. Building signed IPA..."
-            flutter build ipa --release --export-method ad-hoc
-          else
-            echo "No code signing found. Building iOS without codesign..."
-            flutter build ios --release --no-codesign
-          fi
+          flutter build ipa --release
 
     artifacts:
       - build/ios/ipa/*.ipa
-      - build/ios/iphoneos/Runner.app
-      - build/ios/archive/*.xcarchive
