@@ -28,6 +28,7 @@ import '../game/entities/cell.dart' as ge;
 import '../game/entities/ejected_mass.dart';
 import '../game/entities/virus.dart' as ge;
 import '../game/game_engine.dart';
+import '../game/game_settings.dart';
 import '../game/mechanics/split_handler.dart';
 import '../game/skin_settings.dart';
 import 'net/v2_packets.dart';
@@ -47,7 +48,12 @@ class V2Controller extends ChangeNotifier {
   /// Local lifetime cap for self-spawned ejected mass. After this window the
   /// authoritative server-side copy (in [V2World.ejected]) has fully arrived,
   /// so the locally-spawned one is dropped to avoid double-rendering.
-  static const _localEjectedLifetimeMs = 150;
+  /// Local ejected mass is rendered until the matching server-broadcast copy
+  /// has had time to arrive (1 RTT + 1 server tick). Too short = visible
+  /// "blink" when the feed disappears before the server version shows up.
+  /// Too long = double-rendered feed (local + server overlap) is visible.
+  /// 300 ms covers typical mobile latencies (RTT ≤ 250 ms) comfortably.
+  static const _localEjectedLifetimeMs = 300;
   /// Local prediction window for virus pops, used to suppress accidental
   /// re-pop of the same virus across two ticks before the server confirms.
   final Set<String> _locallyPoppedViruses = {};
@@ -231,9 +237,18 @@ class V2Controller extends ChangeNotifier {
     // Clamp to the unit disc.
     final m = d.distance;
     final clamped = m > 1 ? d / m : d;
-    _moveDir = clamped;
-    if (clamped.distance > 0.05) _lastDir = clamped;
-    sim.moveDir = clamped;
+    if (clamped.distance > 0.05) {
+      _moveDir = clamped;
+      _lastDir = clamped;
+    } else {
+      // Joystick released. Mirror the offline GameEngine rule exactly:
+      //   stopOnRelease=true  → stop moving
+      //   stopOnRelease=false → keep gliding in the last aim direction
+      // Without this branch the online cell always stopped on release,
+      // overriding the user's setting.
+      _moveDir = GameSettings.instance.stopOnRelease ? Offset.zero : _lastDir;
+    }
+    sim.moveDir = _moveDir;
     sim.lastNonZeroDir = _lastDir;
   }
 
@@ -254,7 +269,14 @@ class V2Controller extends ChangeNotifier {
     if (_deadServerConfirmed) return;
     final aim = _moveDir.distance > 0.05 ? _moveDir : _lastDir;
     sim.doEject(aim);
-    client.sendEject();
+    // The offline EjectHandler fires `burst` ejects per cell per call (driven
+    // by feedSpeedMultiplier). The server must do the same number per packet
+    // — otherwise local mass drops further than server confirms, and the
+    // reconcile snaps it back (visible as "mass disappearing" then refilling).
+    final burst = (GameSettings.instance.feedSpeedMultiplier / 10)
+        .floor()
+        .clamp(1, 10);
+    client.sendEject(count: burst);
     _pendingActions.add(_PendingAction(client.lastSentSeq, 'eject'));
   }
 

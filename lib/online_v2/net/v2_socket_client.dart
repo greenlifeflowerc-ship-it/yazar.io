@@ -192,9 +192,15 @@ class V2SocketClient {
     _sendRaw({'type': 'split', 'seq': seq});
   }
 
-  void sendEject() {
+  /// [count] is the number of "burst" ejects the local sim applied in this
+  /// single call (driven by feedSpeedMultiplier). The server runs the eject
+  /// routine [count] times so the per-cell mass loss matches the client's
+  /// prediction exactly — without this, fast feed (multiplier ≥ 20) drops
+  /// local mass much further than the server confirms and the difference
+  /// gets snapped back via reconciliation (the "mass disappearing" glitch).
+  void sendEject({int count = 1}) {
     final seq = _nextSeq();
-    _sendRaw({'type': 'eject', 'seq': seq});
+    _sendRaw({'type': 'eject', 'seq': seq, 'count': count});
   }
 
   void sendRespawn() => _sendRaw({'type': 'respawn'});

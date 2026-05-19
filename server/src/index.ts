@@ -1407,7 +1407,16 @@ wss.on("connection", (ws) => {
       let dx = player.input.dx, dy = player.input.dy;
       const m = Math.hypot(dx, dy);
       if (m < 0.05) { dx = player.input.lastDir.x; dy = player.input.lastDir.y; }
-      tryDoEject(player, dx, dy);
+      // Honour the client's burst count so high-speed feed matches the local
+      // EjectHandler's loop exactly. Clamped to a sane range so a malicious
+      // client can't flood the world by claiming count = 10000.
+      const rawCount = Number(msg.count);
+      const count = Number.isFinite(rawCount)
+        ? Math.max(1, Math.min(10, Math.floor(rawCount)))
+        : 1;
+      for (let i = 0; i < count; i++) {
+        tryDoEject(player, dx, dy);
+      }
     } else if (type === "respawn") {
       if (player.dead) spawnCellForPlayer(player);
     } else if (type === "ping") {
