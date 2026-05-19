@@ -982,6 +982,12 @@ function popVirus(p: Player, eater: Cell, _v: Virus): void {
 // ─────────────────────────────────────────────────────── merge
 function processMerges(p: Player): void {
   const now = Date.now();
+  // Always clear stale freshSplit — even for single-cell players.
+  // Without this, a cell that split and re-merged stays freshSplit=true
+  // forever, requiring 1.33× mass to eat instead of 1.25×.
+  for (const c of p.cells) {
+    if (c.freshSplit && now >= c.mergeReadyAt) c.freshSplit = false;
+  }
   if (p.cells.length < 2) return;
   outer: for (let i = 0; i < p.cells.length; i++) {
     for (let j = i + 1; j < p.cells.length; j++) {
@@ -1000,13 +1006,12 @@ function processMerges(p: Player): void {
       keeper.vx = (keeper.vx * keeper.mass + consumed.vx * consumed.mass) / total;
       keeper.vy = (keeper.vy * keeper.mass + consumed.vy * consumed.mass) / total;
       keeper.mass = total;
+      // Merged cell is whole again — clear freshSplit so it uses the normal
+      // 1.25× eating ratio instead of the post-split 1.33× ratio.
+      keeper.freshSplit = false;
       p.cells.splice(idx, 1);
       return processMerges(p);
     }
-  }
-  // clear stale freshSplit
-  for (const c of p.cells) {
-    if (c.freshSplit && now >= c.mergeReadyAt) c.freshSplit = false;
   }
 }
 

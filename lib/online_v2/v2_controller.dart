@@ -257,17 +257,14 @@ class V2Controller extends ChangeNotifier {
 
   void _predictPelletEating() {
     if (!sim.isInitialized || sim.cells.isEmpty) return;
-    // Snapshot ids so we don't mutate the map while iterating.
     final toEat = <String>[];
     for (final c in sim.cells) {
-      final r = c.radius;
-      final rSq = r * r;
+      final rSq = c.radius * c.radius;
       for (final p in world.pellets.values) {
         final dx = p.x - c.position.dx;
         final dy = p.y - c.position.dy;
         if (dx * dx + dy * dy < rSq) {
           toEat.add(p.id);
-          if (c.mass < GameConstants.maxCellMass) c.mass += 1.0;
         }
       }
     }
