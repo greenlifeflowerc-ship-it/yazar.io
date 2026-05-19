@@ -37,12 +37,15 @@ class V2LocalSim {
   late final EjectHandler _eject = EjectHandler(engine, _rng);
   late final MergeHandler _merge = MergeHandler(engine);
 
-  Player get player => engine.humanPlayer;
-  List<Cell> get cells => engine.humanPlayer.cells;
-  List<EjectedMass> get localEjected => engine.ejectedMasses;
-
   bool _initialized = false;
   bool get isInitialized => _initialized;
+
+  // All getters that touch `engine.humanPlayer` MUST be safe to call before
+  // [spawn] runs — the screen's ticker starts firing immediately on mount
+  // and the welcome packet only arrives one network round-trip later.
+  Player get player => engine.humanPlayer;
+  List<Cell> get cells => _initialized ? engine.humanPlayer.cells : const [];
+  List<EjectedMass> get localEjected => engine.ejectedMasses;
 
   Offset moveDir = Offset.zero;
   Offset lastNonZeroDir = const Offset(1, 0);
@@ -203,8 +206,10 @@ class V2LocalSim {
   }
 
   /// Aggregate stats — used by the controller to detect divergence vs. the
-  /// server's view of self and decide whether to reconcile.
-  Offset get centerOfMass => player.centerOfMass;
-  double get totalMass => player.totalMass;
-  int get cellCount => player.cells.length;
+  /// server's view of self and decide whether to reconcile. Safe to call
+  /// before [spawn]; return zeros / origin in that case.
+  Offset get centerOfMass =>
+      _initialized ? player.centerOfMass : Offset.zero;
+  double get totalMass => _initialized ? player.totalMass : 0;
+  int get cellCount => _initialized ? player.cells.length : 0;
 }

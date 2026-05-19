@@ -236,7 +236,9 @@ class _GameScreenState extends State<GameScreen>
     if (_draggingEject) return;
     if (_ejectHoldTimer != null) return; // Already running
 
-    _engine.attackMode = true;
+    // NOTE: attackMode intentionally NOT set on feed — players want their
+    // other cells to stay in place (real agar.io behaviour), the feed flies
+    // through them. Only split toggles attackMode.
     _engine.doEject(); // fire on first touch immediately
 
     // The timer now respects the user's "Feed speed" setting.
@@ -253,15 +255,13 @@ class _GameScreenState extends State<GameScreen>
   void _endEjectHold() {
     _ejectHoldTimer?.cancel();
     _ejectHoldTimer = null;
-    _engine.attackMode = false;
   }
 
   void _startEjectHold2() {
     if (_draggingEject2) return;
-    if (_ejectHoldTimer2 != null) return; 
+    if (_ejectHoldTimer2 != null) return;
 
-    _engine.attackMode = true;
-    _engine.doEject(); 
+    _engine.doEject();
 
     final speedMult = GameSettings.instance.feedSpeedMultiplier2;
     final ms = (100 / speedMult).round().clamp(1, 500);
@@ -275,7 +275,6 @@ class _GameScreenState extends State<GameScreen>
   void _endEjectHold2() {
     _ejectHoldTimer2?.cancel();
     _ejectHoldTimer2 = null;
-    _engine.attackMode = false;
   }
 
   void _onSplitTap() {

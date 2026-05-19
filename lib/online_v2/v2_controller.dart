@@ -25,11 +25,15 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../game/entities/cell.dart' as ge;
+import '../game/entities/ejected_mass.dart';
+import '../game/entities/virus.dart' as ge;
 import '../game/game_engine.dart';
+import '../game/mechanics/split_handler.dart';
 import '../game/skin_settings.dart';
 import 'net/v2_packets.dart';
 import 'net/v2_socket_client.dart';
 import 'v2_local_sim.dart';
+import 'v2_skin_cache.dart';
 import 'v2_world.dart';
 
 class V2Controller extends ChangeNotifier {
@@ -38,6 +42,15 @@ class V2Controller extends ChangeNotifier {
   final V2SocketClient client;
   final V2World world = V2World();
   final V2LocalSim sim = V2LocalSim();
+  final V2SkinCache skinCache = V2SkinCache();
+
+  /// Local lifetime cap for self-spawned ejected mass. After this window the
+  /// authoritative server-side copy (in [V2World.ejected]) has fully arrived,
+  /// so the locally-spawned one is dropped to avoid double-rendering.
+  static const _localEjectedLifetimeMs = 500;
+  /// Local prediction window for virus pops, used to suppress accidental
+  /// re-pop of the same virus across two ticks before the server confirms.
+  final Set<String> _locallyPoppedViruses = {};
 
   // ── connection / identity ─────────────────────────────────────────────
   V2ConnState _connState = V2ConnState.idle;
@@ -78,6 +91,13 @@ class V2Controller extends ChangeNotifier {
   int _countMismatchTicks = 0;
   static const _countMismatchSnapThreshold = 6; // ~200 ms at 30 Hz
 
+  /// After `welcome` we spawn the local sim at world center as a placeholder
+  /// — the server's actual chosen spawn point arrives one tick later.
+  /// This flag forces a HARD snap on the first snapshot so the camera and
+  /// the local cell land where the server thinks we are; without it the
+  /// reconcile loop's 400 u distance cap would refuse to close the gap.
+  bool _needsInitialSnap = false;
+
   // ── streams ───────────────────────────────────────────────────────────
   late final List<StreamSubscription<dynamic>> _subs;
 
@@ -117,6 +137,8 @@ class V2Controller extends ChangeNotifier {
     );
     _deadServerConfirmed = false;
     _pendingActions.clear();
+    _needsInitialSnap = true;
+    _countMismatchTicks = 0;
     notifyListeners();
   }
 
@@ -142,8 +164,11 @@ class V2Controller extends ChangeNotifier {
       // death overlay.
       sim.killSelf();
     } else if (wasDead && !s.self.dead) {
-      // Server respawned us. Snap to server-reported center of mass.
+      // Server respawned us. Snap to server-reported center of mass — and
+      // re-arm the initial-snap path so the next reconcile rebuilds cells
+      // straight from the authoritative addCells (not a single seed cell).
       sim.respawn(position: Offset(s.self.cmX, s.self.cmY), mass: s.self.mass);
+      _needsInitialSnap = true;
     }
 
     _reconcileSelf(s);
@@ -200,10 +225,21 @@ class V2Controller extends ChangeNotifier {
     // 2. Predict pellet eating against the current world cache.
     _predictPelletEating();
 
-    // 3. Smooth render positions of every remote-authoritative entity.
+    // 3. Predict eating of local-spawned feed (own cells absorbing own feed)
+    //    and of server-side feed in viewport. Also expire stale local feed
+    //    so it doesn't pile up after server's authoritative copy takes over.
+    _predictEjectedEating();
+    _expireLocalEjected();
+
+    // 4. Predict virus pops. The server is authoritative but waiting a full
+    //    RTT for the cell explosion makes the action feel rubbery, so we run
+    //    the same SplitHandler.popVirus locally.
+    _predictVirusPops();
+
+    // 5. Smooth render positions of every remote-authoritative entity.
     world.tickRender(dt);
 
-    // 4. Throttled input send to the server.
+    // 6. Throttled input send to the server.
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     if (nowMs - _lastInputSendMs >= _inputIntervalMs) {
       _lastInputSendMs = nowMs;
@@ -220,7 +256,7 @@ class V2Controller extends ChangeNotifier {
   }
 
   void _predictPelletEating() {
-    if (sim.cells.isEmpty) return;
+    if (!sim.isInitialized || sim.cells.isEmpty) return;
     // Snapshot ids so we don't mutate the map while iterating.
     final toEat = <String>[];
     for (final c in sim.cells) {
@@ -237,6 +273,114 @@ class V2Controller extends ChangeNotifier {
     }
     for (final id in toEat) {
       world.markPelletLocallyEaten(id);
+    }
+  }
+
+  /// Local cell-vs-ejected eating, for both our locally-spawned feed and the
+  /// server-broadcast ejected from other players. Mirrors the offline rule:
+  /// a cell needs mass >= 22, then anything inside `radius - ejectedRadius*0.4`
+  /// gets consumed. The 200 ms owner-immunity matches the offline / server
+  /// formula so the feed isn't self-eaten before it travels.
+  void _predictEjectedEating() {
+    if (!sim.isInitialized || sim.cells.isEmpty) return;
+    final selfId = _playerId;
+    if (selfId == null) return;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final ejectedRadius = math.sqrt(13 / math.pi) * 10;
+
+    // ── local-only ejected (our own feed) ──
+    final localToRemove = <EjectedMass>[];
+    for (final c in sim.cells) {
+      if (c.mass < 22) continue;
+      for (final e in sim.localEjected) {
+        final age = nowMs - e.spawnTime.millisecondsSinceEpoch;
+        if (e.ownerId == c.ownerId && age < 200) continue;
+        final eatR = c.radius - e.radius * 0.4;
+        if (eatR <= 0) continue;
+        final dx = e.position.dx - c.position.dx;
+        final dy = e.position.dy - c.position.dy;
+        if (dx * dx + dy * dy < eatR * eatR) {
+          if (c.mass < GameConstants.maxCellMass) {
+            c.mass += GameConstants.ejectConsumedMass;
+          }
+          localToRemove.add(e);
+        }
+      }
+    }
+    if (localToRemove.isNotEmpty) {
+      sim.localEjected
+          .removeWhere((e) => localToRemove.contains(e));
+    }
+
+    // ── server-broadcast ejected (other players' feed) ──
+    // Skip ejected that belong to our own cells for the first 200 ms so our
+    // own feed doesn't get self-eaten the moment the server confirms it.
+    final serverToRemove = <String>[];
+    for (final c in sim.cells) {
+      if (c.mass < 22) continue;
+      for (final e in world.ejected.values) {
+        if (e.ownerId == selfId && nowMs - e.addedAt < 200) continue;
+        final eatR = c.radius - ejectedRadius * 0.4;
+        if (eatR <= 0) continue;
+        final dx = e.renderX - c.position.dx;
+        final dy = e.renderY - c.position.dy;
+        if (dx * dx + dy * dy < eatR * eatR) {
+          if (c.mass < GameConstants.maxCellMass) {
+            c.mass += GameConstants.ejectConsumedMass;
+          }
+          serverToRemove.add(e.id);
+        }
+      }
+    }
+    for (final id in serverToRemove) {
+      world.ejected.remove(id);
+    }
+  }
+
+  /// After [_localEjectedLifetimeMs], the server-broadcast copy of our own
+  /// feed is fully visible via [V2World.ejected]. Drop the local-only one so
+  /// we don't render it twice.
+  void _expireLocalEjected() {
+    if (sim.localEjected.isEmpty) return;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    sim.localEjected.removeWhere((e) =>
+        nowMs - e.spawnTime.millisecondsSinceEpoch > _localEjectedLifetimeMs);
+  }
+
+  /// Predict virus pops locally so the cell shatter animation fires the
+  /// instant our cell touches the virus, instead of waiting one RTT for the
+  /// server to broadcast the new fragment cells.
+  void _predictVirusPops() {
+    if (!sim.isInitialized || sim.cells.isEmpty) return;
+    final cells = [...sim.cells];
+    final toPop = <String>[];
+    for (final c in cells) {
+      final cr = c.radius;
+      for (final v in world.viruses.values) {
+        if (_locallyPoppedViruses.contains(v.id)) continue;
+        final vr = v.renderRadius;
+        if (cr <= vr * 1.15) continue;
+        final trigger = cr + vr * 0.2;
+        final dx = v.renderX - c.position.dx;
+        final dy = v.renderY - c.position.dy;
+        if (dx * dx + dy * dy < trigger * trigger) {
+          // Pop locally — reuse the offline SplitHandler so fragment
+          // distribution and merge cooldowns match the server bit-for-bit.
+          final synthVirus = ge.Virus(id: v.id, position: Offset(v.renderX, v.renderY));
+          SplitHandler(sim.engine, math.Random()).popVirus(sim.player, c, synthVirus);
+          toPop.add(v.id);
+          break;
+        }
+      }
+    }
+    for (final id in toPop) {
+      _locallyPoppedViruses.add(id);
+      world.viruses.remove(id);
+    }
+    // Cap the set so it doesn't grow indefinitely — server confirms
+    // pops within ~200 ms; 256 entries gives a few seconds of headroom.
+    if (_locallyPoppedViruses.length > 256) {
+      _locallyPoppedViruses.clear();
     }
   }
 
@@ -262,6 +406,15 @@ class V2Controller extends ChangeNotifier {
       // ourselves shouldn't happen) — skip.
       return;
     }
+    if (_needsInitialSnap) {
+      // First snapshot since welcome — accept the server's chosen spawn
+      // point verbatim. Otherwise the placeholder mid-world spawn drifts
+      // the local cell ~half a world away from where snapshots target.
+      _rebuildLocalFromServer(serverCells);
+      _needsInitialSnap = false;
+      _countMismatchTicks = 0;
+      return;
+    }
     if (sim.cells.isEmpty) {
       // Local was empty but server says we have cells — rebuild from server.
       _rebuildLocalFromServer(serverCells);
@@ -270,28 +423,55 @@ class V2Controller extends ChangeNotifier {
     }
 
     if (sim.cells.length != serverCells.length) {
-      _countMismatchTicks++;
-      if (_countMismatchTicks >= _countMismatchSnapThreshold) {
-        _rebuildLocalFromServer(serverCells);
+      // We almost always have MORE cells locally for ~1 RTT (after a split,
+      // a virus pop, or before the server has processed an upcoming merge),
+      // or FEWER for ~1 RTT (after a local merge). Both are harmless — the
+      // server catches up within a snapshot or two. Only rebuild when we
+      // have STRICTLY FEWER cells than the server for an extended window,
+      // which means we missed a real event (eaten by another player,
+      // ate a virus we didn't predict, etc.).
+      if (sim.cells.length < serverCells.length) {
+        _countMismatchTicks++;
+        if (_countMismatchTicks >= _countMismatchSnapThreshold) {
+          _rebuildLocalFromServer(serverCells);
+          _countMismatchTicks = 0;
+        }
+      } else {
         _countMismatchTicks = 0;
       }
       return;
     }
     _countMismatchTicks = 0;
 
-    // Same cell count — pair by descending mass and blend per pair.
-    final localSorted = [...sim.cells]
-      ..sort((a, b) => b.mass.compareTo(a.mass));
-    final serverSorted = [...serverCells]
-      ..sort((a, b) => b.targetMass.compareTo(a.targetMass));
+    // Same cell count — pair each local cell with its NEAREST server cell
+    // (capped to a reasonable radius) instead of by mass index. Mass-index
+    // pairing fights split/merge cycles when two new cells start with the
+    // same mass at very different positions.
+    final usedServer = <V2WorldCell>{};
+    for (final l in sim.cells) {
+      V2WorldCell? best;
+      double bestD2 = double.infinity;
+      for (final r in serverCells) {
+        if (usedServer.contains(r)) continue;
+        final dx = r.targetX - l.position.dx;
+        final dy = r.targetY - l.position.dy;
+        final d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          best = r;
+        }
+      }
+      if (best == null) continue;
+      usedServer.add(best);
+      // Don't pull across long distances — pairing is likely wrong if the
+      // match is more than 400 u away (a split cell can drift faster than
+      // that legitimately, so this guards against bad pairings only).
+      final d = math.sqrt(bestD2);
+      if (d > 400) continue;
 
-    for (int i = 0; i < localSorted.length; i++) {
-      final l = localSorted[i];
-      final r = serverSorted[i];
-      final dx = r.targetX - l.position.dx;
-      final dy = r.targetY - l.position.dy;
-      final d = math.sqrt(dx * dx + dy * dy);
-      final massDelta = r.targetMass - l.mass;
+      final dx = best.targetX - l.position.dx;
+      final dy = best.targetY - l.position.dy;
+      final massDelta = best.targetMass - l.mass;
 
       // Tiny drift: ignore — local sim is matching the server.
       if (d < 12 && massDelta.abs() < l.mass * 0.02) continue;

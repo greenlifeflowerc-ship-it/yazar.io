@@ -1160,6 +1160,7 @@ function buildSnapshot(p: Player, lb: LBEntry[], sendSlow: boolean): unknown {
         x: Math.round(e.x * 10) / 10,
         y: Math.round(e.y * 10) / 10,
         c: e.color,
+        o: e.ownerId,
       });
       p.seenEjected.add(e.id);
     } else {

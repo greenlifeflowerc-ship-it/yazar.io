@@ -23,8 +23,8 @@ class GameMode {
 final List<GameMode> gameModes = [
   GameMode(
     id: 'online_classic',
-    name: 'Online',
-    subtitle: 'Play online',
+    name: 'Classic Online FFA',
+    subtitle: 'Real-time FFA',
     icon: Icons.public,
     gradientColors: const [
       Color(0xFF00E5FF),

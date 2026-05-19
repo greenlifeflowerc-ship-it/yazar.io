@@ -159,11 +159,13 @@ class V2AddEjected {
     required this.x,
     required this.y,
     required this.colorHex,
+    required this.ownerId,
   });
   final String id;
   final double x;
   final double y;
   final String colorHex;
+  final String ownerId;
 }
 
 class V2UpdEjected {
@@ -333,6 +335,7 @@ class V2State {
           x: (e['x'] as num?)?.toDouble() ?? 0,
           y: (e['y'] as num?)?.toDouble() ?? 0,
           colorHex: (e['c'] as String?) ?? '#FFFFFF',
+          ownerId: (e['o'] as String?) ?? '',
         ));
       }
       final updEjected = <V2UpdEjected>[];

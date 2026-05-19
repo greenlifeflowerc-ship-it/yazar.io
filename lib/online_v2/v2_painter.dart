@@ -174,6 +174,7 @@ class V2Painter extends CustomPainter {
         cellColor: c.color,
         cellOwnerId: c.ownerId,
         cellIsHuman: c.isHuman,
+        cellSkinId: c.skinId,
       ));
     }
 
@@ -224,6 +225,10 @@ class V2Painter extends CustomPainter {
           skin = ss.isAltFaceActive && ss.altSkinImage != null
               ? ss.altSkinImage
               : ss.skinImage;
+        } else if (d.cellSkinId.isNotEmpty) {
+          // Remote players — async-loaded from the asset bundle the first
+          // time we see their skin id; cached for the rest of the session.
+          skin = controller.skinCache.get(d.cellSkinId);
         }
         _drawCell(canvas, d, skin: skin, fill: fill, stroke: stroke);
       }
@@ -477,6 +482,7 @@ class _Drawable {
     this.cellColor = Colors.white,
     this.cellOwnerId = '',
     this.cellIsHuman = false,
+    this.cellSkinId = '',
     this.cellLocal,
   });
   final double mass;
@@ -487,6 +493,7 @@ class _Drawable {
   final Color cellColor;
   final String cellOwnerId;
   final bool cellIsHuman;
+  final String cellSkinId;
   final ge.Cell? cellLocal;
 }
 

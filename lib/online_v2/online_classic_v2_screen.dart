@@ -22,6 +22,7 @@ import 'package:intl/intl.dart';
 
 import '../game/game_engine.dart';
 import '../game/game_settings.dart';
+import '../game/skin_settings.dart';
 import '../widgets/death_screen.dart';
 import '../widgets/game_button.dart';
 import '../widgets/pause_menu.dart';
@@ -58,8 +59,10 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
   // Draggable button positions reuse the offline GameSettings keys so users
   // get one consistent layout across modes.
   late final ValueNotifier<Offset> _ejectPos;
+  late final ValueNotifier<Offset> _ejectPos2;
   late final ValueNotifier<Offset> _splitPos;
   bool _draggingEject = false;
+  bool _draggingEject2 = false;
   bool _draggingSplit = false;
 
   // PC Mode support.
@@ -67,8 +70,9 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
   Offset _mousePos = Offset.zero;
   bool _firstMouseHover = false;
 
-  // Hold-to-eject.
+  // Hold-to-eject (two independent buttons, same as offline).
   Timer? _ejectHoldTimer;
+  Timer? _ejectHoldTimer2;
 
   static final _numberFmt = NumberFormat.decimalPattern('en_US');
 
@@ -76,9 +80,15 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
   void initState() {
     super.initState();
     _ejectPos = ValueNotifier(GameSettings.instance.ejectBtnFrac);
+    _ejectPos2 = ValueNotifier(GameSettings.instance.ejectBtnFrac2);
     _splitPos = ValueNotifier(GameSettings.instance.splitBtnFrac);
     _ctrl = V2Controller();
-    _ctrl.connect(playerName: widget.nickname.trim());
+    // Pass the player's chosen skin asset path so the server can broadcast
+    // it; other clients lazy-load the image via V2SkinCache.
+    _ctrl.connect(
+      playerName: widget.nickname.trim(),
+      skin: SkinSettings.instance.skinPath ?? '',
+    );
     _ticker = createTicker(_onTick)..start();
     if (GameSettings.instance.pcMode) _focus.requestFocus();
   }
@@ -135,7 +145,8 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
   void _startEjectHold() {
     if (_draggingEject) return;
     if (_ejectHoldTimer != null) return;
-    _ctrl.setAttackMode(true);
+    // attackMode intentionally NOT toggled on feed — see comment in
+    // game_screen._startEjectHold; matches offline behaviour 1:1.
     _ctrl.doEject();
     final speed = GameSettings.instance.feedSpeedMultiplier;
     final ms = (100 / speed).round().clamp(1, 500);
@@ -148,7 +159,23 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
   void _endEjectHold() {
     _ejectHoldTimer?.cancel();
     _ejectHoldTimer = null;
-    _ctrl.setAttackMode(false);
+  }
+
+  void _startEjectHold2() {
+    if (_draggingEject2) return;
+    if (_ejectHoldTimer2 != null) return;
+    _ctrl.doEject();
+    final speed = GameSettings.instance.feedSpeedMultiplier2;
+    final ms = (100 / speed).round().clamp(1, 500);
+    _ejectHoldTimer2 = Timer.periodic(
+      Duration(milliseconds: ms),
+      (_) => _ctrl.doEject(),
+    );
+  }
+
+  void _endEjectHold2() {
+    _ejectHoldTimer2?.cancel();
+    _ejectHoldTimer2 = null;
   }
 
   void _onSplitTap() {
@@ -185,10 +212,12 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
   @override
   void dispose() {
     _ejectHoldTimer?.cancel();
+    _ejectHoldTimer2?.cancel();
     _ticker.dispose();
     _frame.dispose();
     _hudTick.dispose();
     _ejectPos.dispose();
+    _ejectPos2.dispose();
     _splitPos.dispose();
     _focus.dispose();
     _ctrl.dispose();
@@ -196,10 +225,17 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
   }
 
   // ───────────────────────────────────────────────────── build
+  /// The painter is recreated on every frame tick so the latest [_camPos] /
+  /// [_camZoom] reach `V2Painter`. `repaint: _frame` alone is not enough —
+  /// it triggers `paint()` but the painter still holds the stale camera
+  /// values captured at construction time.
   Widget _buildWorldCanvas(Size size) {
     final scale = GameSettings.instance.renderScale;
-    if (scale == 1.0) {
-      return RepaintBoundary(
+    final canvasSize =
+        scale == 1.0 ? size : Size(size.width * scale, size.height * scale);
+    final canvas = ValueListenableBuilder<int>(
+      valueListenable: _frame,
+      builder: (_, _, _) => RepaintBoundary(
         child: CustomPaint(
           painter: V2Painter(
             controller: _ctrl,
@@ -207,27 +243,17 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
             cameraZoom: _camZoom,
             repaint: _frame,
           ),
-          size: size,
+          size: canvasSize,
         ),
-      );
-    }
-    final canvasSize = Size(size.width * scale, size.height * scale);
+      ),
+    );
+    if (scale == 1.0) return canvas;
     return FittedBox(
       fit: BoxFit.fill,
       child: SizedBox(
         width: canvasSize.width,
         height: canvasSize.height,
-        child: RepaintBoundary(
-          child: CustomPaint(
-            painter: V2Painter(
-              controller: _ctrl,
-              cameraPos: _camPos,
-              cameraZoom: _camZoom,
-              repaint: _frame,
-            ),
-            size: canvasSize,
-          ),
-        ),
+        child: canvas,
       ),
     );
   }
@@ -238,7 +264,12 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
     final gs = GameSettings.instance;
 
     return AnimatedBuilder(
-      animation: gs,
+      // Listen to BOTH GameSettings (for setting changes) AND the V2Controller
+      // (for connection state / death / leaderboard / world cache updates).
+      // Without the controller in this list the death overlay and connection
+      // chip only refresh on the lower-frequency `_hudTick`, making them feel
+      // sticky for ~100 ms after the event.
+      animation: Listenable.merge([gs, _ctrl]),
       builder: (context, _) {
         final btnScale = gs.buttonScale;
         final joystickRight = gs.joystickOnRight;
@@ -262,6 +293,14 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
                   _startEjectHold();
                 } else if (isUp) {
                   _endEjectHold();
+                }
+                return KeyEventResult.handled;
+              }
+              if (event.logicalKey == LogicalKeyboardKey.keyE) {
+                if (isDown) {
+                  _startEjectHold2();
+                } else if (isUp) {
+                  _endEjectHold2();
                 }
                 return KeyEventResult.handled;
               }
@@ -375,7 +414,7 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
                     ),
                   ),
 
-                  // Eject button — draggable + hold-to-feed.
+                  // Eject button 1 — draggable + hold-to-feed.
                   if (!pcMode)
                     ValueListenableBuilder<Offset>(
                       valueListenable: _ejectPos,
@@ -407,6 +446,45 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
                               size: 60 * btnScale,
                               enabled: !_ctrl.isDead && !_draggingEject,
                               hint: _draggingEject ? 'hold & drag' : null,
+                              builder: (_) => const EjectIcon(),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+
+                  // Eject button 2 — second feed button, mirrors offline.
+                  if (!pcMode)
+                    ValueListenableBuilder<Offset>(
+                      valueListenable: _ejectPos2,
+                      builder: (context, pos, _) {
+                        final half = 30.0 * btnScale;
+                        return Positioned(
+                          left: pos.dx * size.width - half,
+                          top: pos.dy * size.height - half,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onLongPressStart: (_) =>
+                                setState(() => _draggingEject2 = true),
+                            onLongPressMoveUpdate: (d) {
+                              final n = Offset(
+                                (d.globalPosition.dx / size.width)
+                                    .clamp(0.04, 0.96),
+                                (d.globalPosition.dy / size.height)
+                                    .clamp(0.04, 0.96),
+                              );
+                              _ejectPos2.value = n;
+                              GameSettings.instance.ejectBtnFrac2 = n;
+                            },
+                            onLongPressEnd: (_) =>
+                                setState(() => _draggingEject2 = false),
+                            child: GameButton(
+                              onPressStart: _startEjectHold2,
+                              onPressEnd: _endEjectHold2,
+                              color: const Color(0xFFFFB300),
+                              size: 60 * btnScale,
+                              enabled: !_ctrl.isDead && !_draggingEject2,
+                              hint: _draggingEject2 ? 'hold & drag' : null,
                               builder: (_) => const EjectIcon(),
                             ),
                           ),
@@ -468,7 +546,7 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
                               borderRadius: BorderRadius.circular(20),
                             ),
                             child: Text(
-                              'PC Mode: Move with mouse • Split: Space • Feed: W',
+                              'PC Mode: Move with mouse • Split: Space • Feed: W / E',
                               style: GoogleFonts.baloo2(
                                 color: Colors.white70,
                                 fontSize: 13,

@@ -117,12 +117,16 @@ class V2WorldEjected {
     required double initialX,
     required double initialY,
     required this.color,
+    required this.ownerId,
+    required this.addedAt,
   })  : targetX = initialX,
         targetY = initialY,
         renderX = initialX,
         renderY = initialY;
   final String id;
   final Color color;
+  final String ownerId;
+  final int addedAt; // ms timestamp when this entry was added to world
   double targetX, targetY;
   double renderX, renderY;
 
@@ -226,12 +230,15 @@ class V2World {
     }
 
     // ── ejected ──
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
     for (final e in s.addEjected) {
       ejected[e.id] = V2WorldEjected(
         id: e.id,
         initialX: e.x,
         initialY: e.y,
         color: _parseHex(e.colorHex),
+        ownerId: e.ownerId,
+        addedAt: nowMs,
       );
     }
     for (final u in s.updEjected) {
