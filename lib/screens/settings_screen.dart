@@ -216,14 +216,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
             'Feed speed 1',
             _s.feedSpeedMultiplier,
             min: 0.5,
-            max: 100.0,
+            max: 150.0,
             onChanged: (v) => _s.feedSpeedMultiplier = v,
           ),
           _sliderRow(
             'Feed speed 2',
             _s.feedSpeedMultiplier2,
             min: 0.5,
-            max: 100.0,
+            max: 150.0,
             onChanged: (v) => _s.feedSpeedMultiplier2 = v,
           ),
           _sliderRow(

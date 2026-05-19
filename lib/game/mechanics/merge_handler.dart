@@ -74,7 +74,7 @@ class MergeHandler {
       
       final accelMag = GameConstants.cohesionStrength *
           min(dist, GameConstants.cohesionMaxDistance) *
-          cohesionFactor;
+          cohesionFactor * 1.2; // 20% boost for "magnetic" feel
       c.velocity += unit * accelMag * dt;
     }
   }

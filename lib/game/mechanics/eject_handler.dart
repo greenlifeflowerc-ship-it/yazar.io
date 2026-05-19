@@ -19,7 +19,7 @@ class EjectHandler {
   /// nudged forward in 2-unit increments (max 30 iterations) until it's no
   /// longer inside any friendly cell — projectiles never spawn inside the
   /// player's own body.
-  void ejectPlayer(Player p, Offset aimDir) {
+  void ejectPlayer(Player p, Offset aimDir, {double? multiplier}) {
     if (p.isDead) return;
     final mag = aimDir.distance;
     final unit = mag > 0 ? aimDir / mag : const Offset(1, 0);
@@ -29,7 +29,8 @@ class EjectHandler {
     int cellIdx = 0;
     // Macro Logic: If feed speed is very high (> 20), fire multiple pellets
     // per cell in a single call to achieve insane speeds.
-    final burstCount = (GameSettings.instance.feedSpeedMultiplier / 10).floor().clamp(1, 10);
+    final speed = multiplier ?? GameSettings.instance.feedSpeedMultiplier;
+    final burstCount = (speed / 10).floor().clamp(1, 20);
 
     for (final c in p.cells) {
       if (c.mass < GameConstants.ejectMinMass) continue;
@@ -41,6 +42,7 @@ class EjectHandler {
         final randomRad = (rng.nextDouble() * 12 - 6) * (pi / 180);
         final speedVar = 0.95 + rng.nextDouble() * 0.1;
 
+        // Direction vector from cell position toward the targetPoint (or aimDir)
         final finalDir = Offset(
           unit.dx * cos(randomRad) - unit.dy * sin(randomRad),
           unit.dx * sin(randomRad) + unit.dy * cos(randomRad),
@@ -52,13 +54,35 @@ class EjectHandler {
           dir: finalDir,
           ejectedRadius: ejectedRadius,
         );
+
+        final ejectVelocity = finalDir *
+              (GameConstants.ejectVelocityInitial * speedMult * speedVar);
+
         engine.ejectedMasses.add(EjectedMass(
           ownerId: p.id,
           position: launchPoint,
-          velocity: finalDir *
-              (GameConstants.ejectVelocityInitial * speedMult * speedVar),
+          velocity: ejectVelocity,
           color: _vivid(c.color),
         ));
+
+        // --- Recoil Sticking Physics ---
+        // Every eject applies a backward force (recoil) to the cell.
+        // Wall-sticking: if the cell is at a boundary and feeding TOWARDS it, 
+        // we cancel the recoil component that would push it away from the wall.
+        const recoilScale = 0.35; 
+        final recoilVelocity = finalDir * (GameConstants.ejectMass / c.mass) * 
+                               (GameConstants.ejectVelocityInitial * speedMult) * recoilScale;
+        
+        final r = c.radius;
+        final inset = r * 0.85; 
+        final world = GameConstants.worldSize;
+        double rx = recoilVelocity.dx;
+        double ry = recoilVelocity.dy;
+
+        if ((c.position.dx <= inset && finalDir.dx < -0.2) || (c.position.dx >= world - inset && finalDir.dx > 0.2)) rx = 0;
+        if ((c.position.dy <= inset && finalDir.dy < -0.2) || (c.position.dy >= world - inset && finalDir.dy > 0.2)) ry = 0;
+
+        c.velocity -= Offset(rx, ry);
       }
       cellIdx++;
     }
@@ -105,8 +129,8 @@ class EjectHandler {
     return launch;
   }
 
-  /// Per-frame motion + friction decay.
-  void update(double dt) {
+  /// Per-frame motion + friction decay + magnet effect.
+  void update(double dt, {Iterable<Offset>? extraAttractors}) {
     final s = GameSettings.instance;
     // Decouple speed and distance:
     // Distance = v0 / (1 - friction).
@@ -122,6 +146,37 @@ class EjectHandler {
     final worldSize = GameConstants.worldSize;
     for (final e in engine.ejectedMasses) {
       if (e.velocity == Offset.zero) continue;
+
+      // --- Subtle Magnet Effect for Ejected Feed ---
+      Offset magnetForce = Offset.zero;
+      
+      // Attract toward known player cells in the engine.
+      for (final p in engine.players) {
+        if (p.isDead) continue;
+        for (final c in p.cells) {
+          final delta = c.position - e.position;
+          final d = delta.distance;
+          if (d < 150 && d > 10) {
+            final strength = (1.0 - d / 150) * 800.0;
+            magnetForce += (delta / d) * strength;
+          }
+        }
+      }
+      
+      // Attract toward extra attractors (e.g. remote players in online mode).
+      if (extraAttractors != null) {
+        for (final pos in extraAttractors) {
+          final delta = pos - e.position;
+          final d = delta.distance;
+          if (d < 150 && d > 10) {
+            final strength = (1.0 - d / 150) * 800.0;
+            magnetForce += (delta / d) * strength;
+          }
+        }
+      }
+
+      e.velocity += magnetForce * dt;
+
       e.position += e.velocity * dt;
       e.velocity = e.velocity * fric;
       if (e.velocity.distance < 1) e.velocity = Offset.zero;

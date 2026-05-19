@@ -378,7 +378,7 @@ class V2Controller extends ChangeNotifier {
 
     // 1. Local sim step (movement, cohesion, separation, integrate, eject,
     //    merge, auto-split cap). Mirrors Offline Classic 1:1.
-    sim.step(dt);
+    sim.step(dt, world: world);
 
     // 2. Predict pellet eating against the current world cache.
     _predictPelletEating();
@@ -459,8 +459,7 @@ class V2Controller extends ChangeNotifier {
         if (localToRemove.contains(e)) continue;
         final age = nowMs - e.spawnTime.millisecondsSinceEpoch;
         if (e.ownerId == c.ownerId && age < 200) continue;
-        final eatR = c.radius - e.radius * 0.4;
-        if (eatR <= 0) continue;
+        final eatR = c.radius + e.radius;
         final dx = e.position.dx - c.position.dx;
         final dy = e.position.dy - c.position.dy;
         if (dx * dx + dy * dy < eatR * eatR) {
@@ -478,8 +477,7 @@ class V2Controller extends ChangeNotifier {
       final cRadius = c.renderRadius;
       for (final e in sim.localEjected) {
         if (localToRemove.contains(e)) continue;
-        final eatR = cRadius - e.radius * 0.4;
-        if (eatR <= 0) continue;
+        final eatR = cRadius + e.radius;
         final dx = e.position.dx - c.renderX;
         final dy = e.position.dy - c.renderY;
         if (dx * dx + dy * dy < eatR * eatR) {
@@ -518,8 +516,7 @@ class V2Controller extends ChangeNotifier {
       if (c.mass < 22) continue;
       for (final e in world.ejected.values) {
         if (e.ownerId == selfId) continue;
-        final eatR = c.radius - ejectedRadius * 0.4;
-        if (eatR <= 0) continue;
+        final eatR = c.radius + ejectedRadius;
         final dx = e.renderX - c.position.dx;
         final dy = e.renderY - c.position.dy;
         if (dx * dx + dy * dy < eatR * eatR) {

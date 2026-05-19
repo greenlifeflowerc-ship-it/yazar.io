@@ -95,7 +95,7 @@ class GameSettings extends ChangeNotifier {
   double _feedSpeedMultiplier = 1.0;
   double get feedSpeedMultiplier => _feedSpeedMultiplier;
   set feedSpeedMultiplier(double v) {
-    final c = v.clamp(0.5, 100.0);
+    final c = v.clamp(0.5, 150.0);
     if (_feedSpeedMultiplier == c) return;
     _feedSpeedMultiplier = c;
     StorageService.instance.setDouble('feedSpeedMultiplier', c);
@@ -105,7 +105,7 @@ class GameSettings extends ChangeNotifier {
   double _feedSpeedMultiplier2 = 1.0;
   double get feedSpeedMultiplier2 => _feedSpeedMultiplier2;
   set feedSpeedMultiplier2(double v) {
-    final c = v.clamp(0.5, 100.0);
+    final c = v.clamp(0.5, 200.0);
     if (_feedSpeedMultiplier2 == c) return;
     _feedSpeedMultiplier2 = c;
     StorageService.instance.setDouble('feedSpeedMultiplier2', c);

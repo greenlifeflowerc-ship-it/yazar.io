@@ -85,8 +85,8 @@ const LANE_FORWARD_DEPTH_FACTOR = 2.8;
 // Per-radius speed clamp.
 const REFERENCE_RADIUS = 35.0;
 const MAX_SMALL_CELL_SPEED = 360.0;
-const MAX_LARGE_CELL_SPEED = 95.0;
-const SPEED_RADIUS_POWER = 0.42;
+const MAX_LARGE_CELL_SPEED = 115.0;
+const SPEED_RADIUS_POWER = 0.38;
 const SPEED_SCALE_BASE = 260.0;
 
 // Merge.
@@ -547,19 +547,34 @@ function applyInputForce(p: Player, dt: number): void {
   }
   const mag = Math.hypot(dx, dy);
   if (mag < 0.05) return;
-  // Convergent movement: all cells aim for a target point X (Agar.io mobile).
   const intensity = mag > 1 ? 1 : mag;
-  const com = centerOfMass(p);
-  const tx = com.x + (dx / mag) * 800;
-  const ty = com.y + (dy / mag) * 800;
 
-  const f = intensity * INPUT_MOVE_STRENGTH * dt;
+  const com = centerOfMass(p);
+
+  let maxR = 0;
+  for (const c of p.cells) {
+    const r = radius(c.mass);
+    if (r > maxR) maxR = r;
+  }
+
+  const targetDist = 1000;
+  const tx = com.x + (dx / mag) * targetDist;
+  const ty = com.y + (dy / mag) * targetDist;
+
   for (const c of p.cells) {
     const tdx = tx - c.x, tdy = ty - c.y;
     const d = Math.hypot(tdx, tdy);
     if (d > 0.1) {
-      c.vx += (tdx / d) * f;
-      c.vy += (tdy / d) * f;
+      const r = radius(c.mass);
+      const maxSpeed = maxSpeedForRadius(r);
+      // Agility scaling: small = light/fast acceleration, large = heavy/slow.
+      const agility = Math.pow(150 / (c.mass + 50), 0.15);
+      const finalAgility = Math.max(0.7, Math.min(1.5, agility));
+
+      const accel = maxSpeed * DAMPING_PER_SECOND * finalAgility;
+
+      c.vx += (tdx / d) * accel * intensity * dt;
+      c.vy += (tdy / d) * accel * intensity * dt;
     }
   }
 }
@@ -680,11 +695,19 @@ function integrateCells(p: Player, dt: number): void {
     }
     c.x += c.vx * dt;
     c.y += c.vy * dt;
-    if (c.mass > DECAY_THRESHOLD) {
-      const nm = c.mass * Math.pow(1 - MASS_DECAY_RATE, dt);
+    const nm = c.mass * Math.pow(1 - MASS_DECAY_RATE, dt);
       c.mass = nm < DECAY_THRESHOLD ? DECAY_THRESHOLD : nm;
     }
+
+    // Wall Sticking Physics
     const inset = r * 0.75;
+    if ((c.x <= inset && c.vx < 0) || (c.x >= WORLD_SIZE - inset && c.vx > 0)) {
+      c.vx = 0;
+    }
+    if ((c.y <= inset && c.vy < 0) || (c.y >= WORLD_SIZE - inset && c.vy > 0)) {
+      c.vy = 0;
+    }
+
     c.x = clamp(c.x, inset, WORLD_SIZE - inset);
     c.y = clamp(c.y, inset, WORLD_SIZE - inset);
   }
@@ -758,6 +781,20 @@ function tryDoEject(p: Player, dirX: number, dirY: number): void {
       color: c.color,
       spawnedAt: Date.now(),
     });
+
+    // --- Recoil Sticking Physics ---
+    // If cell is at boundary and feeding TOWARDS it, cancel recoil that pushes away.
+    const recoilScale = 0.35;
+    let rvx = fx * (EJECT_MASS / c.mass) * EJECT_VELOCITY_INITIAL * recoilScale;
+    let rvy = fy * (EJECT_MASS / c.mass) * EJECT_VELOCITY_INITIAL * recoilScale;
+
+    const cr = radius(c.mass);
+    const inset = cr * 0.85;
+    if ((c.x <= inset && fx < -0.2) || (c.x >= WORLD_SIZE - inset && fx > 0.2)) rvx = 0;
+    if ((c.y <= inset && fy < -0.2) || (c.y >= WORLD_SIZE - inset && fy > 0.2)) rvy = 0;
+
+    c.vx -= rvx;
+    c.vy -= rvy;
   }
 }
 
@@ -767,6 +804,21 @@ function updateEjected(dt: number): void {
   const er = radius(EJECT_MASS);
   for (const e of ejected.values()) {
     if (e.vx === 0 && e.vy === 0) continue;
+
+    // --- Subtle Magnet Effect for Ejected Feed ---
+    for (const p of players.values()) {
+      if (p.dead) continue;
+      for (const c of p.cells) {
+        const dx = c.x - e.x, dy = c.y - e.y;
+        const d = Math.hypot(dx, dy);
+        if (d < 150 && d > 10) {
+          const strength = (1.0 - d / 150) * 800.0;
+          e.vx += (dx / d) * strength * dt;
+          e.vy += (dy / d) * strength * dt;
+        }
+      }
+    }
+
     e.x += e.vx * dt;
     e.y += e.vy * dt;
     e.vx *= fric;
@@ -823,6 +875,25 @@ function tryDoSplit(p: Player, dirX: number, dirY: number): void {
   }
 }
 
+function applyPelletMagnet(dt: number): void {
+  for (const p of players.values()) {
+    if (p.dead) continue;
+    for (const c of p.cells) {
+      // Very subtle pull toward nearby pellets.
+      for (const pe of pellets.values()) {
+        const dx = pe.x - c.x, dy = pe.y - c.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < 100 * 100 && d2 > 1) {
+          const d = Math.sqrt(d2);
+          const strength = (1.0 - d / 100) * 150.0;
+          c.vx += (dx / d) * strength * dt;
+          c.vy += (dy / d) * strength * dt;
+        }
+      }
+    }
+  }
+}
+
 // ─────────────────────────────────────────────────────── collisions
 function resolveEatPellets(): void {
   for (const p of players.values()) {
@@ -852,7 +923,7 @@ function resolveEatEjected(): void {
       for (const [id, e] of ejected) {
         if (e.ownerId === c.ownerId && now - e.spawnedAt < EJECT_OWNER_IMMUNITY_MS) continue;
         const er = radius(EJECT_MASS);
-        const eatR = r - er * 0.4;
+        const eatR = r + er; // Eat as soon as it touches the edge
         const dx = e.x - c.x, dy = e.y - c.y;
         if (dx * dx + dy * dy < eatR * eatR) {
           if (c.mass < MAX_CELL_MASS) c.mass += EJECT_CONSUMED_MASS;
@@ -1278,6 +1349,7 @@ setInterval(() => {
     applyCohesion(p, dt);
     applySeparation(p, dt);
     applyAttackSpread(p, dt);
+    applyPelletMagnet(dt);
     integrateCells(p, dt);
   }
 

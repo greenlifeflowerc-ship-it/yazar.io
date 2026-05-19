@@ -21,6 +21,7 @@ import '../game/game_mode_type.dart';
 import '../game/mechanics/eject_handler.dart';
 import '../game/mechanics/merge_handler.dart';
 import '../game/mechanics/split_handler.dart';
+import 'v2_world.dart';
 
 /// Public surface the controller uses. All physics goes through this class so
 /// the controller doesn't have to know about [GameEngine] internals.
@@ -131,7 +132,7 @@ class V2LocalSim {
 
   /// One simulation step. Mirrors the offline engine sequence for the local
   /// player only — no bot AI, no global collision pass, no pellet spawner.
-  void step(double dt) {
+  void step(double dt, {V2World? world}) {
     if (!_initialized || player.isDead || dt <= 0) return;
     engine.elapsed += dt;
 
@@ -146,10 +147,33 @@ class V2LocalSim {
       attackMode: attackMode,
       aimDir: lastNonZeroDir,
     );
+    _applyMagnetEffects(dt, world);
     _integrate(player, dt);
-    _eject.update(dt);
+    
+    final remotePositions = world?.cells.values
+        .where((c) => !c.isSelf)
+        .map((c) => Offset(c.renderX, c.renderY));
+    _eject.update(dt, extraAttractors: remotePositions);
+
     _merge.processMerges(player);
     _split.enforceAutoSplit(player);
+  }
+
+  void _applyMagnetEffects(double dt, V2World? world) {
+    if (world == null) return;
+    for (final c in player.cells) {
+      // 1. Pellet Magnet (Client Prediction)
+      for (final pe in world.pellets.values) {
+        final dx = pe.x - c.position.dx;
+        final dy = pe.y - c.position.dy;
+        final d2 = dx * dx + dy * dy;
+        if (d2 < 100 * 100 && d2 > 1) {
+          final d = math.sqrt(d2);
+          final strength = (1.0 - d / 100) * 150.0;
+          c.velocity += Offset(dx / d, dy / d) * strength * dt;
+        }
+      }
+    }
   }
 
   // ────────────────────────── ported from GameEngine ──────────────────────
@@ -163,16 +187,29 @@ class V2LocalSim {
     final intensity = mag > 1.0 ? 1.0 : mag;
 
     final com = p.centerOfMass;
-    // Target point X is 800 units away in the input direction.
-    final targetPoint = com + (rawDir / mag) * 800.0;
-    final forceMag = intensity * GameConstants.inputMoveStrength * dt;
+    
+    double maxR = 0;
+    for (final c in p.cells) {
+      if (c.radius > maxR) maxR = c.radius;
+    }
+    
+    const targetDist = 1000.0;
+    final targetPoint = com + (rawDir / mag) * targetDist;
 
     for (final c in p.cells) {
       final toTarget = targetPoint - c.position;
-      final d = toTarget.distance;
-      if (d > 0.1) {
-        c.velocity += (toTarget / d) * forceMag;
-      }
+      final dist = toTarget.distance;
+      if (dist < 0.1) continue;
+      
+      final dir = toTarget / dist;
+      final maxSpeed = GameConstants.maxSpeedForRadius(c.radius);
+      // Agility: smaller cells feel lighter and accelerate faster.
+      // Large cells feel heavier with lower relative acceleration.
+      final agility = math.pow(150.0 / (c.mass + 50.0), 0.15).clamp(0.7, 1.5).toDouble();
+      
+      final acceleration = maxSpeed * GameConstants.dampingPerSecond * agility;
+      
+      c.velocity += dir * acceleration * intensity * dt;
     }
   }
 

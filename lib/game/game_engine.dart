@@ -101,8 +101,8 @@ class GameConstants {
   // Max-speed clamp (per radius). Smaller cells move faster.
   static const double referenceRadius = 35.0;
   static const double maxSmallCellSpeed = 360.0;
-  static const double maxLargeCellSpeed = 95.0;
-  static const double speedRadiusPower = 0.42;
+  static const double maxLargeCellSpeed = 115.0;
+  static const double speedRadiusPower = 0.38;
   static const double speedScaleBase = 260.0;
 
   // Merge: trigger when centers are deeply inside each other.
@@ -426,11 +426,11 @@ class GameEngine {
     _split.splitPlayer(humanPlayer, aimDir());
   }
 
-  void doEject() {
+  void doEject({double? multiplier}) {
     debugPrint(
       'EJECT tapped — dead=${humanPlayer.isDead} cells=${humanPlayer.cells.length} totalMass=${humanPlayer.totalMass.toStringAsFixed(0)}',
     );
-    _eject.ejectPlayer(humanPlayer, aimDir());
+    _eject.ejectPlayer(humanPlayer, aimDir(), multiplier: multiplier);
   }
 
   Offset aimDir() {
@@ -615,7 +615,7 @@ class GameEngine {
     // expires between matches won't keep applying.
     // BOTS now start at 100 mass as requested.
     final startingMass = p.isHuman
-        ? (76   * AuthService.instance.activeMassMultiplier).clamp(76, 1e9).toDouble()
+        ? (5000   * AuthService.instance.activeMassMultiplier).clamp(76, 1e9).toDouble()
         : 100.0;
 
     p.cells.clear();
@@ -774,6 +774,7 @@ class GameEngine {
         attackMode: p.isHuman && attackMode,
         aimDir: lastNonZeroDir,
       );
+      _applyPelletMagnet(p, dt);
       _integrateCells(p, dt, splitFric);
     }
 
@@ -899,21 +900,38 @@ class GameEngine {
     final intensity = mag > 1.0 ? 1.0 : mag;
 
     final com = p.centerOfMass;
-    // All cells aim for a point 800 units away from the COM in the
-    // input direction. This causes them to converge toward that target
-    // rather than moving in parallel.
-    final targetPoint = com + (rawDir / mag) * 800.0;
-    final forceMag = intensity *
-        GameConstants.inputMoveStrength *
-        _activeSpeedMultiplier() *
-        dt;
+    
+    // Find the largest cell to scale the target point distance.
+    double maxR = 0;
+    for (final c in p.cells) {
+      if (c.radius > maxR) maxR = c.radius;
+    }
+    
+    // Target point X: Fixed distance of 1000 as requested.
+    const targetDist = 1000.0;
+    final targetPoint = com + (rawDir / mag) * targetDist;
+
+    final speedMult = _activeSpeedMultiplier();
 
     for (final c in p.cells) {
       final toTarget = targetPoint - c.position;
-      final d = toTarget.distance;
-      if (d > 0.1) {
-        c.velocity += (toTarget / d) * forceMag;
-      }
+      final dist = toTarget.distance;
+      if (dist < 0.1) continue;
+      
+      final dir = toTarget / dist;
+
+      // Agar.io Mobile Attack Physics:
+      // 1. Acceleration is proportional to the cell's max speed and damping
+      //    to ensure it reaches its potential.
+      // 2. Agility scaling: smaller cells accelerate faster than their
+      //    proportional share, making them feel lighter. Large cells
+      //    accelerate slower, feeling heavier.
+      final maxSpeed = GameConstants.maxSpeedForRadius(c.radius) * speedMult;
+      final agility = pow(150.0 / (c.mass + 50.0), 0.15).clamp(0.7, 1.5).toDouble();
+      
+      final acceleration = maxSpeed * GameConstants.dampingPerSecond * agility;
+      
+      c.velocity += dir * acceleration * intensity * dt;
     }
   }
 
@@ -931,6 +949,23 @@ class GameEngine {
 
   /// Step 3 of the force-based update: split-impulse decay, damping, speed
   /// clamp, position += velocity * dt, mass decay, world clamp.
+  void _applyPelletMagnet(Player p, double dt) {
+    if (p.isDead) return;
+    for (final c in p.cells) {
+      // Query spatial grid for nearby pellets.
+      final near = pelletGrid.queryRadius(c.position, 100);
+      for (final pe in near) {
+        final delta = pe.position - c.position;
+        final d = delta.distance;
+        if (d < 100 && d > 1) {
+          // Subtle pull toward pellets within 100 units.
+          final strength = (1.0 - d / 100) * 150.0;
+          c.velocity += (delta / d) * strength * dt;
+        }
+      }
+    }
+  }
+
   void _integrateCells(Player p, double dt, double splitFric) {
     final dampingFactor = exp(-GameConstants.dampingPerSecond * dt);
 
@@ -981,14 +1016,29 @@ class GameEngine {
         }
       }
 
-      // World clamp.
-      // Agar.io Mobile style: Allow cells to "sink" slightly into the wall.
-      // We allow ~25% of the cell radius to be outside the playable area.
+      // World clamp & Wall Sticking Physics.
+      // If the cell is against a wall, we clamp the velocity component pointing
+      // into the wall. This cancels the recoil force and creates a "sticking"
+      // effect, allowing the wall to act as a physical stabilizer for feeding.
       final r = c.radius;
       final inset = r * 0.75; 
+      final world = GameConstants.worldSize;
+
+      bool atLeft = c.position.dx <= inset;
+      bool atRight = c.position.dx >= world - inset;
+      bool atTop = c.position.dy <= inset;
+      bool atBottom = c.position.dy >= world - inset;
+
+      if ((atLeft && c.velocity.dx < 0) || (atRight && c.velocity.dx > 0)) {
+        c.velocity = Offset(0, c.velocity.dy);
+      }
+      if ((atTop && c.velocity.dy < 0) || (atBottom && c.velocity.dy > 0)) {
+        c.velocity = Offset(c.velocity.dx, 0);
+      }
+
       c.position = Offset(
-        c.position.dx.clamp(inset, GameConstants.worldSize - inset),
-        c.position.dy.clamp(inset, GameConstants.worldSize - inset),
+        c.position.dx.clamp(inset, world - inset),
+        c.position.dy.clamp(inset, world - inset),
       );
     }
   }
@@ -1309,7 +1359,7 @@ class GameEngine {
           // that doesn't get eaten when intended, while still preventing
           // instant self-consumption upon spawn.
           if (ageMs < 200 && e.ownerId == c.ownerId) continue;
-          final eatRadius = c.radius - e.radius * 0.4;
+          final eatRadius = c.radius + e.radius; // Eat as soon as it touches the edge
           if ((e.position - c.position).distanceSquared <
               eatRadius * eatRadius) {
             c.addBump(atan2(e.position.dy - c.position.dy, e.position.dx - c.position.dx), 0.08);
