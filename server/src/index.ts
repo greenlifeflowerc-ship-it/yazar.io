@@ -547,11 +547,20 @@ function applyInputForce(p: Player, dt: number): void {
   }
   const mag = Math.hypot(dx, dy);
   if (mag < 0.05) return;
-  const ux = dx / mag, uy = dy / mag;
-  const f = INPUT_MOVE_STRENGTH * dt;
+  // Convergent movement: all cells aim for a target point X (Agar.io mobile).
+  const intensity = mag > 1 ? 1 : mag;
+  const com = centerOfMass(p);
+  const tx = com.x + (dx / mag) * 800;
+  const ty = com.y + (dy / mag) * 800;
+
+  const f = intensity * INPUT_MOVE_STRENGTH * dt;
   for (const c of p.cells) {
-    c.vx += ux * f;
-    c.vy += uy * f;
+    const tdx = tx - c.x, tdy = ty - c.y;
+    const d = Math.hypot(tdx, tdy);
+    if (d > 0.1) {
+      c.vx += (tdx / d) * f;
+      c.vy += (tdy / d) * f;
+    }
   }
 }
 

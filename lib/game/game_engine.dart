@@ -652,7 +652,14 @@ class GameEngine {
     elapsed += dt;
     final now = elapsed;
 
-    if (moveDir.distance > 0.05) lastNonZeroDir = moveDir;
+    // Store lastNonZeroDir as a unit vector. The intensity (magnitude) lives
+    // on moveDir; lastNonZeroDir is only the *aim* we fall back to when the
+    // joystick is released and stopOnRelease=false. Without normalising
+    // here, releasing a half-pulled joystick would lock the player into
+    // permanent half-speed glide.
+    if (moveDir.distance > 0.05) {
+      lastNonZeroDir = moveDir / moveDir.distance;
+    }
 
     // AI decisions
     for (final p in players) {
@@ -881,16 +888,32 @@ class GameEngine {
   }
 
   /// Step 1 of the new force-based cell update: add input force to velocity.
+  ///
+  /// Magnitude matters: the joystick reports its pull (0..1). A half-pull
+  /// applies half the force, leaving cohesion strong enough to pull split
+  /// fragments back toward the centre — the standard Agar.io mobile feel.
+  /// Bot AI passes a unit-length direction so they still move at full power.
   void _applyInputForce(Player p, Offset rawDir, double dt) {
     final mag = rawDir.distance;
     if (mag < 0.05) return;
-    final unit = rawDir / mag;
-    final f = unit *
+    final intensity = mag > 1.0 ? 1.0 : mag;
+
+    final com = p.centerOfMass;
+    // All cells aim for a point 800 units away from the COM in the
+    // input direction. This causes them to converge toward that target
+    // rather than moving in parallel.
+    final targetPoint = com + (rawDir / mag) * 800.0;
+    final forceMag = intensity *
         GameConstants.inputMoveStrength *
         _activeSpeedMultiplier() *
         dt;
+
     for (final c in p.cells) {
-      c.velocity += f;
+      final toTarget = targetPoint - c.position;
+      final d = toTarget.distance;
+      if (d > 0.1) {
+        c.velocity += (toTarget / d) * forceMag;
+      }
     }
   }
 

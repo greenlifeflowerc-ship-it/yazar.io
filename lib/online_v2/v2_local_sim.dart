@@ -34,6 +34,9 @@ class V2LocalSim {
   final math.Random _rng = math.Random();
 
   late final SplitHandler _split = SplitHandler(engine, _rng);
+  /// Public access for virus-pop prediction in the controller — avoids
+  /// constructing a throwaway SplitHandler (and a fresh Random) on every pop.
+  SplitHandler get splitHandler => _split;
   late final EjectHandler _eject = EjectHandler(engine, _rng);
   late final MergeHandler _merge = MergeHandler(engine);
 
@@ -157,10 +160,19 @@ class V2LocalSim {
   void _applyInputForce(Player p, Offset rawDir, double dt) {
     final mag = rawDir.distance;
     if (mag < 0.05) return;
-    final unit = rawDir / mag;
-    final f = unit * GameConstants.inputMoveStrength * dt;
+    final intensity = mag > 1.0 ? 1.0 : mag;
+
+    final com = p.centerOfMass;
+    // Target point X is 800 units away in the input direction.
+    final targetPoint = com + (rawDir / mag) * 800.0;
+    final forceMag = intensity * GameConstants.inputMoveStrength * dt;
+
     for (final c in p.cells) {
-      c.velocity += f;
+      final toTarget = targetPoint - c.position;
+      final d = toTarget.distance;
+      if (d > 0.1) {
+        c.velocity += (toTarget / d) * forceMag;
+      }
     }
   }
 

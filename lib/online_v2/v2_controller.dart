@@ -29,7 +29,6 @@ import '../game/entities/ejected_mass.dart';
 import '../game/entities/virus.dart' as ge;
 import '../game/game_engine.dart';
 import '../game/game_settings.dart';
-import '../game/mechanics/split_handler.dart';
 import '../game/skin_settings.dart';
 import 'net/v2_packets.dart';
 import 'net/v2_socket_client.dart';
@@ -57,6 +56,20 @@ class V2Controller extends ChangeNotifier {
   /// Local prediction window for virus pops, used to suppress accidental
   /// re-pop of the same virus across two ticks before the server confirms.
   final Set<String> _locallyPoppedViruses = {};
+  /// Wall-clock ms of the most recent locally-predicted virus pop. Used by
+  /// the reconcile path: while a predicted pop is fresh, local has many more
+  /// cells than the server (server hasn't broadcast the fragments yet) and
+  /// we have to wait it out instead of rebuilding immediately.
+  int _lastVirusPopMs = 0;
+
+  /// Enemy cells we locally predicted as eaten. The painter no longer draws
+  /// them, but if the server keeps reporting them alive in a subsequent
+  /// snapshot we restore them — guards against the prediction running ahead
+  /// of the server when our local cell is RTT/2 in front of where the server
+  /// thinks we are.
+  final Map<String, V2WorldCell> _locallyKilledEnemy = {};
+  final Map<String, int> _locallyKilledExpiry = {};
+  static const _locallyKilledTtlMs = 1000;
 
   // ── connection / identity ─────────────────────────────────────────────
   V2ConnState _connState = V2ConnState.idle;
@@ -200,7 +213,73 @@ class V2Controller extends ChangeNotifier {
     // action with seq <= ack has been observed authoritatively.
     _pendingActions.removeWhere((p) => p.seq <= s.ackSeq);
 
+    // FIFO-match server-confirmed ejected pieces to our locally-predicted
+    // ones, drop the locals, AND seed the new server pieces' render position
+    // with the local piece's last position. Without the position transfer,
+    // the local piece (rendered at the predicted cell edge + flight) vanishes
+    // and the server piece pops up tens of units behind it — looks like the
+    // feed "teleported back" or "disappeared" then a new one appeared.
+    // Reconcile locally-predicted enemy kills against the snapshot. If the
+    // server confirmed (rmCells), drop the tracking. If the server is still
+    // updating that cell (updCells), we mispredicted — restore it so the
+    // player doesn't lose sight of an enemy that's actually still alive.
+    if (_locallyKilledExpiry.isNotEmpty) {
+      final ids = _locallyKilledExpiry.keys.toList();
+      for (final id in ids) {
+        if (s.rmCells.contains(id)) {
+          _locallyKilledEnemy.remove(id);
+          _locallyKilledExpiry.remove(id);
+        } else if (s.updCells.any((u) => u.id == id)) {
+          final restored = _locallyKilledEnemy[id];
+          if (restored != null) world.cells[id] = restored;
+          _locallyKilledEnemy.remove(id);
+          _locallyKilledExpiry.remove(id);
+        }
+      }
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      _locallyKilledExpiry.removeWhere((id, exp) {
+        if (nowMs > exp) {
+          final restored = _locallyKilledEnemy[id];
+          if (restored != null) world.cells[id] = restored;
+          _locallyKilledEnemy.remove(id);
+          return true;
+        }
+        return false;
+      });
+    }
+
+    final selfId = _playerId;
+    final inheritedRenderPos = <String, Offset>{};
+    if (selfId != null && s.addEjected.isNotEmpty && sim.localEjected.isNotEmpty) {
+      final ownAdds = <V2AddEjected>[];
+      for (final e in s.addEjected) {
+        if (e.ownerId == selfId) ownAdds.add(e);
+      }
+      if (ownAdds.isNotEmpty) {
+        final toDrop = ownAdds.length > sim.localEjected.length
+            ? sim.localEjected.length
+            : ownAdds.length;
+        for (int i = 0; i < toDrop; i++) {
+          inheritedRenderPos[ownAdds[i].id] = sim.localEjected[i].position;
+        }
+        sim.localEjected.removeRange(0, toDrop);
+      }
+    }
+
     world.applySnapshot(s);
+
+    // Seed render positions so the visual continues from where local was —
+    // the smooth tick() will then converge it onto the server's authoritative
+    // target over the next few frames without any visible jump.
+    if (inheritedRenderPos.isNotEmpty) {
+      for (final entry in inheritedRenderPos.entries) {
+        final w = world.ejected[entry.key];
+        if (w != null) {
+          w.renderX = entry.value.dx;
+          w.renderY = entry.value.dy;
+        }
+      }
+    }
     _online = s.online;
     leaderboard = s.leaderboard;
 
@@ -234,18 +313,24 @@ class V2Controller extends ChangeNotifier {
 
   // ──────────────────────────────────────────────────────── input plumbing
   void setMoveDir(Offset d) {
-    // Clamp to the unit disc.
+    // Clamp the raw input vector to the unit disc — the joystick already
+    // limits magnitude to [0, 1] but pinch-pad inputs can go outside.
     final m = d.distance;
     final clamped = m > 1 ? d / m : d;
     if (clamped.distance > 0.05) {
+      // Active input: moveDir carries BOTH direction and intensity so
+      // _applyInputForce can scale force by joystick pull (Agar.io feel
+      // — a half-pulled joystick = half force, lets split cells regroup).
       _moveDir = clamped;
-      _lastDir = clamped;
+      // lastDir is the *aim* fallback for "continue moving on release",
+      // so we store it as a pure unit vector — releasing a half-pulled
+      // joystick should glide forward at full power, not half.
+      _lastDir = clamped / clamped.distance;
     } else {
-      // Joystick released. Mirror the offline GameEngine rule exactly:
+      // Joystick released. Mirror the offline GameEngine rule:
       //   stopOnRelease=true  → stop moving
       //   stopOnRelease=false → keep gliding in the last aim direction
-      // Without this branch the online cell always stopped on release,
-      // overriding the user's setting.
+      //     at full intensity (since _lastDir is already a unit vector).
       _moveDir = GameSettings.instance.stopOnRelease ? Offset.zero : _lastDir;
     }
     sim.moveDir = _moveDir;
@@ -309,7 +394,13 @@ class V2Controller extends ChangeNotifier {
     //    the same SplitHandler.popVirus locally.
     _predictVirusPops();
 
-    // 5. Smooth render positions of every remote-authoritative entity.
+    // 5. Predict cell-vs-cell eating both directions — we eating an enemy
+    //    AND being eaten ourselves. Without this, both events lag by ~1 RTT
+    //    (the server's tick + the snapshot round-trip), which makes
+    //    aggressive plays feel sluggish.
+    _predictCellEating();
+
+    // 6. Smooth render positions of every remote-authoritative entity.
     world.tickRender(dt);
 
     // 6. Throttled input send to the server.
@@ -415,13 +506,18 @@ class V2Controller extends ChangeNotifier {
     }
 
     // ── server-broadcast ejected (other players' feed) ──
-    // Skip ejected that belong to our own cells for the first 200 ms so our
-    // own feed doesn't get self-eaten the moment the server confirms it.
+    // Only predict eating ENEMY feed locally. Our own feed is server-
+    // authoritative: the local cell sits ahead of the server cell, so a
+    // local "I caught my own feed" prediction routinely runs ahead of the
+    // server and silently wipes feed that the server still has alive — the
+    // visible symptom is "my feed pieces vanished for no reason". Letting
+    // the server's rmEjected drive the removal of own feed eliminates the
+    // false positive entirely while staying responsive for enemy feed.
     final serverToRemove = <String>[];
     for (final c in sim.cells) {
       if (c.mass < 22) continue;
       for (final e in world.ejected.values) {
-        if (e.ownerId == selfId && nowMs - e.addedAt < 200) continue;
+        if (e.ownerId == selfId) continue;
         final eatR = c.radius - ejectedRadius * 0.4;
         if (eatR <= 0) continue;
         final dx = e.renderX - c.position.dx;
@@ -449,6 +545,85 @@ class V2Controller extends ChangeNotifier {
         nowMs - e.spawnTime.millisecondsSinceEpoch > _localEjectedLifetimeMs);
   }
 
+  /// Predict cell-vs-cell eating, both directions:
+  ///   • We eat an enemy → remove their cell locally, add their mass.
+  ///     Tracked for ~1 s; if the server keeps reporting the cell alive in
+  ///     subsequent snapshots we restore it (false-positive recovery).
+  ///   • We get eaten → drop the local cell immediately. The next snapshot's
+  ///     reconcile will confirm; if we mispredicted, the server-driven
+  ///     rebuild restores the cell on the next snapshot.
+  ///
+  /// Uses MASS-based ratio (matches the server). Uses the server's
+  /// authoritative target position for enemy cells (renderX/Y lags behind
+  /// what the server thinks is happening, which would make us miss eats
+  /// the server commits to).
+  void _predictCellEating() {
+    if (!sim.isInitialized || sim.cells.isEmpty) return;
+    final selfId = _playerId;
+    if (selfId == null) return;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+
+    // (a) we → eat → enemy
+    final eaten = <String>[];
+    for (final ours in sim.cells) {
+      final ar = ours.radius;
+      for (final enemy in world.cells.values) {
+        if (enemy.ownerId == selfId) continue;
+        if (eaten.contains(enemy.id)) continue;
+        if (_locallyKilledEnemy.containsKey(enemy.id)) continue;
+        if (ours.mass <= enemy.targetMass) continue;
+        final ratio = ours.isFreshSplit ? 1.33 : 1.25;
+        if (ours.mass < enemy.targetMass * ratio) continue;
+        final br = math.sqrt(enemy.targetMass / math.pi) * 10;
+        final eatR = ar - br * 0.4;
+        if (eatR <= 0) continue;
+        // Use targetX/Y (authoritative) — renderX/Y lags ~38 ms behind.
+        final dx = enemy.targetX - ours.position.dx;
+        final dy = enemy.targetY - ours.position.dy;
+        if (dx * dx + dy * dy < eatR * eatR) {
+          if (ours.mass < GameConstants.maxCellMass) {
+            ours.mass = math.min(
+              GameConstants.maxCellMass,
+              ours.mass + enemy.targetMass,
+            );
+          }
+          eaten.add(enemy.id);
+        }
+      }
+    }
+    for (final id in eaten) {
+      final cell = world.cells.remove(id);
+      if (cell != null) {
+        // Stash so we can restore on mispredict.
+        _locallyKilledEnemy[id] = cell;
+        _locallyKilledExpiry[id] = nowMs + _locallyKilledTtlMs;
+      }
+    }
+
+    // (b) enemy → eats → us
+    final dead = <ge.Cell>[];
+    for (final ours in sim.cells) {
+      for (final enemy in world.cells.values) {
+        if (enemy.ownerId == selfId) continue;
+        if (enemy.targetMass <= ours.mass) continue;
+        final ratio = enemy.freshSplit ? 1.33 : 1.25;
+        if (enemy.targetMass < ours.mass * ratio) continue;
+        final er = math.sqrt(enemy.targetMass / math.pi) * 10;
+        final eatR = er - ours.radius * 0.4;
+        if (eatR <= 0) continue;
+        final dx = ours.position.dx - enemy.targetX;
+        final dy = ours.position.dy - enemy.targetY;
+        if (dx * dx + dy * dy < eatR * eatR) {
+          dead.add(ours);
+          break;
+        }
+      }
+    }
+    if (dead.isNotEmpty) {
+      sim.player.cells.removeWhere(dead.contains);
+    }
+  }
+
   /// Predict virus pops locally so the cell shatter animation fires the
   /// instant our cell touches the virus, instead of waiting one RTT for the
   /// server to broadcast the new fragment cells.
@@ -466,10 +641,10 @@ class V2Controller extends ChangeNotifier {
         final dx = v.renderX - c.position.dx;
         final dy = v.renderY - c.position.dy;
         if (dx * dx + dy * dy < trigger * trigger) {
-          // Pop locally — reuse the offline SplitHandler so fragment
-          // distribution and merge cooldowns match the server bit-for-bit.
+          // Pop locally — reuse the sim's existing SplitHandler so the RNG
+          // is stable and we don't allocate a fresh handler on every pop.
           final synthVirus = ge.Virus(id: v.id, position: Offset(v.renderX, v.renderY));
-          SplitHandler(sim.engine, math.Random()).popVirus(sim.player, c, synthVirus);
+          sim.splitHandler.popVirus(sim.player, c, synthVirus);
           toPop.add(v.id);
           break;
         }
@@ -478,6 +653,9 @@ class V2Controller extends ChangeNotifier {
     for (final id in toPop) {
       _locallyPoppedViruses.add(id);
       world.viruses.remove(id);
+    }
+    if (toPop.isNotEmpty) {
+      _lastVirusPopMs = DateTime.now().millisecondsSinceEpoch;
     }
     // Cap the set so it doesn't grow indefinitely — server confirms
     // pops within ~200 ms; 256 entries gives a few seconds of headroom.
@@ -525,14 +703,37 @@ class V2Controller extends ChangeNotifier {
     }
 
     if (sim.cells.length != serverCells.length) {
-      // We almost always have MORE cells locally for ~1 RTT (after a split,
-      // a virus pop, or before the server has processed an upcoming merge),
-      // or FEWER for ~1 RTT (after a local merge). Both are harmless — the
-      // server catches up within a snapshot or two. Rebuild when we have
-      // a mismatch for an extended window, which means we missed a real event
-      // (eaten by another player, ate a virus we didn't predict, etc.).
       _countMismatchTicks++;
-      if (_countMismatchTicks >= _countMismatchSnapThreshold) {
+      final localAhead = sim.cells.length > serverCells.length;
+      final hasPendingSplit =
+          _pendingActions.any((p) => p.kind == 'split');
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final recentVirusPop = nowMs - _lastVirusPopMs < 500;
+
+      // Decide how long to tolerate the count mismatch before snapping:
+      //   • Pending split (local > server) ............ 20 ticks (~666 ms)
+      //     — we just split, the new cells are en route through the server.
+      //   • Recent virus pop (local > server) ......... 12 ticks (~400 ms)
+      //     — we popped predictively, server hasn't broadcast fragments yet.
+      //   • Otherwise local > server ..................  1 tick   (~33 ms)
+      //     — almost certainly we just got eaten / server-side-merged. Snap
+      //     to reality NOW so the player sees the death / merge in real time.
+      //   • Local < server ............................  3 ticks (~100 ms)
+      //     — server has cells we didn't predict; rebuild to catch up.
+      final int tolerateTicks;
+      if (localAhead) {
+        if (hasPendingSplit) {
+          tolerateTicks = 20;
+        } else if (recentVirusPop) {
+          tolerateTicks = 12;
+        } else {
+          tolerateTicks = 1;
+        }
+      } else {
+        tolerateTicks = _countMismatchSnapThreshold; // 3
+      }
+
+      if (_countMismatchTicks >= tolerateTicks) {
         _rebuildLocalFromServer(serverCells);
         _countMismatchTicks = 0;
       }
