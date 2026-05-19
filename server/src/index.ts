@@ -200,6 +200,13 @@ interface Player {
   lastSeenAt: number;
   spawnAt: number;
   highestMass: number;
+  /// Mass boost multiplier the client sent at join. Applied to starting mass
+  /// on every spawn (mirrors the offline GameEngine behaviour).
+  massMult: number;
+  /// Number of enemy cells this player has eaten in the current life. Reset
+  /// on spawn. Reported to the client in each `state.self` payload so the
+  /// client can submit accurate kill counts at end-of-match.
+  eatenCount: number;
   // bot scratch
   aiDir: { x: number; y: number };
   aiNextDecide: number;
@@ -297,7 +304,10 @@ function spawnVirus(): Virus {
 
 function spawnCellForPlayer(p: Player): void {
   const pos = safeSpawnPos();
-  const startMass = p.isBot ? 100 : 76;
+  // Apply the human player's mass-boost multiplier (sent at join). Bots
+  // always spawn at 100 — the boost is only for the joined human.
+  const mult = p.isBot ? 1.0 : clamp(p.massMult, 0.5, 10.0);
+  const startMass = p.isBot ? 100 : Math.round(76 * mult);
   p.cells = [{
     id: newId("c"),
     ownerId: p.id,
@@ -316,6 +326,7 @@ function spawnCellForPlayer(p: Player): void {
   p.deadAt = 0;
   p.spawnAt = Date.now();
   p.highestMass = startMass;
+  p.eatenCount = 0;
   p.input.dx = 0;
   p.input.dy = 0;
   p.input.attack = false;
@@ -338,6 +349,8 @@ function makeBot(): Player {
     lastSeenAt: Date.now(),
     spawnAt: Date.now(),
     highestMass: 100,
+    massMult: 1.0,
+    eatenCount: 0,
     aiDir: { x: 0, y: 0 },
     aiNextDecide: 0,
     aiNextSplit: 0,
@@ -571,20 +584,33 @@ function applySeparation(p: Player, dt: number): void {
       const b = cs[j];
       if (now >= a.mergeReadyAt && now >= b.mergeReadyAt) continue;
       const dx = a.x - b.x, dy = a.y - b.y;
-      const d = Math.hypot(dx, dy);
+      let d = Math.hypot(dx, dy);
       const ar = radius(a.mass), br = radius(b.mass);
       const minDist = ar + br + MIN_GAP;
       if (d >= minDist) continue;
-      if (d === 0) { a.x += 0.5; continue; }
+      if (d === 0) { a.x += 0.5; d = 0.5; }
       const overlap = minDist - d;
       const nx = dx / d, ny = dy / d;
       const totMass = a.mass + b.mass;
+
+      // Velocity-based push (smooth ramp-up).
       const fx = nx * overlap * SEPARATION_STRENGTH;
       const fy = ny * overlap * SEPARATION_STRENGTH;
       a.vx += fx * (b.mass / totMass) * dt;
       a.vy += fy * (b.mass / totMass) * dt;
       b.vx -= fx * (a.mass / totMass) * dt;
       b.vy -= fy * (a.mass / totMass) * dt;
+
+      // Hard position correction: cells that can't merge yet MUST NOT
+      // overlap. Without this, a fast-moving cell punches through its
+      // sibling because velocity-only separation can't outrun the impulse
+      // in a single tick. Mass-weighted so big cells move less.
+      const aPush = overlap * (b.mass / totMass);
+      const bPush = overlap * (a.mass / totMass);
+      a.x += nx * aPush;
+      a.y += ny * aPush;
+      b.x -= nx * bPush;
+      b.y -= ny * bPush;
     }
   }
 }
@@ -761,10 +787,14 @@ function tryDoSplit(p: Player, dirX: number, dirY: number): void {
     const cd = mergeCooldownMsForRadius(sR);
     source.mergeReadyAt = now + cd;
     source.freshSplit = true;
+    // Big cells should reach far when double/triple splitting. Exponent
+    // 0.5 + cap 5.0 ≈ Agar.io mobile feel: at radius 35 (start mass 76) →
+    // scale 1.0, at radius 268 (max mass) → scale ~2.77, at radius 500 →
+    // capped at 5.0.
     const radiusScale = clamp(
-      Math.pow(sR / REFERENCE_RADIUS, 0.35),
+      Math.pow(sR / REFERENCE_RADIUS, 0.5),
       1.0,
-      2.5,
+      5.0,
     );
     const id = newId("c");
     p.cells.push({
@@ -882,6 +912,10 @@ function resolveCellVsCell(): void {
       if (dx * dx + dy * dy < eatR * eatR) {
         if (a.mass < MAX_CELL_MASS) a.mass = Math.min(MAX_CELL_MASS, a.mass + b.mass);
         dead.add(b);
+        // Track the kill on the eater's owning player so the client can
+        // submit accurate kill counts at end-of-match.
+        const eater = players.get(a.ownerId);
+        if (eater) eater.eatenCount++;
       }
     }
   }
@@ -1191,6 +1225,8 @@ function buildSnapshot(p: Player, lb: LBEntry[], sendSlow: boolean): unknown {
       dead: p.dead,
       cm: { x: Math.round(com.x * 10) / 10, y: Math.round(com.y * 10) / 10 },
       mass: Math.round(totalMass(p)),
+      kills: p.eatenCount,
+      highestMass: Math.round(p.highestMass),
     },
     addCells, updCells, rmCells,
     addPellets, rmPellets,
@@ -1298,6 +1334,8 @@ wss.on("connection", (ws) => {
       const rawName = typeof msg.name === "string" ? msg.name : "";
       const name = rawName.trim().slice(0, 18) || "Player";
       const skinId = typeof msg.skin === "string" ? msg.skin.slice(0, 128) : "";
+      const rawMult = Number(msg.massMult);
+      const massMult = Number.isFinite(rawMult) ? clamp(rawMult, 0.5, 10.0) : 1.0;
       const id = newId("h");
       player = {
         id,
@@ -1314,6 +1352,8 @@ wss.on("connection", (ws) => {
         lastSeenAt: Date.now(),
         spawnAt: Date.now(),
         highestMass: 76,
+        massMult,
+        eatenCount: 0,
         aiDir: { x: 0, y: 0 },
         aiNextDecide: 0,
         aiNextSplit: 0,

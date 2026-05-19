@@ -67,7 +67,7 @@ class V2WorldCell {
   /// Exponentially smooth render position toward target. [dt] is seconds.
   /// At [smoothing] = 18 the half-life is ~38 ms — fast enough to look real,
   /// slow enough to swallow per-tick jitter.
-  void tick(double dt, {double smoothing = 18}) {
+  void tick(double dt, {double smoothing = 25}) {
     final f = 1 - math.exp(-smoothing * dt);
     renderX += (targetX - renderX) * f;
     renderY += (targetY - renderY) * f;
@@ -104,7 +104,7 @@ class V2WorldVirus {
   double renderX, renderY;
   double get renderRadius => math.sqrt(mass / math.pi) * 10;
 
-  void tick(double dt, {double smoothing = 12}) {
+  void tick(double dt, {double smoothing = 22}) {
     final f = 1 - math.exp(-smoothing * dt);
     renderX += (targetX - renderX) * f;
     renderY += (targetY - renderY) * f;
@@ -130,7 +130,7 @@ class V2WorldEjected {
   double targetX, targetY;
   double renderX, renderY;
 
-  void tick(double dt, {double smoothing = 22}) {
+  void tick(double dt, {double smoothing = 32}) {
     final f = 1 - math.exp(-smoothing * dt);
     renderX += (targetX - renderX) * f;
     renderY += (targetY - renderY) * f;

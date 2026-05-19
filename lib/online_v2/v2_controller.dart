@@ -47,7 +47,7 @@ class V2Controller extends ChangeNotifier {
   /// Local lifetime cap for self-spawned ejected mass. After this window the
   /// authoritative server-side copy (in [V2World.ejected]) has fully arrived,
   /// so the locally-spawned one is dropped to avoid double-rendering.
-  static const _localEjectedLifetimeMs = 500;
+  static const _localEjectedLifetimeMs = 150;
   /// Local prediction window for virus pops, used to suppress accidental
   /// re-pop of the same virus across two ticks before the server confirms.
   final Set<String> _locallyPoppedViruses = {};
@@ -71,6 +71,36 @@ class V2Controller extends ChangeNotifier {
   bool _deadServerConfirmed = false;
   bool get isDead => _deadServerConfirmed && sim.cells.isEmpty;
 
+  // ── match stats (consumed by the screen on death) ─────────────────────
+  int _kills = 0;
+  int get kills => _kills;
+  double _highestMass = 0;
+  double get highestMass => _highestMass;
+  DateTime? _spawnedAt;
+  int get survivalSeconds {
+    final t = _spawnedAt;
+    if (t == null) return 0;
+    return DateTime.now().difference(t).inSeconds;
+  }
+  int get currentRank {
+    final id = _playerId;
+    if (id == null) return -1;
+    for (int i = 0; i < leaderboard.length; i++) {
+      if (leaderboard[i].id == id) return i + 1;
+    }
+    return -1; // not in top-N
+  }
+  /// Fires once when the server confirms death — the screen subscribes via
+  /// ChangeNotifier and submits the match result to the profile RPC.
+  bool _deathNotified = false;
+  bool consumeDeathEvent() {
+    if (_deadServerConfirmed && !_deathNotified) {
+      _deathNotified = true;
+      return true;
+    }
+    return false;
+  }
+
   // ── input ─────────────────────────────────────────────────────────────
   /// Joystick direction in [-1,1] per axis.
   Offset _moveDir = Offset.zero;
@@ -89,7 +119,7 @@ class V2Controller extends ChangeNotifier {
   /// time out unconfirmed local actions.
   final List<_PendingAction> _pendingActions = [];
   int _countMismatchTicks = 0;
-  static const _countMismatchSnapThreshold = 6; // ~200 ms at 30 Hz
+  static const _countMismatchSnapThreshold = 3; // ~100 ms at 30 Hz
 
   /// After `welcome` we spawn the local sim at world center as a placeholder
   /// — the server's actual chosen spawn point arrives one tick later.
@@ -102,7 +132,11 @@ class V2Controller extends ChangeNotifier {
   late final List<StreamSubscription<dynamic>> _subs;
 
   // ── lifecycle ─────────────────────────────────────────────────────────
-  Future<void> connect({required String playerName, String skin = ''}) async {
+  Future<void> connect({
+    required String playerName,
+    String skin = '',
+    double massMultiplier = 1.0,
+  }) async {
     _playerName = playerName.trim().isEmpty ? 'Player' : playerName.trim();
     _subs = [
       client.welcomes.listen(_onWelcome),
@@ -110,7 +144,11 @@ class V2Controller extends ChangeNotifier {
       client.pongs.listen(_onPong),
       client.stateChanges.listen(_onConnStateChanged),
     ];
-    await client.connect(playerName: _playerName, skin: skin);
+    await client.connect(
+      playerName: _playerName,
+      skin: skin,
+      massMultiplier: massMultiplier,
+    );
   }
 
   void _onConnStateChanged(V2ConnState s) {
@@ -139,6 +177,10 @@ class V2Controller extends ChangeNotifier {
     _pendingActions.clear();
     _needsInitialSnap = true;
     _countMismatchTicks = 0;
+    _kills = 0;
+    _highestMass = 0;
+    _spawnedAt = DateTime.now();
+    _deathNotified = false;
     notifyListeners();
   }
 
@@ -169,7 +211,16 @@ class V2Controller extends ChangeNotifier {
       // straight from the authoritative addCells (not a single seed cell).
       sim.respawn(position: Offset(s.self.cmX, s.self.cmY), mass: s.self.mass);
       _needsInitialSnap = true;
+      // New life — reset run stats so submitMatchResult only sees this run.
+      _kills = 0;
+      _highestMass = s.self.mass;
+      _spawnedAt = DateTime.now();
+      _deathNotified = false;
     }
+
+    // Match stats are authoritative from the server's self payload.
+    if (s.self.kills > _kills) _kills = s.self.kills;
+    if (s.self.highestMass > _highestMass) _highestMass = s.self.highestMass;
 
     _reconcileSelf(s);
     notifyListeners();
@@ -265,6 +316,7 @@ class V2Controller extends ChangeNotifier {
         final dy = p.y - c.position.dy;
         if (dx * dx + dy * dy < rSq) {
           toEat.add(p.id);
+          if (c.mass < GameConstants.maxCellMass) c.mass += 1.0;
         }
       }
     }
@@ -287,9 +339,11 @@ class V2Controller extends ChangeNotifier {
 
     // ── local-only ejected (our own feed) ──
     final localToRemove = <EjectedMass>[];
+    // Check if MY cells eat MY local feed.
     for (final c in sim.cells) {
       if (c.mass < 22) continue;
       for (final e in sim.localEjected) {
+        if (localToRemove.contains(e)) continue;
         final age = nowMs - e.spawnTime.millisecondsSinceEpoch;
         if (e.ownerId == c.ownerId && age < 200) continue;
         final eatR = c.radius - e.radius * 0.4;
@@ -304,9 +358,38 @@ class V2Controller extends ChangeNotifier {
         }
       }
     }
+    // Check if OTHER players' cells eat MY local feed.
+    for (final c in world.cells.values) {
+      if (c.isSelf) continue; // skipped, we use sim.cells above
+      if (c.targetMass < 22) continue;
+      final cRadius = c.renderRadius;
+      for (final e in sim.localEjected) {
+        if (localToRemove.contains(e)) continue;
+        final eatR = cRadius - e.radius * 0.4;
+        if (eatR <= 0) continue;
+        final dx = e.position.dx - c.renderX;
+        final dy = e.position.dy - c.renderY;
+        if (dx * dx + dy * dy < eatR * eatR) {
+          localToRemove.add(e);
+        }
+      }
+    }
+    // Check if viruses eat MY local feed.
+    for (final v in world.viruses.values) {
+      final vRadius = v.renderRadius;
+      for (final e in sim.localEjected) {
+        if (localToRemove.contains(e)) continue;
+        // Viruses eat ejected mass if it's within (virusR + ejectedR*0.5).
+        final trigger = vRadius + e.radius * 0.5;
+        final dx = e.position.dx - v.renderX;
+        final dy = e.position.dy - v.renderY;
+        if (dx * dx + dy * dy < trigger * trigger) {
+          localToRemove.add(e);
+        }
+      }
+    }
     if (localToRemove.isNotEmpty) {
-      sim.localEjected
-          .removeWhere((e) => localToRemove.contains(e));
+      sim.localEjected.removeWhere((e) => localToRemove.contains(e));
     }
 
     // ── server-broadcast ejected (other players' feed) ──
@@ -423,17 +506,12 @@ class V2Controller extends ChangeNotifier {
       // We almost always have MORE cells locally for ~1 RTT (after a split,
       // a virus pop, or before the server has processed an upcoming merge),
       // or FEWER for ~1 RTT (after a local merge). Both are harmless — the
-      // server catches up within a snapshot or two. Only rebuild when we
-      // have STRICTLY FEWER cells than the server for an extended window,
-      // which means we missed a real event (eaten by another player,
-      // ate a virus we didn't predict, etc.).
-      if (sim.cells.length < serverCells.length) {
-        _countMismatchTicks++;
-        if (_countMismatchTicks >= _countMismatchSnapThreshold) {
-          _rebuildLocalFromServer(serverCells);
-          _countMismatchTicks = 0;
-        }
-      } else {
+      // server catches up within a snapshot or two. Rebuild when we have
+      // a mismatch for an extended window, which means we missed a real event
+      // (eaten by another player, ate a virus we didn't predict, etc.).
+      _countMismatchTicks++;
+      if (_countMismatchTicks >= _countMismatchSnapThreshold) {
+        _rebuildLocalFromServer(serverCells);
         _countMismatchTicks = 0;
       }
       return;
@@ -473,44 +551,99 @@ class V2Controller extends ChangeNotifier {
       // Tiny drift: ignore — local sim is matching the server.
       if (d < 12 && massDelta.abs() < l.mass * 0.02) continue;
 
-      // Medium drift: gentle blend (12 % position, 30 % mass per snapshot).
+      // Medium drift: blend position gently, mass more aggressively.
       if (d < 220 && massDelta.abs() < l.mass * 0.15) {
         l.position = Offset(
-          l.position.dx + dx * 0.12,
-          l.position.dy + dy * 0.12,
+          l.position.dx + dx * 0.14,
+          l.position.dy + dy * 0.14,
         );
-        l.mass += massDelta * 0.30;
+        l.mass += massDelta * 0.55;
         continue;
       }
 
-      // Large drift: harder blend (45 % / 60 %). At this point our local
-      // prediction is meaningfully wrong (lost packets, ate something we
-      // didn't expect, etc.) so we close it fast — but still smoothly.
+      // Large drift: snap hard — prediction is meaningfully wrong.
       l.position = Offset(
-        l.position.dx + dx * 0.45,
-        l.position.dy + dy * 0.45,
+        l.position.dx + dx * 0.55,
+        l.position.dy + dy * 0.55,
       );
-      l.mass += massDelta * 0.60;
+      l.mass += massDelta * 0.90;
+    }
+
+    // Total-mass correction: if local total diverges >8% from server-reported
+    // mass, scale all cells proportionally. This catches accumulated pellet-
+    // eating divergence that per-cell blending is too slow to close alone.
+    if (s.self.mass > 0 && sim.cells.isNotEmpty) {
+      final localTotal = sim.cells.fold(0.0, (acc, c) => acc + c.mass);
+      final serverTotal = s.self.mass;
+      final drift = (serverTotal - localTotal).abs();
+      if (drift > localTotal * 0.08 && localTotal > 0) {
+        final scale = serverTotal / localTotal;
+        for (final c in sim.cells) {
+          c.mass = (c.mass * scale).clamp(1.0, GameConstants.maxCellMass);
+        }
+      }
     }
   }
 
   void _rebuildLocalFromServer(List<V2WorldCell> serverCells) {
-    sim.player.cells.clear();
     final now = DateTime.now();
+    final serverNow = world.lastServerNow;
+    // To avoid the visible 1-frame "stop" of a wholesale clear+rebuild, we
+    // preserve velocity / splitImpulse from the closest local cell when we
+    // create the new authoritative cell. We pair greedily by ID first
+    // (matches across confirmed snapshots), then by nearest position
+    // (matches a local-only predicted split to its eventual server cell).
+    final byId = <String, ge.Cell>{
+      for (final c in sim.player.cells) c.id: c,
+    };
+    final leftover = <ge.Cell>[
+      for (final c in sim.player.cells)
+        if (!serverCells.any((s) => s.id == c.id)) c,
+    ];
+
+    final fresh = <ge.Cell>[];
     for (final s in serverCells) {
-      sim.player.cells.add(ge.Cell(
+      final remainingMs = serverNow > 0
+          ? (s.mergeReadyAtMs - serverNow).clamp(0, 28000)
+          : (s.freshSplit ? 500 : 0);
+
+      ge.Cell? donor = byId.remove(s.id);
+      if (donor == null && leftover.isNotEmpty) {
+        ge.Cell? best;
+        double bestD2 = double.infinity;
+        for (final c in leftover) {
+          final dx = c.position.dx - s.targetX;
+          final dy = c.position.dy - s.targetY;
+          final d2 = dx * dx + dy * dy;
+          if (d2 < bestD2) {
+            bestD2 = d2;
+            best = c;
+          }
+        }
+        if (best != null && bestD2 < 400 * 400) {
+          leftover.remove(best);
+          donor = best;
+        }
+      }
+
+      fresh.add(ge.Cell(
         id: s.id,
         ownerId: s.ownerId,
         position: Offset(s.targetX, s.targetY),
         mass: s.targetMass,
         color: s.color,
         name: s.name,
-        mergeReadyAt: s.freshSplit
-            ? now.add(const Duration(milliseconds: 200))
-            : now,
+        mergeReadyAt: now.add(Duration(milliseconds: remainingMs)),
         isFreshSplit: s.freshSplit,
+        // Donor carries the in-flight motion so the cell doesn't visually
+        // stop the frame we rebuild it.
+        velocity: donor?.velocity ?? Offset.zero,
+        splitImpulse: donor?.splitImpulse ?? Offset.zero,
       ));
     }
+    sim.player.cells
+      ..clear()
+      ..addAll(fresh);
   }
 
   // ──────────────────────────────────────────────────────── disposal

@@ -23,6 +23,11 @@ import 'package:intl/intl.dart';
 import '../game/game_engine.dart';
 import '../game/game_settings.dart';
 import '../game/skin_settings.dart';
+import '../models/capsule.dart';
+import '../services/auth_service.dart';
+import '../services/capsule_service.dart';
+import '../services/profile_service.dart';
+import '../services/storage_service.dart';
 import '../widgets/death_screen.dart';
 import '../widgets/game_button.dart';
 import '../widgets/pause_menu.dart';
@@ -84,10 +89,13 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
     _splitPos = ValueNotifier(GameSettings.instance.splitBtnFrac);
     _ctrl = V2Controller();
     // Pass the player's chosen skin asset path so the server can broadcast
-    // it; other clients lazy-load the image via V2SkinCache.
+    // it; other clients lazy-load the image via V2SkinCache. Also forward
+    // the active mass-boost multiplier so the server applies it on spawn
+    // exactly like Offline Classic does.
     _ctrl.connect(
       playerName: widget.nickname.trim(),
       skin: SkinSettings.instance.skinPath ?? '',
+      massMultiplier: AuthService.instance.activeMassMultiplier,
     );
     _ticker = createTicker(_onTick)..start();
     if (GameSettings.instance.pcMode) _focus.requestFocus();
@@ -123,21 +131,82 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
 
     _ctrl.tick(dt);
 
-    // Camera follow + zoom (mirrors GameEngine._targetZoom).
+    // Camera follow + zoom — dt-based so speed is framerate-independent.
     if (_ctrl.sim.isInitialized && _ctrl.sim.cells.isNotEmpty) {
       final target = _ctrl.sim.centerOfMass;
-      _camPos = Offset.lerp(_camPos, target, 0.1)!;
+      final cf = (1 - math.exp(-10.0 * dt)).clamp(0.0, 1.0);
+      _camPos = Offset.lerp(_camPos, target, cf)!;
       final mass = _ctrl.sim.totalMass.clamp(10, 1e9).toDouble();
       final z = math.pow(64 / mass, 0.25).toDouble();
       final mult = 1.0 / GameSettings.instance.zoomMultiplier;
       final targetZoom = (z * mult).clamp(0.01, 4.0);
-      _camZoom = _camZoom + (targetZoom - _camZoom) * 0.1;
+      final zf = (1 - math.exp(-5.0 * dt)).clamp(0.0, 1.0);
+      _camZoom = _camZoom + (targetZoom - _camZoom) * zf;
     }
 
     _frame.value++;
     if (++_hudCounter >= 6) {
       _hudCounter = 0;
       _hudTick.value++;
+    }
+
+    // Submit match result the moment the server confirms our death.
+    if (_ctrl.consumeDeathEvent()) {
+      _submitMatchResult();
+    }
+  }
+
+  // ───────────────────────────────────────────────────── match result
+  Future<void> _submitMatchResult() async {
+    if (!AuthService.instance.isLoggedIn) return;
+    final score = _ctrl.highestMass.round();
+    final massCollected = score;
+    final kills = _ctrl.kills;
+    final survival = _ctrl.survivalSeconds;
+    final rank = _ctrl.currentRank > 0 ? _ctrl.currentRank : 9999;
+
+    // Capsule award path mirrors the offline flow exactly so the player
+    // gets the same loot for online runs.
+    final inv = CapsuleInventory.instance;
+    final savedInv = StorageService.instance.getString('capsuleInventory') ?? '';
+    if (savedInv.isNotEmpty) inv.loadFromJson(savedInv);
+    final awardedTier =
+        inv.awardForMatch(rank: rank, survivalSeconds: survival);
+    StorageService.instance.setString('capsuleInventory', inv.saveToJson());
+    if (awardedTier != null) {
+      final slotIdx = inv.slots.indexWhere((s) =>
+          !s.isEmpty && s.tier == awardedTier && s.brewStartedAt != null);
+      if (slotIdx >= 0) {
+        await CapsuleService.instance.awardCapsuleOnServer(
+          tier: awardedTier,
+          slotIndex: slotIdx,
+          brewStartedAt: inv.slots[slotIdx].brewStartedAt!,
+        );
+      }
+    }
+
+    final res = await ProfileService.instance.submitMatchResult(
+      score: score,
+      massCollected: massCollected,
+      kills: kills,
+      survivalSeconds: survival,
+      rank: rank,
+    );
+    if (res != null) {
+      final existing = AuthService.instance.profile;
+      if (existing != null) {
+        AuthService.instance.applyProfile(existing.copyWith(
+          level: res.level,
+          xp: res.xp,
+          coins: res.coins,
+          dna: res.dna,
+        ));
+      } else {
+        await AuthService.instance.refreshProfile();
+      }
+      if (res.leveledUp) {
+        AuthService.instance.queueLevelUp(res);
+      }
     }
   }
 
@@ -558,16 +627,15 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
                       ),
                     ),
 
-                  // Death overlay.
+                  // Death overlay — real run stats from the controller so
+                  // the player sees their actual highest mass / kills / time.
                   if (_ctrl.isDead)
                     Positioned.fill(
                       child: DeathScreen(
-                        highestMass: _ctrl.sim.isInitialized
-                            ? _ctrl.sim.player.highestMass
-                            : 0,
-                        timeSurvived: 0,
-                        eatenCount: 0,
-                        rank: -1,
+                        highestMass: _ctrl.highestMass,
+                        timeSurvived: _ctrl.survivalSeconds.toDouble(),
+                        eatenCount: _ctrl.kills,
+                        rank: _ctrl.currentRank,
                         onPlayAgain: _playAgain,
                         onMainMenu: _exit,
                       ),

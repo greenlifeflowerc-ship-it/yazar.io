@@ -186,12 +186,16 @@ class V2SelfStatus {
     required this.cmX,
     required this.cmY,
     required this.mass,
+    required this.kills,
+    required this.highestMass,
   });
   final String id;
   final bool dead;
   final double cmX;
   final double cmY;
   final double mass;
+  final int kills;
+  final double highestMass;
 }
 
 class V2LeaderboardEntry {
@@ -259,6 +263,8 @@ class V2State {
         cmX: (cm['x'] as num?)?.toDouble() ?? 0,
         cmY: (cm['y'] as num?)?.toDouble() ?? 0,
         mass: (selfM['mass'] as num?)?.toDouble() ?? 0,
+        kills: (selfM['kills'] as num?)?.toInt() ?? 0,
+        highestMass: (selfM['highestMass'] as num?)?.toDouble() ?? 0,
       );
 
       final addCells = <V2AddCell>[];

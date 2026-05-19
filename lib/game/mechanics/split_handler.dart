@@ -135,9 +135,12 @@ class SplitHandler {
       milliseconds: (baseCooldown.inMilliseconds * mult).round(),
     );
     
-    // Scale split impulse by radius so larger cells split further, 
-    // mimicking Agar.io mobile's feel.
-    final radiusScale = pow(source.radius / GameConstants.referenceRadius, 0.35).clamp(1.0, 2.5);
+    // Scale split impulse by radius so larger cells split further. Tuned for
+    // Agar.io mobile feel: at reference radius scale=1.0, at max-mass cell
+    // (~268 r) scale~2.77, beyond that grows up to cap 5.0. This lets a big
+    // player double/triple-split onto distant targets.
+    final radiusScale = pow(source.radius / GameConstants.referenceRadius, 0.5)
+        .clamp(1.0, 5.0);
     final impulse = dir * (GameConstants.splitImpulseInitial * radiusScale);
 
     final cell = Cell(

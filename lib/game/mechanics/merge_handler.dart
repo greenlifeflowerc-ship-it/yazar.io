@@ -106,11 +106,16 @@ class MergeHandler {
         final overlap = minDist - dist;
         final n = delta / dist;
         final totalMass = a.mass + b.mass;
-        // Force vector applied opposite to each side, scaled by inverse mass
-        // so the lighter cell moves further.
+        // Velocity force — smooth, mass-weighted push.
         final force = n * (overlap * GameConstants.separationStrength);
         a.velocity += force * (b.mass / totalMass) * dt;
         b.velocity -= force * (a.mass / totalMass) * dt;
+        // Hard position correction: cells not yet allowed to merge MUST NOT
+        // overlap (Agar.io feel). Velocity-only separation can't outrun a
+        // fast split impulse in one frame, so we resolve the overlap
+        // directly here, mass-weighted so big cells barely move.
+        a.position = a.position + n * (overlap * (b.mass / totalMass));
+        b.position = b.position - n * (overlap * (a.mass / totalMass));
       }
     }
   }

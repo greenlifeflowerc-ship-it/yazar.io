@@ -41,6 +41,7 @@ class V2SocketClient {
 
   String? _lastName;
   String _lastSkin = 'default';
+  double _lastMassMult = 1.0;
 
   final _welcome = StreamController<V2Welcome>.broadcast();
   final _states = StreamController<V2State>.broadcast();
@@ -66,12 +67,14 @@ class V2SocketClient {
   Future<void> connect({
     required String playerName,
     String skin = 'default',
+    double massMultiplier = 1.0,
   }) async {
     if (_disposed) return;
     _wantConnected = true;
     _reconnectAttempts = 0;
     _lastName = playerName;
     _lastSkin = skin;
+    _lastMassMult = massMultiplier;
     await _openOnce();
   }
 
@@ -94,6 +97,7 @@ class V2SocketClient {
         'type': 'join',
         'name': _lastName ?? 'Player',
         'skin': _lastSkin,
+        'massMult': _lastMassMult,
       });
       _pingTimer?.cancel();
       _pingTimer = Timer.periodic(const Duration(seconds: 1), (_) => sendPing());
