@@ -1,247 +1,324 @@
 /**
- * Yazario Online Classic — authoritative WebSocket game server.
+ * Yazario Online Classic V2 — authoritative WebSocket game server.
  *
- * One global world, one room. Clients send `join` / `input` / `split` / `ping`,
- * server simulates physics + bots + collisions and broadcasts spatially
- * filtered snapshots at TICK_RATE Hz.
+ * Goal: behave exactly like Offline Classic so the client can mirror its
+ * simulation locally for client-side prediction. Constants, speed model,
+ * cohesion/separation/spread, split impulse, eject travel, merge cooldown,
+ * virus pop and bot AI are all faithful ports of `lib/game/...`.
  *
- * No external state, no DB. Self-contained.
+ * Wire protocol (V2):
+ *   client→server: {type:"join", name, skin}
+ *                  {type:"input", seq, dx, dy, attack}
+ *                  {type:"split", seq}
+ *                  {type:"eject", seq}
+ *                  {type:"respawn"}
+ *                  {type:"ping", t}
+ *   server→client: {type:"welcome", id, worldSize, tickRate, tickMs}
+ *                  {type:"state", t, now, ack,
+ *                      self:{id,dead,cm:{x,y}},
+ *                      addCells:[...], updCells:[...], rmCells:[...],
+ *                      addPellets:[...], rmPellets:[...],
+ *                      addViruses:[...], updViruses:[...], rmViruses:[...],
+ *                      addEjected:[...], updEjected:[...], rmEjected:[...],
+ *                      leaderboard, online}
+ *                  {type:"pong", t}
  *
- * Run: `npm i && npm run build && npm start`
+ * Entity IDs are monotonically-increasing strings, never reused.
+ * Run:  npx ts-node src/index.ts   (dev)
+ *       npm run build && npm start (prod)
  */
+
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 
-// ────────────────────────────────────────────────────────── world constants
+// ─────────────────────────────────────────────────────── world constants
+// Mirror of lib/game/game_engine.dart GameConstants.
 const PORT = Number(process.env.PORT ?? 2567);
-const MAP_W = 8000;
-const MAP_H = 8000;
-// 50 Hz tick = 20 ms simulation step. Matches the client's 20 ms input pump
-// and snapshot cadence, giving Agar.io-style real-time feel.
-const TICK_RATE = 50;
-const TICK_MS = 1000 / TICK_RATE;
-// Snapshots go out every Nth tick. We keep pellets/viruses at half-rate
-// because they barely move — saves ~50% bandwidth without hurting feel.
-const SNAPSHOT_EVERY_N_TICKS = 1;            // 50 Hz state snapshots
-const SLOW_SNAPSHOT_EVERY_N_TICKS = 2;       // 25 Hz pellet/virus refresh
 
-const PELLET_TARGET = 900;
-const VIRUS_TARGET = 15;
-const BOT_TARGET = 25; // baseline; scaled down as humans join
-const MAX_BOTS = 30;
+const WORLD_SIZE = 14142;
+const TARGET_PELLETS = 8000;
+const TARGET_VIRUSES = 30;
+const TARGET_BOTS = 70;
 
-const START_MASS = 30;
-const MAX_MASS = 22500;
-const DECAY_THRESHOLD = 35;
-const DECAY_PER_SEC = 0.002; // 0.2 %/s above threshold
-const EAT_RATIO = 1.25; // eater must be 25 % bigger
-
+const MAX_CELLS_PER_PLAYER = 16;
+const MAX_CELL_MASS = 22500;
 const SPLIT_MIN_MASS = 35;
-const SPLIT_COOLDOWN_MS = 800;
-const SPLIT_DASH_VELOCITY = 900;
-const SPLIT_DASH_DECAY = 0.91; // per 1/60 s frame
-const SPLIT_MASS_COST = 0.5; // half mass lost on split — kept name for clarity
-const MAX_CELLS_PER_PLAYER = 16; // mirrors GameConstants.maxCellsPerPlayer
-const SPLIT_MERGE_WINDOW_MS = 12000; // 12 s before fragments can re-merge
+const EJECT_MIN_MASS = 35;
+
+const MASS_DECAY_RATE = 0.002;          // 0.2 %/s above threshold
+const DECAY_THRESHOLD = 35;
+
+const EJECT_COST = 13;
+const EJECT_MASS = 13;
+const EJECT_CONSUMED_MASS = 13;
+const EJECT_VELOCITY_INITIAL = 1500;
+const EJECT_FRICTION_PER_FRAME = 0.91;
+
+const SPLIT_IMPULSE_INITIAL = 1500;
+const SPLIT_FRICTION_PER_FRAME = 0.91;
 
 const VIRUS_MASS = 100;
-const VIRUS_DAMAGE_MASS_LOSS = 0.4; // 40 % mass loss + small dash
-const VIRUS_BOUNCE_VELOCITY = 700;
+const VIRUS_SHOT_INITIAL = 1200;
+const PELLET_MASS = 1;
 
-// ── Eject (feed) ─────────────────────────────────────────────────────────
-const EJECT_MIN_MASS = 35;       // source cell needs at least this much
-const EJECT_COST = 13;           // mass removed from source cell
-const EJECT_MASS = 13;           // mass of the spawned projectile
-const EJECT_VELOCITY = 1100;     // launch speed (u/s)
-const EJECT_FRICTION_PER_S = 4;  // exponential decay rate (per second)
-const EJECT_MIN_SPEED = 30;      // when speed drops below this, it parks
-const EJECT_LIFETIME_MS = 30000; // server-side TTL for unclaimed feeds
-const EJECT_COOLDOWN_MS = 60;    // per-press, prevents accidental double-fires
+// Movement (impulse + damping + per-radius clamp).
+const INPUT_MOVE_STRENGTH = 1200;
+const DAMPING_PER_SECOND = 5.8;
 
-// ── Speed model: mirrors Offline Classic.
-// Classic uses an impulse+damping model whose terminal velocity is
-//   inputMoveStrength / dampingPerSecond = 1200 / 5.8 ≈ 207 u/s
-// and a per-radius cap maxSpeedForRadius(r) clamped to [95, 360].
-// We collapse that to a direct-velocity model:
-//   v = input * min(CLASSIC_TERMINAL, maxSpeedForRadius(r))
-// which gives the same steady-state feel without needing to simulate damping.
-const CLASSIC_TERMINAL = 207;            // 1200 / 5.8
-const SPEED_SCALE_BASE = 260;
-const SPEED_REFERENCE_RADIUS = 35;
+// Cohesion.
+const COHESION_STRENGTH = 4.5;
+const COHESION_MAX_DISTANCE = 120.0;
+const COHESION_COOLDOWN_FACTOR = 0.35;
+
+// Separation.
+const SEPARATION_STRENGTH = 34.0;
+const MIN_GAP = 3.0;
+
+// Attack spread.
+const ATTACK_SPREAD_STRENGTH = 22.0;
+const LAUNCH_OFFSET = 10.0;
+const PROJECTILE_SPAWN_CLEARANCE = 6.0;
+const LANE_WIDTH_BASE = 18.0;
+const LANE_WIDTH_RADIUS_FACTOR = 0.72;
+const LANE_FORWARD_DEPTH_FACTOR = 2.8;
+
+// Per-radius speed clamp.
+const REFERENCE_RADIUS = 35.0;
+const MAX_SMALL_CELL_SPEED = 360.0;
+const MAX_LARGE_CELL_SPEED = 95.0;
 const SPEED_RADIUS_POWER = 0.42;
-const MAX_SMALL_CELL_SPEED = 360;
-const MAX_LARGE_CELL_SPEED = 95;
+const SPEED_SCALE_BASE = 260.0;
 
-const SNAPSHOT_RADIUS = 1800; // how far around each viewer we send entities
+// Merge.
+const MERGE_DISTANCE_FACTOR = 0.75;
+const MERGE_COOLDOWN_BASE_S = 14.0;
+const MERGE_COOLDOWN_MAX_S = 28.0;
+const MERGE_COOLDOWN_PER_RADIUS = 0.12;
+
+const EAT_RATIO_WHOLE = 1.25;
+const EAT_RATIO_FRESH_SPLIT = 1.33;
+
+// Bot scan radii / cadence.
+const BOT_SCAN_RADIUS = 900;
+const BOT_PELLET_SCAN = 600;
+const BOT_VIRUS_AVOIDANCE = 250;
+const BOT_DECIDE_CADENCE_MS = 200;
+const BOT_RESPAWN_DELAY_MS = 500;
+
+// Networking.
+const TICK_RATE = 30;                   // server simulation Hz
+const TICK_MS = 1000 / TICK_RATE;
+const SLOW_TICK_EVERY = 4;              // 7.5 Hz pellet refresh per player
+const VIEWPORT_RADIUS = 2200;           // entities sent per player
 const LEADERBOARD_SIZE = 10;
+const STALE_PLAYER_MS = 20000;
+const EJECT_OWNER_IMMUNITY_MS = 200;
 
-// Pool of skin ids assigned to bots. Clients map any string skinId →
-// a deterministic image from their local SkinRegistry, so the actual
-// values just need to be stable & varied.
-const BOT_SKINS: string[] = [
-  "bot_a", "bot_b", "bot_c", "bot_d", "bot_e",
-  "bot_f", "bot_g", "bot_h", "bot_i", "bot_j",
-  "bot_k", "bot_l", "bot_m", "bot_n", "bot_o",
-];
-
+// Palette (mirrors offline _palette).
 const PALETTE = [
-  "#FF1F2D", "#1E9BFF", "#34C924", "#FFD60A",
-  "#FF6A00", "#A63CFF", "#00C8E0", "#FF2D87",
+  "#FF0000", "#00FF00", "#0091FF", "#FFD700", "#FF00FF",
+  "#00FFFF", "#FF6600", "#9D00FF", "#39FF14", "#FF1493",
 ];
 
 const BOT_NAMES = [
-  "Doge", "Ninja", "Cookie", "Slayer42", "Mario", "Sonic", "Yoshi", "Kirby",
-  "Reaper", "Phantom", "Bandit", "Viper", "Hawk", "Pixel", "Wraith", "Pumba",
-  "Bender", "Sponge", "Zelda", "Samus", "Ezio", "Solid", "Master", "Sneaky",
+  "Bot_Killer", "Doge", "Ninja", "Slayer42", "Cookie", "AgarKing",
+  "TacoCat", "PixelPro", "Nyan", "Mario", "Sonic", "Pikachu", "Yoshi",
+  "Bart", "Donut", "Bender", "Sponge", "Kirby", "Link", "Zelda", "Samus",
+  "Ezio", "Solid", "Master", "Sneaky", "Wraith", "Reaper", "Phantom",
+  "Bandit", "Viper", "Hawk",
 ];
 
-// ────────────────────────────────────────────────────────── types
-type Color = string;
-
-interface InputState {
-  dx: number;
-  dy: number;
-}
-
-interface Entity {
-  id: string;
-  x: number;
-  y: number;
-  mass: number;
-  color: Color;
-}
-
-interface Cell extends Entity {
-  vx: number; // base velocity (from input)
-  vy: number;
-  dashVx: number; // split-dash velocity (decays fast)
-  dashVy: number;
-  ownerId: string;
-  freshSplitUntil: number; // ms timestamp: can't merge yet
-}
-
-interface Player {
-  id: string;
-  socket: WebSocket | null; // null for bots
-  isBot: boolean;
-  name: string;
-  color: Color;
-  skinId: string; // opaque string; clients map to a local image
-  cells: Cell[];
-  input: InputState;
-  dead: boolean;
-  deadUntil: number; // ms timestamp; bots only
-  lastSplitAt: number;
-  lastEjectAt: number;
-  spawnTime: number;
-  highestMass: number;
-  lastSeenAt: number; // ms
-  // bot AI scratch
-  botTarget?: { x: number; y: number };
-  nextDecideAt: number;
-}
-
-interface Pellet extends Entity {}
-interface Virus extends Entity {}
-
-interface EjectedMass extends Entity {
-  vx: number;
-  vy: number;
-  expiresAt: number;
-  ownerId: string; // so the source cell can't eat its own feed instantly
-}
-
-// ────────────────────────────────────────────────────────── world state
-const players = new Map<string, Player>();
-const pellets: Pellet[] = [];
-const viruses: Virus[] = [];
-const ejected: EjectedMass[] = [];
-let entitySeq = 0;
-
-const newId = (prefix: string) => `${prefix}_${++entitySeq}`;
-
-function rand(min: number, max: number): number {
-  return min + Math.random() * (max - min);
-}
-function pickColor(): Color {
-  return PALETTE[Math.floor(Math.random() * PALETTE.length)];
-}
+// ─────────────────────────────────────────────────────── helpers
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 function radius(mass: number): number {
-  return Math.sqrt(mass / Math.PI) * 10;
+  return Math.sqrt(Math.max(mass, 0) / Math.PI) * 10;
 }
-function dist(ax: number, ay: number, bx: number, by: number): number {
-  const dx = ax - bx, dy = ay - by;
-  return Math.sqrt(dx * dx + dy * dy);
+function rand(min: number, max: number): number {
+  return min + Math.random() * (max - min);
+}
+function pickPaletteColor(): string {
+  return PALETTE[Math.floor(Math.random() * PALETTE.length)];
+}
+function maxSpeedForRadius(r: number): number {
+  const s =
+    SPEED_SCALE_BASE *
+    Math.pow(REFERENCE_RADIUS / (r < 1 ? 1 : r), SPEED_RADIUS_POWER);
+  return clamp(s, MAX_LARGE_CELL_SPEED, MAX_SMALL_CELL_SPEED);
+}
+function mergeCooldownMsForRadius(r: number): number {
+  const secs = clamp(
+    MERGE_COOLDOWN_BASE_S + r * MERGE_COOLDOWN_PER_RADIUS,
+    MERGE_COOLDOWN_BASE_S,
+    MERGE_COOLDOWN_MAX_S,
+  );
+  return Math.round(secs * 1000);
 }
 
-// ────────────────────────────────────────────────────────── spawning
-function safeSpawnPosition(margin = 500): { x: number; y: number } {
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const x = rand(margin, MAP_W - margin);
-    const y = rand(margin, MAP_H - margin);
-    let ok = true;
-    for (const p of players.values()) {
-      if (p.dead) continue;
-      for (const c of p.cells) {
-        if (dist(c.x, c.y, x, y) < 600) {
-          ok = false;
-          break;
-        }
+let entitySeq = 0;
+function newId(prefix: string): string {
+  return `${prefix}${++entitySeq}`;
+}
+
+// ─────────────────────────────────────────────────────── types
+interface InputState {
+  dx: number;
+  dy: number;
+  attack: boolean;
+  lastDir: { x: number; y: number };
+  seq: number;
+}
+
+interface Cell {
+  id: string;
+  ownerId: string;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  spX: number;       // split impulse
+  spY: number;
+  mass: number;
+  color: string;
+  freshSplit: boolean;
+  mergeReadyAt: number; // ms timestamp
+}
+
+interface Player {
+  id: string;
+  socket: WebSocket | null;
+  isBot: boolean;
+  name: string;
+  color: string;
+  skinId: string;
+  cells: Cell[];
+  input: InputState;
+  dead: boolean;
+  deadAt: number;
+  lastInputSeq: number;
+  lastSeenAt: number;
+  spawnAt: number;
+  highestMass: number;
+  // bot scratch
+  aiDir: { x: number; y: number };
+  aiNextDecide: number;
+  aiNextSplit: number;
+  aiNextEject: number;
+  // per-player visibility (set of entity IDs we've told this client about)
+  seenCells: Set<string>;
+  seenPellets: Set<string>;
+  seenViruses: Set<string>;
+  seenEjected: Set<string>;
+}
+
+interface Pellet {
+  id: string;
+  x: number;
+  y: number;
+  color: string;
+}
+
+interface Virus {
+  id: string;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  mass: number;
+  feedCount: number;
+  lfX: number;
+  lfY: number;
+}
+
+interface EjectedMass {
+  id: string;
+  ownerId: string;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  color: string;
+  spawnedAt: number;
+}
+
+// ─────────────────────────────────────────────────────── world state
+const players = new Map<string, Player>();
+const pellets = new Map<string, Pellet>();
+const viruses = new Map<string, Virus>();
+const ejected = new Map<string, EjectedMass>();
+let serverTick = 0;
+let lastNowMs = Date.now();
+
+// ─────────────────────────────────────────────────────── spawning
+function randomWorldPos(margin = 200): { x: number; y: number } {
+  return {
+    x: rand(margin, WORLD_SIZE - margin),
+    y: rand(margin, WORLD_SIZE - margin),
+  };
+}
+
+function safeSpawnPos(margin = 600): { x: number; y: number } {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const p = randomWorldPos(margin);
+    let safe = true;
+    for (const other of players.values()) {
+      if (other.dead) continue;
+      for (const c of other.cells) {
+        const dx = c.x - p.x, dy = c.y - p.y;
+        if (dx * dx + dy * dy < 800 * 800) { safe = false; break; }
       }
-      if (!ok) break;
+      if (!safe) break;
     }
-    for (const v of viruses) {
-      if (dist(v.x, v.y, x, y) < 200) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) return { x, y };
+    if (safe) return p;
   }
-  return { x: rand(margin, MAP_W - margin), y: rand(margin, MAP_H - margin) };
+  return randomWorldPos(margin);
 }
 
 function spawnPellet(): Pellet {
-  return {
-    id: newId("p"),
-    x: rand(20, MAP_W - 20),
-    y: rand(20, MAP_H - 20),
-    mass: 1,
-    color: pickColor(),
-  };
+  const p = randomWorldPos(40);
+  return { id: newId("p"), x: p.x, y: p.y, color: pickPaletteColor() };
 }
+
 function spawnVirus(): Virus {
+  const p = randomWorldPos(300);
   return {
     id: newId("v"),
-    x: rand(200, MAP_W - 200),
-    y: rand(200, MAP_H - 200),
+    x: p.x,
+    y: p.y,
+    vx: 0,
+    vy: 0,
     mass: VIRUS_MASS,
-    color: "#33FF33",
+    feedCount: 0,
+    lfX: 0,
+    lfY: 0,
   };
 }
 
-function spawnCellForPlayer(p: Player, mass: number = START_MASS): void {
-  const pos = safeSpawnPosition();
+function spawnCellForPlayer(p: Player): void {
+  const pos = safeSpawnPos();
+  const startMass = p.isBot ? 100 : 76;
   p.cells = [{
     id: newId("c"),
     ownerId: p.id,
     x: pos.x,
     y: pos.y,
-    mass,
     vx: 0,
     vy: 0,
-    dashVx: 0,
-    dashVy: 0,
+    spX: 0,
+    spY: 0,
+    mass: startMass,
     color: p.color,
-    freshSplitUntil: 0,
+    freshSplit: false,
+    mergeReadyAt: Date.now(),
   }];
   p.dead = false;
-  p.spawnTime = Date.now();
-  p.highestMass = mass;
-  p.input = { dx: 0, dy: 0 };
+  p.deadAt = 0;
+  p.spawnAt = Date.now();
+  p.highestMass = startMass;
+  p.input.dx = 0;
+  p.input.dy = 0;
+  p.input.attack = false;
 }
 
 function makeBot(): Player {
@@ -251,64 +328,88 @@ function makeBot(): Player {
     socket: null,
     isBot: true,
     name: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
-    color: pickColor(),
-    skinId: BOT_SKINS[Math.floor(Math.random() * BOT_SKINS.length)],
+    color: pickPaletteColor(),
+    skinId: `bot_${id}`,
     cells: [],
-    input: { dx: 0, dy: 0 },
+    input: { dx: 0, dy: 0, attack: false, lastDir: { x: 1, y: 0 }, seq: 0 },
     dead: false,
-    deadUntil: 0,
-    lastSplitAt: 0,
-    lastEjectAt: 0,
-    spawnTime: Date.now(),
-    highestMass: START_MASS,
+    deadAt: 0,
+    lastInputSeq: 0,
     lastSeenAt: Date.now(),
-    nextDecideAt: 0,
+    spawnAt: Date.now(),
+    highestMass: 100,
+    aiDir: { x: 0, y: 0 },
+    aiNextDecide: 0,
+    aiNextSplit: 0,
+    aiNextEject: 0,
+    seenCells: new Set(),
+    seenPellets: new Set(),
+    seenViruses: new Set(),
+    seenEjected: new Set(),
   };
   spawnCellForPlayer(bot);
   return bot;
 }
 
-// initialise world
-for (let i = 0; i < PELLET_TARGET; i++) pellets.push(spawnPellet());
-for (let i = 0; i < VIRUS_TARGET; i++) viruses.push(spawnVirus());
-for (let i = 0; i < BOT_TARGET; i++) {
+// init world
+for (let i = 0; i < TARGET_PELLETS; i++) {
+  const p = spawnPellet();
+  pellets.set(p.id, p);
+}
+for (let i = 0; i < TARGET_VIRUSES; i++) {
+  const v = spawnVirus();
+  viruses.set(v.id, v);
+}
+for (let i = 0; i < TARGET_BOTS; i++) {
   const b = makeBot();
   players.set(b.id, b);
 }
 
-// ────────────────────────────────────────────────────────── bot AI
-function botDecide(b: Player, now: number): void {
-  if (b.dead) return;
-  if (now < b.nextDecideAt) return;
-  b.nextDecideAt = now + 250 + Math.random() * 250;
-
-  // Compute center of mass
+// ─────────────────────────────────────────────────────── centre of mass
+function centerOfMass(p: Player): { x: number; y: number } {
+  if (p.cells.length === 0) return { x: WORLD_SIZE / 2, y: WORLD_SIZE / 2 };
   let cx = 0, cy = 0, tm = 0;
-  for (const c of b.cells) {
+  for (const c of p.cells) {
     cx += c.x * c.mass;
     cy += c.y * c.mass;
     tm += c.mass;
   }
-  if (tm <= 0) return;
-  cx /= tm;
-  cy /= tm;
-  const myMass = tm;
+  if (tm <= 0) return { x: p.cells[0].x, y: p.cells[0].y };
+  return { x: cx / tm, y: cy / tm };
+}
 
-  let threatX = 0, threatY = 0, threatStrength = 0;
-  let preyX = cx, preyY = cy, preyDist = Infinity;
+function totalMass(p: Player): number {
+  let m = 0;
+  for (const c of p.cells) m += c.mass;
+  return m;
+}
+
+// ─────────────────────────────────────────────────────── bot AI
+function botDecide(p: Player, now: number): void {
+  if (p.dead) return;
+  if (now < p.aiNextDecide) return;
+  p.aiNextDecide = now + BOT_DECIDE_CADENCE_MS + Math.random() * 250;
+
+  const c = centerOfMass(p);
+  const myMass = totalMass(p);
+  if (myMass <= 0) return;
+
+  let threatX = 0, threatY = 0, threatW = 0;
+  let preyX = c.x, preyY = c.y, preyDist = Infinity;
 
   for (const other of players.values()) {
-    if (other.id === b.id || other.dead) continue;
+    if (other.id === p.id || other.dead) continue;
     for (const oc of other.cells) {
-      const d = dist(cx, cy, oc.x, oc.y);
-      if (d > 900) continue;
-      if (oc.mass > myMass * EAT_RATIO) {
-        // threat: stronger when closer
-        const w = 1 - d / 900;
-        threatX += (cx - oc.x) * w;
-        threatY += (cy - oc.y) * w;
-        threatStrength += w;
-      } else if (myMass > oc.mass * EAT_RATIO && d < preyDist) {
+      const dx = oc.x - c.x, dy = oc.y - c.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > BOT_SCAN_RADIUS * BOT_SCAN_RADIUS) continue;
+      const d = Math.sqrt(d2);
+      if (oc.mass > myMass * EAT_RATIO_WHOLE && d < 750) {
+        const w = 1 - d / 750;
+        threatX += (c.x - oc.x) * w;
+        threatY += (c.y - oc.y) * w;
+        threatW += w;
+      } else if (myMass > oc.mass * EAT_RATIO_WHOLE && d < preyDist) {
         preyX = oc.x;
         preyY = oc.y;
         preyDist = d;
@@ -316,162 +417,470 @@ function botDecide(b: Player, now: number): void {
     }
   }
 
-  // Virus avoidance: only matters for big bots
-  if (myMass > 130) {
-    for (const v of viruses) {
-      const d = dist(cx, cy, v.x, v.y);
-      if (d < 260) {
-        const w = 1 - d / 260;
-        threatX += (cx - v.x) * w;
-        threatY += (cy - v.y) * w;
-        threatStrength += w * 0.7;
+  // Virus avoidance for big bots.
+  if (myMass > 130 && p.cells.length < MAX_CELLS_PER_PLAYER) {
+    for (const v of viruses.values()) {
+      const dx = v.x - c.x, dy = v.y - c.y;
+      const d = Math.hypot(dx, dy);
+      if (d > 0 && d < BOT_VIRUS_AVOIDANCE) {
+        const w = (1 - d / BOT_VIRUS_AVOIDANCE) * 0.7;
+        threatX += (c.x - v.x) * w;
+        threatY += (c.y - v.y) * w;
+        threatW += w;
       }
     }
   }
 
   let tx: number, ty: number;
-  if (threatStrength > 0.3) {
-    tx = cx + threatX;
-    ty = cy + threatY;
+  if (threatW > 0.3) {
+    tx = c.x + threatX;
+    ty = c.y + threatY;
   } else if (isFinite(preyDist)) {
     tx = preyX;
     ty = preyY;
   } else {
-    // Find closest pellet
-    let bd = Infinity;
-    let bp: Pellet | null = null;
-    for (const pe of pellets) {
-      const d = dist(cx, cy, pe.x, pe.y);
-      if (d < bd) {
-        bd = d;
-        bp = pe;
-      }
-      if (bd < 50) break;
+    // chase nearest pellet
+    let bd = BOT_PELLET_SCAN * BOT_PELLET_SCAN;
+    let best: Pellet | null = null;
+    for (const pe of pellets.values()) {
+      const dx = pe.x - c.x, dy = pe.y - c.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bd) { bd = d2; best = pe; }
     }
-    if (bp) {
-      tx = bp.x;
-      ty = bp.y;
-    } else {
-      tx = cx + rand(-300, 300);
-      ty = cy + rand(-300, 300);
-    }
+    if (best) { tx = best.x; ty = best.y; }
+    else { tx = c.x + rand(-300, 300); ty = c.y + rand(-300, 300); }
   }
 
-  // Steer away from world edges
-  const margin = 350;
-  if (cx < margin) tx += 400;
-  if (cx > MAP_W - margin) tx -= 400;
-  if (cy < margin) ty += 400;
-  if (cy > MAP_H - margin) ty -= 400;
+  // Edge steering.
+  const margin = 400;
+  if (c.x < margin) tx += 400;
+  if (c.x > WORLD_SIZE - margin) tx -= 400;
+  if (c.y < margin) ty += 400;
+  if (c.y > WORLD_SIZE - margin) ty -= 400;
 
-  const dx = tx - cx, dy = ty - cy;
+  const dx = tx - c.x, dy = ty - c.y;
   const m = Math.hypot(dx, dy);
   if (m > 0.5) {
-    b.input.dx = clamp(dx / m, -1, 1);
-    b.input.dy = clamp(dy / m, -1, 1);
+    p.aiDir.x = dx / m;
+    p.aiDir.y = dy / m;
   } else {
-    b.input.dx = 0;
-    b.input.dy = 0;
+    p.aiDir.x = 0;
+    p.aiDir.y = 0;
   }
 }
 
-// ────────────────────────────────────────────────────────── simulation
-// Mirrors GameConstants.maxSpeedForRadius from the offline engine.
-function maxSpeedForRadius(r: number): number {
-  const s =
-    SPEED_SCALE_BASE *
-    Math.pow(SPEED_REFERENCE_RADIUS / (r < 1 ? 1 : r), SPEED_RADIUS_POWER);
-  return clamp(s, MAX_LARGE_CELL_SPEED, MAX_SMALL_CELL_SPEED);
+function botDecideSplit(p: Player, now: number): void {
+  if (p.dead) return;
+  if (now < p.aiNextSplit) return;
+  if (p.cells.length >= 6) { p.aiNextSplit = now + 1500; return; }
+  const myMass = totalMass(p);
+  if (myMass < 60) { p.aiNextSplit = now + 800; return; }
+  const c = centerOfMass(p);
+  const myR = radius(myMass);
+  for (const other of players.values()) {
+    if (other.id === p.id || other.dead) continue;
+    for (const oc of other.cells) {
+      const dx = oc.x - c.x, dy = oc.y - c.y;
+      const d = Math.hypot(dx, dy);
+      if (myMass > oc.mass * 1.3 && d > myR * 1.1 && d < myR * 2.8) {
+        tryDoSplit(p, p.aiDir.x, p.aiDir.y);
+        p.aiNextSplit = now + 3000 + Math.random() * 5000;
+        return;
+      }
+    }
+  }
+  p.aiNextSplit = now + 900;
 }
 
-// Direct steady-state speed for a cell of given radius. Bots & humans
-// use the same curve — same as Offline Classic.
-function speedForRadius(r: number): number {
-  return Math.min(CLASSIC_TERMINAL, maxSpeedForRadius(r));
+function botDecideEject(p: Player, now: number): void {
+  if (p.dead) return;
+  if (now < p.aiNextEject) return;
+  const myMass = totalMass(p);
+  if (myMass < 140) { p.aiNextEject = now + 800; return; }
+  const c = centerOfMass(p);
+  let bigEnemy = false;
+  for (const other of players.values()) {
+    if (other.id === p.id || other.dead) continue;
+    for (const oc of other.cells) {
+      const dx = oc.x - c.x, dy = oc.y - c.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < 600 * 600 && oc.mass > myMass * 1.4) { bigEnemy = true; break; }
+    }
+    if (bigEnemy) break;
+  }
+  if (!bigEnemy) { p.aiNextEject = now + 600; return; }
+  for (const v of viruses.values()) {
+    const dx = v.x - c.x, dy = v.y - c.y;
+    const d = Math.hypot(dx, dy);
+    if (d < 20 || d > 450) continue;
+    const ax = dx / d, ay = dy / d;
+    const aligned = ax * p.aiDir.x + ay * p.aiDir.y;
+    if (aligned > 0.45) {
+      tryDoEject(p, p.aiDir.x, p.aiDir.y);
+      p.aiNextEject = now + 1500 + Math.random() * 2000;
+      return;
+    }
+  }
+  p.aiNextEject = now + 700;
 }
 
-function applyMovement(p: Player, dt: number): void {
-  const idx = clamp(p.input.dx, -1, 1);
-  const idy = clamp(p.input.dy, -1, 1);
-  const im = Math.hypot(idx, idy) || 1;
-  const ux = im > 1 ? idx / im : idx;
-  const uy = im > 1 ? idy / im : idy;
-
+// ─────────────────────────────────────────────────────── physics
+function applyInputForce(p: Player, dt: number): void {
+  let dx: number, dy: number;
+  if (p.isBot) {
+    dx = p.aiDir.x; dy = p.aiDir.y;
+  } else {
+    dx = p.input.dx; dy = p.input.dy;
+  }
+  const mag = Math.hypot(dx, dy);
+  if (mag < 0.05) return;
+  const ux = dx / mag, uy = dy / mag;
+  const f = INPUT_MOVE_STRENGTH * dt;
   for (const c of p.cells) {
-    const r = radius(c.mass);
-    const speed = speedForRadius(r);
-    const vx = ux * speed;
-    const vy = uy * speed;
-    c.vx = vx;
-    c.vy = vy;
+    c.vx += ux * f;
+    c.vy += uy * f;
+  }
+}
 
-    // Apply velocity + dash and clamp to world.
-    c.x += (c.vx + c.dashVx) * dt;
-    c.y += (c.vy + c.dashVy) * dt;
+function applyCohesion(p: Player, dt: number): void {
+  if (p.cells.length < 2) return;
+  const com = centerOfMass(p);
+  let maxMass = 0;
+  for (const c of p.cells) if (c.mass > maxMass) maxMass = c.mass;
+  const now = Date.now();
+  for (const c of p.cells) {
+    if (Math.hypot(c.spX, c.spY) >= 1) continue;
+    const dx = com.x - c.x, dy = com.y - c.y;
+    const d = Math.hypot(dx, dy);
+    if (d === 0) continue;
+    let factor = now >= c.mergeReadyAt ? 1.0 : COHESION_COOLDOWN_FACTOR;
+    if (maxMass > 500 && c.mass < maxMass * 0.2) factor *= 0.3;
+    const accel = COHESION_STRENGTH * Math.min(d, COHESION_MAX_DISTANCE) * factor;
+    c.vx += (dx / d) * accel * dt;
+    c.vy += (dy / d) * accel * dt;
+  }
+}
 
-    // Dash decays per 60 fps frame, scaled by dt.
-    const decay = Math.pow(SPLIT_DASH_DECAY, dt * 60);
-    c.dashVx *= decay;
-    c.dashVy *= decay;
-    if (Math.abs(c.dashVx) < 1) c.dashVx = 0;
-    if (Math.abs(c.dashVy) < 1) c.dashVy = 0;
-
-    const rClamp = radius(c.mass);
-    c.x = clamp(c.x, rClamp * 0.75, MAP_W - rClamp * 0.75);
-    c.y = clamp(c.y, rClamp * 0.75, MAP_H - rClamp * 0.75);
-
-    // Mass decay
-    if (c.mass > DECAY_THRESHOLD) {
-      c.mass = Math.max(
-        DECAY_THRESHOLD,
-        c.mass * Math.pow(1 - DECAY_PER_SEC, dt),
-      );
+function applySeparation(p: Player, dt: number): void {
+  const cs = p.cells;
+  if (cs.length < 2) return;
+  const now = Date.now();
+  for (let i = 0; i < cs.length; i++) {
+    const a = cs[i];
+    for (let j = i + 1; j < cs.length; j++) {
+      const b = cs[j];
+      if (now >= a.mergeReadyAt && now >= b.mergeReadyAt) continue;
+      const dx = a.x - b.x, dy = a.y - b.y;
+      const d = Math.hypot(dx, dy);
+      const ar = radius(a.mass), br = radius(b.mass);
+      const minDist = ar + br + MIN_GAP;
+      if (d >= minDist) continue;
+      if (d === 0) { a.x += 0.5; continue; }
+      const overlap = minDist - d;
+      const nx = dx / d, ny = dy / d;
+      const totMass = a.mass + b.mass;
+      const fx = nx * overlap * SEPARATION_STRENGTH;
+      const fy = ny * overlap * SEPARATION_STRENGTH;
+      a.vx += fx * (b.mass / totMass) * dt;
+      a.vy += fy * (b.mass / totMass) * dt;
+      b.vx -= fx * (a.mass / totMass) * dt;
+      b.vy -= fy * (a.mass / totMass) * dt;
     }
   }
 }
 
-function tryEatPellets(p: Player): void {
+function applyAttackSpread(p: Player, dt: number): void {
+  if (!p.input.attack) return;
+  if (p.cells.length < 2) return;
+  const dirRaw = p.input.lastDir;
+  const amag = Math.hypot(dirRaw.x, dirRaw.y);
+  if (amag === 0) return;
+  const ux = dirRaw.x / amag, uy = dirRaw.y / amag;
+  const px = -uy, py = ux;
+  let main = p.cells[0];
+  for (const c of p.cells) if (c.mass > main.mass) main = c;
+  const mR = radius(main.mass);
+  const laneW = LANE_WIDTH_BASE + mR * LANE_WIDTH_RADIUS_FACTOR;
+  const laneD = mR * LANE_FORWARD_DEPTH_FACTOR;
   for (const c of p.cells) {
+    if (c === main) continue;
+    if (Math.hypot(c.spX, c.spY) >= 1) continue;
+    const rx = c.x - main.x, ry = c.y - main.y;
+    const fwd = rx * ux + ry * uy;
+    const side = rx * px + ry * py;
+    if (fwd <= 0 || fwd >= laneD) continue;
+    if (Math.abs(side) >= laneW) continue;
+    let sign: number;
+    if (Math.abs(side) < 1) {
+      // deterministic bias by id
+      sign = (c.id.charCodeAt(c.id.length - 1) & 1) ? 1 : -1;
+    } else sign = side >= 0 ? 1 : -1;
+    const sidePush = ATTACK_SPREAD_STRENGTH * (laneW - Math.abs(side));
+    c.vx += px * sign * sidePush * dt;
+    c.vy += py * sign * sidePush * dt;
+    c.vx += -ux * ATTACK_SPREAD_STRENGTH * 0.25 * dt;
+    c.vy += -uy * ATTACK_SPREAD_STRENGTH * 0.25 * dt;
+  }
+}
+
+function integrateCells(p: Player, dt: number): void {
+  const damping = Math.exp(-DAMPING_PER_SECOND * dt);
+  const splitFric = Math.pow(SPLIT_FRICTION_PER_FRAME, dt * 60);
+  for (const c of p.cells) {
+    if (Math.hypot(c.spX, c.spY) >= 1) {
+      c.x += c.spX * dt;
+      c.y += c.spY * dt;
+      c.spX *= splitFric;
+      c.spY *= splitFric;
+      if (Math.hypot(c.spX, c.spY) < 1) { c.spX = 0; c.spY = 0; }
+    }
+    c.vx *= damping;
+    c.vy *= damping;
     const r = radius(c.mass);
-    const r2 = r * r;
-    for (let i = pellets.length - 1; i >= 0; i--) {
-      const pe = pellets[i];
-      const dx = pe.x - c.x, dy = pe.y - c.y;
-      if (dx * dx + dy * dy < r2) {
-        if (c.mass < MAX_MASS) c.mass += pe.mass;
-        // Replace with a brand-new pellet (new ID) so the client's local
-        // prediction can safely remove the eaten ID without seeing the
-        // "teleporting pellet" flicker.
-        pellets[i] = spawnPellet();
+    const maxV = maxSpeedForRadius(r);
+    const vMag = Math.hypot(c.vx, c.vy);
+    if (vMag > maxV) {
+      c.vx = c.vx * (maxV / vMag);
+      c.vy = c.vy * (maxV / vMag);
+    }
+    c.x += c.vx * dt;
+    c.y += c.vy * dt;
+    if (c.mass > DECAY_THRESHOLD) {
+      const nm = c.mass * Math.pow(1 - MASS_DECAY_RATE, dt);
+      c.mass = nm < DECAY_THRESHOLD ? DECAY_THRESHOLD : nm;
+    }
+    const inset = r * 0.75;
+    c.x = clamp(c.x, inset, WORLD_SIZE - inset);
+    c.y = clamp(c.y, inset, WORLD_SIZE - inset);
+  }
+}
+
+function updateLastDir(p: Player): void {
+  const mag = Math.hypot(p.input.dx, p.input.dy);
+  if (mag > 0.05) {
+    p.input.lastDir.x = p.input.dx / mag;
+    p.input.lastDir.y = p.input.dy / mag;
+  }
+}
+
+// ─────────────────────────────────────────────────────── viruses
+function updateViruses(dt: number): void {
+  const fric = Math.pow(0.96, dt * 60);
+  for (const v of viruses.values()) {
+    if (Math.hypot(v.vx, v.vy) > 1) {
+      v.x += v.vx * dt;
+      v.y += v.vy * dt;
+      v.vx *= fric;
+      v.vy *= fric;
+    }
+    const r = radius(v.mass);
+    const inset = r * 0.5;
+    v.x = clamp(v.x, inset, WORLD_SIZE - inset);
+    v.y = clamp(v.y, inset, WORLD_SIZE - inset);
+  }
+}
+
+// ─────────────────────────────────────────────────────── eject
+function tryDoEject(p: Player, dirX: number, dirY: number): void {
+  if (p.dead) return;
+  const m = Math.hypot(dirX, dirY);
+  const ux = m > 0.05 ? dirX / m : p.input.lastDir.x;
+  const uy = m > 0.05 ? dirY / m : p.input.lastDir.y;
+  const er = radius(EJECT_MASS);
+  for (const c of p.cells) {
+    if (c.mass < EJECT_MIN_MASS) continue;
+    c.mass -= EJECT_COST;
+    // small random spread (±6°, ±5 % speed)
+    const ang = (Math.random() * 12 - 6) * (Math.PI / 180);
+    const cs = Math.cos(ang), sn = Math.sin(ang);
+    const fx = ux * cs - uy * sn;
+    const fy = ux * sn + uy * cs;
+    const sv = 0.95 + Math.random() * 0.1;
+    const cr = radius(c.mass);
+    let lx = c.x + fx * (cr + er + LAUNCH_OFFSET);
+    let ly = c.y + fy * (cr + er + LAUNCH_OFFSET);
+    // nudge out of friendly cells
+    for (let iter = 0; iter < 30; iter++) {
+      let blocked = false;
+      for (const other of p.cells) {
+        if (other === c) continue;
+        const dx = lx - other.x, dy = ly - other.y;
+        const minD = radius(other.mass) + er + PROJECTILE_SPAWN_CLEARANCE;
+        if (dx * dx + dy * dy < minD * minD) { blocked = true; break; }
+      }
+      if (!blocked) break;
+      lx += fx * 3;
+      ly += fy * 3;
+    }
+    const id = newId("e");
+    ejected.set(id, {
+      id,
+      ownerId: p.id,
+      x: lx,
+      y: ly,
+      vx: fx * EJECT_VELOCITY_INITIAL * sv,
+      vy: fy * EJECT_VELOCITY_INITIAL * sv,
+      color: c.color,
+      spawnedAt: Date.now(),
+    });
+  }
+}
+
+function updateEjected(dt: number): void {
+  if (ejected.size === 0) return;
+  const fric = Math.pow(EJECT_FRICTION_PER_FRAME, dt * 60);
+  const er = radius(EJECT_MASS);
+  for (const e of ejected.values()) {
+    if (e.vx === 0 && e.vy === 0) continue;
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+    e.vx *= fric;
+    e.vy *= fric;
+    if (Math.hypot(e.vx, e.vy) < 1) { e.vx = 0; e.vy = 0; }
+    if (e.x < er) { e.x = er; e.vx = 0; }
+    else if (e.x > WORLD_SIZE - er) { e.x = WORLD_SIZE - er; e.vx = 0; }
+    if (e.y < er) { e.y = er; e.vy = 0; }
+    else if (e.y > WORLD_SIZE - er) { e.y = WORLD_SIZE - er; e.vy = 0; }
+  }
+}
+
+// ─────────────────────────────────────────────────────── split
+function tryDoSplit(p: Player, dirX: number, dirY: number): void {
+  if (p.dead) return;
+  const m = Math.hypot(dirX, dirY);
+  const ux = m > 0.05 ? dirX / m : p.input.lastDir.x;
+  const uy = m > 0.05 ? dirY / m : p.input.lastDir.y;
+  const now = Date.now();
+  const candidates = [...p.cells].sort((a, b) => b.mass - a.mass);
+  for (const source of candidates) {
+    if (p.cells.length >= MAX_CELLS_PER_PLAYER) break;
+    if (source.mass < SPLIT_MIN_MASS) continue;
+    const newMass = source.mass / 2;
+    source.mass = newMass;
+    const sR = radius(source.mass);
+    const cd = mergeCooldownMsForRadius(sR);
+    source.mergeReadyAt = now + cd;
+    source.freshSplit = true;
+    const radiusScale = clamp(
+      Math.pow(sR / REFERENCE_RADIUS, 0.35),
+      1.0,
+      2.5,
+    );
+    const id = newId("c");
+    p.cells.push({
+      id,
+      ownerId: p.id,
+      x: source.x,
+      y: source.y,
+      vx: 0,
+      vy: 0,
+      spX: ux * SPLIT_IMPULSE_INITIAL * radiusScale,
+      spY: uy * SPLIT_IMPULSE_INITIAL * radiusScale,
+      mass: newMass,
+      color: source.color,
+      freshSplit: true,
+      mergeReadyAt: now + cd,
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────── collisions
+function resolveEatPellets(): void {
+  for (const p of players.values()) {
+    if (p.dead) continue;
+    for (const c of p.cells) {
+      const r = radius(c.mass);
+      const r2 = r * r;
+      for (const [id, pe] of pellets) {
+        const dx = pe.x - c.x, dy = pe.y - c.y;
+        if (dx * dx + dy * dy < r2) {
+          if (c.mass < MAX_CELL_MASS) c.mass += PELLET_MASS;
+          pellets.delete(id);
+        }
+      }
+    }
+  }
+}
+
+function resolveEatEjected(): void {
+  if (ejected.size === 0) return;
+  const now = Date.now();
+  for (const p of players.values()) {
+    if (p.dead) continue;
+    for (const c of p.cells) {
+      if (c.mass < 22) continue;
+      const r = radius(c.mass);
+      for (const [id, e] of ejected) {
+        if (e.ownerId === c.ownerId && now - e.spawnedAt < EJECT_OWNER_IMMUNITY_MS) continue;
+        const er = radius(EJECT_MASS);
+        const eatR = r - er * 0.4;
+        const dx = e.x - c.x, dy = e.y - c.y;
+        if (dx * dx + dy * dy < eatR * eatR) {
+          if (c.mass < MAX_CELL_MASS) c.mass += EJECT_CONSUMED_MASS;
+          ejected.delete(id);
+        }
+      }
+    }
+  }
+}
+
+function resolveEjectedFeedsVirus(): void {
+  if (ejected.size === 0) return;
+  for (const [eId, e] of ejected) {
+    for (const v of viruses.values()) {
+      const dx = e.x - v.x, dy = e.y - v.y;
+      const d = Math.hypot(dx, dy);
+      if (d < radius(v.mass) + radius(EJECT_MASS) * 0.5) {
+        v.mass += EJECT_MASS;
+        v.feedCount++;
+        const m = Math.hypot(e.vx, e.vy);
+        if (m > 0) { v.lfX = e.vx / m; v.lfY = e.vy / m; }
+        ejected.delete(eId);
+        if (v.mass >= 200) {
+          v.feedCount = 0;
+          v.mass = VIRUS_MASS;
+          const dx0 = v.lfX === 0 && v.lfY === 0 ? 1 : v.lfX;
+          const dy0 = v.lfX === 0 && v.lfY === 0 ? 0 : v.lfY;
+          const id = newId("v");
+          viruses.set(id, {
+            id,
+            x: v.x + dx0 * (radius(v.mass) + 30),
+            y: v.y + dy0 * (radius(v.mass) + 30),
+            vx: dx0 * VIRUS_SHOT_INITIAL,
+            vy: dy0 * VIRUS_SHOT_INITIAL,
+            mass: VIRUS_MASS,
+            feedCount: 0,
+            lfX: 0,
+            lfY: 0,
+          });
+        }
+        break;
       }
     }
   }
 }
 
 function resolveCellVsCell(): void {
-  // Gather all alive cells
   const all: Cell[] = [];
   for (const p of players.values()) {
     if (p.dead) continue;
     for (const c of p.cells) all.push(c);
   }
   const dead = new Set<Cell>();
-  for (let i = 0; i < all.length; i++) {
-    const a = all[i];
+  for (const a of all) {
     if (dead.has(a)) continue;
     const ar = radius(a.mass);
-    for (let j = 0; j < all.length; j++) {
-      if (i === j) continue;
-      const b = all[j];
-      if (dead.has(b)) continue;
-      if (a.ownerId === b.ownerId) continue; // same-player: never eat
-      if (a.mass < b.mass * EAT_RATIO) continue;
+    for (const b of all) {
+      if (a === b || dead.has(b)) continue;
+      if (a.ownerId === b.ownerId) continue;
+      if (a.mass <= b.mass) continue;
+      const ratio = a.freshSplit ? EAT_RATIO_FRESH_SPLIT : EAT_RATIO_WHOLE;
+      if (a.mass < b.mass * ratio) continue;
       const br = radius(b.mass);
-      const dx = b.x - a.x, dy = b.y - a.y;
       const eatR = ar - br * 0.4;
-      if (eatR < 0) continue;
+      const dx = b.x - a.x, dy = b.y - a.y;
       if (dx * dx + dy * dy < eatR * eatR) {
-        if (a.mass < MAX_MASS) a.mass = Math.min(MAX_MASS, a.mass + b.mass);
+        if (a.mass < MAX_CELL_MASS) a.mass = Math.min(MAX_CELL_MASS, a.mass + b.mass);
         dead.add(b);
       }
     }
@@ -479,475 +888,388 @@ function resolveCellVsCell(): void {
   if (dead.size === 0) return;
   for (const p of players.values()) {
     if (p.cells.length === 0) continue;
-    p.cells = p.cells.filter((c) => !dead.has(c));
+    p.cells = p.cells.filter(c => !dead.has(c));
     if (p.cells.length === 0 && !p.dead) {
       p.dead = true;
-      p.deadUntil = Date.now() + 600; // bots respawn after 0.6 s
+      p.deadAt = Date.now();
     }
   }
 }
 
 function resolveCellVsVirus(): void {
-  const virusesConsumed = new Set<Virus>();
+  const consumed = new Set<string>();
+  // Snapshot virus list because popVirus pushes new cells
   for (const p of players.values()) {
     if (p.dead) continue;
-    for (const c of p.cells) {
-      if (radius(c.mass) <= radius(VIRUS_MASS) * 1.15) continue;
-      for (const v of viruses) {
-        if (virusesConsumed.has(v)) continue;
-        const cr = radius(c.mass);
+    for (const c of p.cells.slice()) {
+      const cr = radius(c.mass);
+      for (const v of viruses.values()) {
+        if (consumed.has(v.id)) continue;
         const vr = radius(v.mass);
-        const dx = v.x - c.x, dy = v.y - c.y;
+        if (cr <= vr * 1.15) continue;
         const trigger = cr + vr * 0.2;
+        const dx = v.x - c.x, dy = v.y - c.y;
         if (dx * dx + dy * dy < trigger * trigger) {
-          // Pop: lose mass, bounce away. Simplified Classic-style hit.
-          virusesConsumed.add(v);
-          const loss = c.mass * VIRUS_DAMAGE_MASS_LOSS;
-          c.mass = Math.max(DECAY_THRESHOLD, c.mass - loss);
-          const m = Math.hypot(dx, dy) || 1;
-          c.dashVx = -dx / m * VIRUS_BOUNCE_VELOCITY * 0.5;
-          c.dashVy = -dy / m * VIRUS_BOUNCE_VELOCITY * 0.5;
+          consumed.add(v.id);
+          popVirus(p, c, v);
           break;
         }
       }
     }
   }
-  if (virusesConsumed.size > 0) {
-    for (let i = viruses.length - 1; i >= 0; i--) {
-      if (virusesConsumed.has(viruses[i])) {
-        viruses[i] = spawnVirus();
-      }
+  for (const id of consumed) viruses.delete(id);
+}
+
+function popVirus(p: Player, eater: Cell, _v: Virus): void {
+  const now = Date.now();
+  if (p.cells.length >= MAX_CELLS_PER_PLAYER) {
+    eater.mass = Math.min(MAX_CELL_MASS, eater.mass + VIRUS_MASS);
+    return;
+  }
+  const available = MAX_CELLS_PER_PLAYER - p.cells.length;
+  const totMass = eater.mass + VIRUS_MASS;
+  const desired = totMass > 350 ? 16 : 8 + Math.floor(Math.random() * 5);
+  const n = Math.min(Math.max(2, Math.min(desired, available + 1)), 16);
+
+  const masses: number[] = [];
+  if (totMass > 350) {
+    let remaining = totMass;
+    const main = totMass * (0.45 + Math.random() * 0.1);
+    masses.push(main); remaining -= main;
+    const medCount = 2 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < medCount && masses.length < n; i++) {
+      const mm = totMass * (0.08 + Math.random() * 0.04);
+      masses.push(mm); remaining -= mm;
     }
+    const small = n - masses.length;
+    if (small > 0) {
+      const sm = remaining / small;
+      for (let i = 0; i < small; i++) masses.push(sm);
+    } else masses[0] += remaining;
+  } else {
+    const each = totMass / n;
+    for (let i = 0; i < n; i++) masses.push(each);
+  }
+
+  eater.mass = masses[0];
+  const er = radius(eater.mass);
+  eater.mergeReadyAt = now + mergeCooldownMsForRadius(er);
+  eater.freshSplit = true;
+  const base = Math.random() * Math.PI * 2;
+  for (let i = 1; i < masses.length; i++) {
+    const ang = base + (i / n) * 2 * Math.PI + (Math.random() - 0.5) * 0.3;
+    const dx = Math.cos(ang), dy = Math.sin(ang);
+    const m = masses[i];
+    const r = radius(m);
+    const radiusScale = clamp(Math.pow(er / REFERENCE_RADIUS, 0.35), 1.0, 2.5);
+    p.cells.push({
+      id: newId("c"),
+      ownerId: p.id,
+      x: eater.x,
+      y: eater.y,
+      vx: 0,
+      vy: 0,
+      spX: dx * SPLIT_IMPULSE_INITIAL * radiusScale,
+      spY: dy * SPLIT_IMPULSE_INITIAL * radiusScale,
+      mass: m,
+      color: eater.color,
+      freshSplit: true,
+      mergeReadyAt: now + mergeCooldownMsForRadius(r),
+    });
   }
 }
 
-function refillWorld(): void {
-  while (pellets.length < PELLET_TARGET) pellets.push(spawnPellet());
-  while (viruses.length < VIRUS_TARGET) viruses.push(spawnVirus());
-
-  // Maintain bot count: humans replace bots up to MAX_BOTS budget.
-  const humans = [...players.values()].filter((p) => !p.isBot).length;
-  const bots = [...players.values()].filter((p) => p.isBot && !p.dead).length;
-  const wanted = clamp(BOT_TARGET - humans, 6, MAX_BOTS);
-  if (bots < wanted) {
-    const b = makeBot();
-    players.set(b.id, b);
+// ─────────────────────────────────────────────────────── merge
+function processMerges(p: Player): void {
+  const now = Date.now();
+  if (p.cells.length < 2) return;
+  outer: for (let i = 0; i < p.cells.length; i++) {
+    for (let j = i + 1; j < p.cells.length; j++) {
+      const a = p.cells[i], b = p.cells[j];
+      if (now < a.mergeReadyAt || now < b.mergeReadyAt) continue;
+      const ar = radius(a.mass), br = radius(b.mass);
+      const dx = a.x - b.x, dy = a.y - b.y;
+      const d = Math.hypot(dx, dy);
+      if (d >= (ar + br) * MERGE_DISTANCE_FACTOR) continue;
+      const keeper = a.mass >= b.mass ? a : b;
+      const consumed = keeper === a ? b : a;
+      const idx = keeper === a ? j : i;
+      const total = keeper.mass + consumed.mass;
+      keeper.x = (keeper.x * keeper.mass + consumed.x * consumed.mass) / total;
+      keeper.y = (keeper.y * keeper.mass + consumed.y * consumed.mass) / total;
+      keeper.vx = (keeper.vx * keeper.mass + consumed.vx * consumed.mass) / total;
+      keeper.vy = (keeper.vy * keeper.mass + consumed.vy * consumed.mass) / total;
+      keeper.mass = total;
+      p.cells.splice(idx, 1);
+      return processMerges(p);
+    }
   }
+  // clear stale freshSplit
+  for (const c of p.cells) {
+    if (c.freshSplit && now >= c.mergeReadyAt) c.freshSplit = false;
+  }
+}
 
-  // Bot respawn after death timer
+// ─────────────────────────────────────────────────────── refill
+function refillWorld(): void {
+  while (pellets.size < TARGET_PELLETS) {
+    const p = spawnPellet();
+    pellets.set(p.id, p);
+  }
+  while (viruses.size < TARGET_VIRUSES) {
+    const v = spawnVirus();
+    viruses.set(v.id, v);
+  }
+  // bots respawn
   const now = Date.now();
   for (const p of players.values()) {
     if (!p.isBot) continue;
-    if (p.dead && now >= p.deadUntil) {
+    if (p.dead && now - p.deadAt >= BOT_RESPAWN_DELAY_MS) {
       spawnCellForPlayer(p);
     }
   }
-}
-
-// ────────────────────────────────────────────────────────── split
-function tryDoSplit(p: Player): void {
-  if (p.dead) return;
-  const now = Date.now();
-  if (now - p.lastSplitAt < SPLIT_COOLDOWN_MS) {
-    console.log("split blocked: cooldown");
-    return;
-  }
-  // Pick a dash direction. If the player isn't pressing any input (e.g.
-  // tapping split while idle on the joystick), fall back to (1, 0) so the
-  // split still fires — same forgiving behaviour as Offline Classic's
-  // SplitHandler.splitPlayer.
-  let dx = p.input.dx, dy = p.input.dy;
-  const m = Math.hypot(dx, dy);
-  if (m < 0.05) {
-    dx = 1;
-    dy = 0;
-  } else {
-    dx /= m;
-    dy /= m;
-  }
-  // Snapshot the eligible cells *before* we start splitting — otherwise
-  // the new cells we push to p.cells would also be considered for further
-  // splitting on the same press.
-  const candidates = [...p.cells].sort((a, b) => b.mass - a.mass);
-  let acted = false;
-  let anyEligible = false;
-  for (const source of candidates) {
-    if (p.cells.length >= MAX_CELLS_PER_PLAYER) break;
-    if (source.mass < SPLIT_MIN_MASS) continue;
-    anyEligible = true;
-    const half = source.mass / 2;
-    source.mass = half;
-    source.freshSplitUntil = now + SPLIT_MERGE_WINDOW_MS;
-    const r = radius(half);
-    const baby: Cell = {
-      id: newId("c"),
-      ownerId: p.id,
-      x: clamp(source.x + dx * (r + 4), r * 0.75, MAP_W - r * 0.75),
-      y: clamp(source.y + dy * (r + 4), r * 0.75, MAP_H - r * 0.75),
-      mass: half,
-      vx: 0,
-      vy: 0,
-      dashVx: dx * SPLIT_DASH_VELOCITY,
-      dashVy: dy * SPLIT_DASH_VELOCITY,
-      color: source.color,
-      freshSplitUntil: now + SPLIT_MERGE_WINDOW_MS,
-    };
-    p.cells.push(baby);
-    acted = true;
-  }
-  if (acted) {
-    p.lastSplitAt = now;
-    console.log("[action] split success", { player: p.id, cells: p.cells.length });
-  } else if (!anyEligible) {
-    console.log("split blocked: mass too low");
-  } else {
-    console.log("split blocked: cell cap reached");
+  // keep bot population near target
+  let aliveBots = 0;
+  for (const p of players.values()) if (p.isBot && !p.dead) aliveBots++;
+  if (aliveBots < TARGET_BOTS) {
+    const b = makeBot();
+    players.set(b.id, b);
   }
 }
 
-// ────────────────────────────────────────────────────────── eject (feed)
-function tryDoEject(p: Player): void {
-  if (p.dead) return;
-  const now = Date.now();
-  if (now - p.lastEjectAt < EJECT_COOLDOWN_MS) {
-    console.log("eject blocked: cooldown");
-    return;
-  }
-  // Pick a launch direction. Same fallback as split — (1, 0) when idle.
-  let dx = p.input.dx, dy = p.input.dy;
-  const m = Math.hypot(dx, dy);
-  if (m < 0.05) {
-    dx = 1;
-    dy = 0;
-  } else {
-    dx /= m;
-    dy /= m;
-  }
-  let anyFired = false;
-  let anyEligible = false;
-  for (const c of p.cells) {
-    // Match Offline: just need mass >= EJECT_MIN_MASS to feed. Cell can dip
-    // below DECAY_THRESHOLD via eject (Offline does the same).
-    if (c.mass < EJECT_MIN_MASS) continue;
-    anyEligible = true;
-    c.mass -= EJECT_COST;
-    const r = radius(c.mass < 1 ? 1 : c.mass);
-    // Spawn just outside the cell so it doesn't immediately re-overlap.
-    const launchX = c.x + dx * (r + 4);
-    const launchY = c.y + dy * (r + 4);
-    ejected.push({
-      id: newId("e"),
-      ownerId: p.id,
-      x: launchX,
-      y: launchY,
-      vx: dx * EJECT_VELOCITY,
-      vy: dy * EJECT_VELOCITY,
-      mass: EJECT_MASS,
-      color: c.color,
-      expiresAt: now + EJECT_LIFETIME_MS,
-    });
-    anyFired = true;
-  }
-  if (anyFired) {
-    p.lastEjectAt = now;
-    console.log("[action] eject success", { ejected: ejected.length });
-  } else if (!anyEligible) {
-    console.log("eject blocked: mass too low");
-  }
-}
-
-function updateEjected(dt: number): void {
-  if (ejected.length === 0) return;
-  const now = Date.now();
-  // Exponential friction; matches feel of Offline Classic's per-frame decay.
-  const decay = Math.exp(-EJECT_FRICTION_PER_S * dt);
-  for (let i = ejected.length - 1; i >= 0; i--) {
-    const e = ejected[i];
-    e.x += e.vx * dt;
-    e.y += e.vy * dt;
-    e.vx *= decay;
-    e.vy *= decay;
-    if (Math.abs(e.vx) < EJECT_MIN_SPEED) e.vx = 0;
-    if (Math.abs(e.vy) < EJECT_MIN_SPEED) e.vy = 0;
-    // Clamp to world.
-    if (e.x < 8) { e.x = 8; e.vx = -e.vx * 0.5; }
-    if (e.x > MAP_W - 8) { e.x = MAP_W - 8; e.vx = -e.vx * 0.5; }
-    if (e.y < 8) { e.y = 8; e.vy = -e.vy * 0.5; }
-    if (e.y > MAP_H - 8) { e.y = MAP_H - 8; e.vy = -e.vy * 0.5; }
-    if (now >= e.expiresAt) {
-      ejected.splice(i, 1);
-    }
-  }
-}
-
-function mergeOwnCells(): void {
-  const now = Date.now();
+// ─────────────────────────────────────────────────────── leaderboard
+interface LBEntry { id: string; name: string; mass: number; isHuman: boolean; }
+function buildLeaderboard(): LBEntry[] {
+  const list: LBEntry[] = [];
   for (const p of players.values()) {
     if (p.dead) continue;
-    if (p.cells.length < 2) continue;
-    // O(n^2) but n <= 16 by MAX_CELLS_PER_PLAYER — trivial.
-    outer: for (let i = 0; i < p.cells.length; i++) {
-      for (let j = i + 1; j < p.cells.length; j++) {
-        const a = p.cells[i];
-        const b = p.cells[j];
-        if (a.freshSplitUntil > now || b.freshSplitUntil > now) continue;
-        const ar = radius(a.mass);
-        const br = radius(b.mass);
-        const dx = a.x - b.x, dy = a.y - b.y;
-        const d2 = dx * dx + dy * dy;
-        const merge = (ar + br) * 0.6; // deep enough overlap = merge
-        if (d2 < merge * merge) {
-          // Absorb smaller into larger.
-          const winner = a.mass >= b.mass ? a : b;
-          const loser = winner === a ? b : a;
-          winner.mass += loser.mass;
-          p.cells.splice(p.cells.indexOf(loser), 1);
-          break outer;
-        }
-      }
-    }
-  }
-}
-
-function tryEatEjected(): void {
-  if (ejected.length === 0) return;
-  const now = Date.now();
-  for (const p of players.values()) {
-    if (p.dead) continue;
-    for (const c of p.cells) {
-      const r = radius(c.mass);
-      const r2 = r * r;
-      for (let i = ejected.length - 1; i >= 0; i--) {
-        const e = ejected[i];
-        // Don't let the source eat their own feed before it's traveled.
-        if (e.ownerId === p.id && now - (e.expiresAt - EJECT_LIFETIME_MS) < 250) continue;
-        const dx = e.x - c.x, dy = e.y - c.y;
-        if (dx * dx + dy * dy < r2) {
-          if (c.mass < MAX_MASS) c.mass = Math.min(MAX_MASS, c.mass + e.mass);
-          ejected.splice(i, 1);
-        }
-      }
-    }
-  }
-}
-
-// ────────────────────────────────────────────────────────── snapshot
-interface SnapshotEntity {
-  id: string;
-  name?: string;
-  x: number;
-  y: number;
-  mass: number;
-  radius: number;
-  color: string;
-  skinId?: string;
-  ownerId?: string;
-  isHuman?: boolean;
-  isSelf?: boolean;
-}
-
-interface LeaderboardEntry {
-  id: string;
-  name: string;
-  mass: number;
-}
-
-function buildLeaderboard(): LeaderboardEntry[] {
-  const list: LeaderboardEntry[] = [];
-  for (const p of players.values()) {
-    if (p.dead) continue;
-    let mass = 0;
-    for (const c of p.cells) mass += c.mass;
-    if (mass <= 0) continue;
-    list.push({ id: p.id, name: p.name, mass: Math.round(mass) });
+    const m = totalMass(p);
+    if (m <= 0) continue;
+    list.push({ id: p.id, name: p.name, mass: Math.round(m), isHuman: !p.isBot });
   }
   list.sort((a, b) => b.mass - a.mass);
   return list.slice(0, LEADERBOARD_SIZE);
 }
 
-function sendSnapshotTo(
-  p: Player,
-  leaderboard: LeaderboardEntry[],
-  includeSlow: boolean,
-): void {
-  if (p.isBot || !p.socket || p.socket.readyState !== WebSocket.OPEN) return;
-  // Pick the viewer center: human's center of mass or world center if dead.
-  let vx = MAP_W / 2, vy = MAP_H / 2;
-  if (!p.dead && p.cells.length > 0) {
-    let cx = 0, cy = 0, tm = 0;
-    for (const c of p.cells) {
-      cx += c.x * c.mass;
-      cy += c.y * c.mass;
-      tm += c.mass;
-    }
-    vx = cx / tm;
-    vy = cy / tm;
-  }
-  const r2 = SNAPSHOT_RADIUS * SNAPSHOT_RADIUS;
+// ─────────────────────────────────────────────────────── snapshot
+function buildSnapshot(p: Player, lb: LBEntry[], sendSlow: boolean): unknown {
+  const com = centerOfMass(p);
+  const r2 = VIEWPORT_RADIUS * VIEWPORT_RADIUS;
+  const now = Date.now();
 
-  const cells: SnapshotEntity[] = [];
+  // ── cells (every tick — small count) ──
+  const currentCells = new Set<string>();
+  const addCells: unknown[] = [];
+  const updCells: unknown[] = [];
   for (const other of players.values()) {
     if (other.dead) continue;
     for (const c of other.cells) {
-      const dx = c.x - vx, dy = c.y - vy;
-      if (dx * dx + dy * dy > r2) continue;
-      cells.push({
+      const dx = c.x - com.x, dy = c.y - com.y;
+      if (dx * dx + dy * dy > r2 * 1.3) continue;
+      currentCells.add(c.id);
+      const payload: Record<string, unknown> = {
         id: c.id,
-        name: other.name,
-        x: Math.round(c.x),
-        y: Math.round(c.y),
-        mass: Math.round(c.mass),
-        radius: Math.round(radius(c.mass)),
-        color: c.color,
-        skinId: other.skinId || "",
-        ownerId: other.id,
-        isHuman: !other.isBot,
-        isSelf: other.id === p.id,
-      });
+        x: Math.round(c.x * 10) / 10,
+        y: Math.round(c.y * 10) / 10,
+        m: Math.round(c.mass * 10) / 10,
+      };
+      if (!p.seenCells.has(c.id)) {
+        payload.o = other.id;
+        payload.n = other.name;
+        payload.col = c.color;
+        payload.sk = other.skinId;
+        payload.h = other.isBot ? 0 : 1;
+        payload.s = c.freshSplit ? 1 : 0;
+        payload.mr = c.mergeReadyAt;
+        addCells.push(payload);
+        p.seenCells.add(c.id);
+      } else {
+        // freshSplit flag may flip mid-life — include it cheap.
+        payload.s = c.freshSplit ? 1 : 0;
+        updCells.push(payload);
+      }
     }
   }
+  const rmCells: string[] = [];
+  for (const id of p.seenCells) {
+    if (!currentCells.has(id)) { rmCells.push(id); p.seenCells.delete(id); }
+  }
 
-  // Pellets / viruses change rarely — only resend them on slow ticks.
-  // Ejected mass is fast-moving, so it always goes out.
-  let visiblePellets:
-    | Array<{ id: string; x: number; y: number; color: string }>
-    | undefined;
-  let visibleViruses: SnapshotEntity[] | undefined;
-  if (includeSlow) {
-    visiblePellets = [];
-    for (const pe of pellets) {
-      const dx = pe.x - vx, dy = pe.y - vy;
+  // ── pellets (slow-tick refresh of additions; removals every tick) ──
+  const addPellets: unknown[] = [];
+  if (sendSlow) {
+    for (const pe of pellets.values()) {
+      const dx = pe.x - com.x, dy = pe.y - com.y;
       if (dx * dx + dy * dy > r2) continue;
-      visiblePellets.push({
+      if (p.seenPellets.has(pe.id)) continue;
+      addPellets.push({
         id: pe.id,
         x: Math.round(pe.x),
         y: Math.round(pe.y),
-        color: pe.color,
+        c: pe.color,
       });
+      p.seenPellets.add(pe.id);
     }
-    visibleViruses = [];
-    for (const v of viruses) {
-      const dx = v.x - vx, dy = v.y - vy;
-      if (dx * dx + dy * dy > r2 * 1.2) continue;
-      visibleViruses.push({
+  }
+  const rmPellets: string[] = [];
+  for (const id of p.seenPellets) {
+    if (!pellets.has(id)) { rmPellets.push(id); p.seenPellets.delete(id); }
+  }
+
+  // ── viruses (slow-tick add, every-tick update for moving ones, removals) ──
+  const addViruses: unknown[] = [];
+  const updViruses: unknown[] = [];
+  const currentViruses = new Set<string>();
+  for (const v of viruses.values()) {
+    const dx = v.x - com.x, dy = v.y - com.y;
+    if (dx * dx + dy * dy > r2 * 1.3) continue;
+    currentViruses.add(v.id);
+    if (!p.seenViruses.has(v.id)) {
+      addViruses.push({
         id: v.id,
-        x: Math.round(v.x),
-        y: Math.round(v.y),
-        mass: v.mass,
-        radius: Math.round(radius(v.mass)),
-        color: v.color,
+        x: Math.round(v.x * 10) / 10,
+        y: Math.round(v.y * 10) / 10,
+        m: Math.round(v.mass),
+      });
+      p.seenViruses.add(v.id);
+    } else if (Math.hypot(v.vx, v.vy) > 1 || sendSlow) {
+      updViruses.push({
+        id: v.id,
+        x: Math.round(v.x * 10) / 10,
+        y: Math.round(v.y * 10) / 10,
+        m: Math.round(v.mass),
       });
     }
   }
-
-  const visibleEjected: SnapshotEntity[] = [];
-  for (const e of ejected) {
-    const dx = e.x - vx, dy = e.y - vy;
-    if (dx * dx + dy * dy > r2) continue;
-    visibleEjected.push({
-      id: e.id,
-      x: Math.round(e.x),
-      y: Math.round(e.y),
-      mass: e.mass,
-      radius: Math.round(radius(e.mass)),
-      color: e.color,
-    });
+  const rmViruses: string[] = [];
+  for (const id of p.seenViruses) {
+    if (!currentViruses.has(id)) { rmViruses.push(id); p.seenViruses.delete(id); }
   }
 
-  let selfMass = 0;
-  if (!p.dead) for (const c of p.cells) selfMass += c.mass;
+  // ── ejected (every tick — fast moving) ──
+  const addEjected: unknown[] = [];
+  const updEjected: unknown[] = [];
+  const currentEjected = new Set<string>();
+  for (const e of ejected.values()) {
+    const dx = e.x - com.x, dy = e.y - com.y;
+    if (dx * dx + dy * dy > r2 * 1.3) continue;
+    currentEjected.add(e.id);
+    if (!p.seenEjected.has(e.id)) {
+      addEjected.push({
+        id: e.id,
+        x: Math.round(e.x * 10) / 10,
+        y: Math.round(e.y * 10) / 10,
+        c: e.color,
+      });
+      p.seenEjected.add(e.id);
+    } else {
+      updEjected.push({
+        id: e.id,
+        x: Math.round(e.x * 10) / 10,
+        y: Math.round(e.y * 10) / 10,
+      });
+    }
+  }
+  const rmEjected: string[] = [];
+  for (const id of p.seenEjected) {
+    if (!currentEjected.has(id)) { rmEjected.push(id); p.seenEjected.delete(id); }
+  }
 
-  const payload: Record<string, unknown> = {
+  return {
     type: "state",
-    serverTime: Date.now(),
+    t: serverTick,
+    now,
+    ack: p.lastInputSeq,
     self: {
       id: p.id,
       dead: p.dead,
-      mass: Math.round(selfMass),
-      x: Math.round(vx),
-      y: Math.round(vy),
+      cm: { x: Math.round(com.x * 10) / 10, y: Math.round(com.y * 10) / 10 },
+      mass: Math.round(totalMass(p)),
     },
-    players: cells,
-    ejected: visibleEjected,
-    leaderboard,
-    online: [...players.values()].filter((q) => !q.isBot).length,
+    addCells, updCells, rmCells,
+    addPellets, rmPellets,
+    addViruses, updViruses, rmViruses,
+    addEjected, updEjected, rmEjected,
+    leaderboard: lb,
+    online: [...players.values()].filter(q => !q.isBot).length,
   };
-  // Pellets / viruses are only attached on slow ticks. Clients keep the last
-  // known list between updates.
-  if (visiblePellets) payload.pellets = visiblePellets;
-  if (visibleViruses) payload.viruses = visibleViruses;
-  try {
-    p.socket.send(JSON.stringify(payload));
-  } catch {
-    /* swallow — disconnects are handled by ws.on('close') */
-  }
 }
 
-// ────────────────────────────────────────────────────────── main loop
-let last = Date.now();
-let tickCount = 0;
+function sendSnapshotTo(p: Player, lb: LBEntry[], sendSlow: boolean): void {
+  if (p.isBot || !p.socket || p.socket.readyState !== WebSocket.OPEN) return;
+  try {
+    p.socket.send(JSON.stringify(buildSnapshot(p, lb, sendSlow)));
+  } catch { /* ignore */ }
+}
+
+// ─────────────────────────────────────────────────────── main loop
 setInterval(() => {
   const now = Date.now();
-  const dt = clamp((now - last) / 1000, 0, 0.1);
-  last = now;
-  tickCount++;
+  let dt = (now - lastNowMs) / 1000;
+  if (dt < 0) dt = 0;
+  if (dt > 0.1) dt = 0.1;
+  lastNowMs = now;
+  serverTick++;
 
-  // Bot decisions
+  // bot decisions
   for (const p of players.values()) {
-    if (p.isBot && !p.dead) botDecide(p, now);
+    if (!p.isBot || p.dead) continue;
+    botDecide(p, now);
+    botDecideSplit(p, now);
+    botDecideEject(p, now);
   }
 
-  // Per-player movement
+  // physics: input force, cohesion, separation, attack spread, integrate
   for (const p of players.values()) {
     if (p.dead) continue;
-    applyMovement(p, dt);
+    updateLastDir(p);
+    applyInputForce(p, dt);
+    applyCohesion(p, dt);
+    applySeparation(p, dt);
+    applyAttackSpread(p, dt);
+    integrateCells(p, dt);
   }
 
-  // Eat pellets
-  for (const p of players.values()) {
-    if (p.dead) continue;
-    tryEatPellets(p);
-  }
+  updateViruses(dt);
+  updateEjected(dt);
 
+  resolveEatPellets();
+  resolveEatEjected();
+  resolveEjectedFeedsVirus();
   resolveCellVsCell();
   resolveCellVsVirus();
-  mergeOwnCells();
-  updateEjected(dt);
-  tryEatEjected();
+
+  for (const p of players.values()) processMerges(p);
+
   refillWorld();
 
-  // Highest mass tracking
+  // highest mass
   for (const p of players.values()) {
     if (p.dead) continue;
-    let m = 0;
-    for (const c of p.cells) m += c.mass;
+    const m = totalMass(p);
     if (m > p.highestMass) p.highestMass = m;
   }
 
   const lb = buildLeaderboard();
-  // Fast snapshots = every tick (cells + ejected). Slow snapshots = every
-  // SLOW_SNAPSHOT_EVERY_N_TICKS ticks (pellets + viruses).
-  const sendSlow = tickCount % SLOW_SNAPSHOT_EVERY_N_TICKS === 0;
-  if (tickCount % SNAPSHOT_EVERY_N_TICKS === 0) {
-    for (const p of players.values()) {
-      if (!p.isBot) sendSnapshotTo(p, lb, sendSlow);
-    }
+  const sendSlow = serverTick % SLOW_TICK_EVERY === 0;
+  for (const p of players.values()) {
+    if (!p.isBot) sendSnapshotTo(p, lb, sendSlow);
   }
 
-  // Stale human cleanup (>15 s without messages)
+  // stale humans
   for (const [id, p] of players) {
     if (p.isBot) continue;
-    if (now - p.lastSeenAt > 15000) {
+    if (now - p.lastSeenAt > STALE_PLAYER_MS) {
       try { p.socket?.close(); } catch { /* ignore */ }
       players.delete(id);
     }
   }
 }, TICK_MS);
 
-// ────────────────────────────────────────────────────────── ws server
+// ─────────────────────────────────────────────────────── ws server
 const http = createServer((_, res) => {
   res.writeHead(200, { "content-type": "text/plain" });
-  res.end("Yazario Online Classic server");
+  res.end("Yazario Online Classic V2");
 });
 const wss = new WebSocketServer({ server: http });
 
@@ -960,91 +1282,100 @@ wss.on("connection", (ws) => {
   };
 
   ws.on("message", (raw) => {
-    let msg: any;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    let msg: { type?: string; [k: string]: unknown };
+    try { msg = JSON.parse(raw.toString()); }
+    catch { return; }
     const type = msg?.type;
+
     if (type === "join") {
-      if (player) return; // already joined
-      const name =
-        typeof msg.name === "string" && msg.name.trim().length > 0
-          ? msg.name.toString().slice(0, 18).trim()
-          : "Player";
-      const skinId =
-        typeof msg.skin === "string" && msg.skin.length > 0
-          ? msg.skin.toString().slice(0, 128)
-          : "";
-      const id = newId("human");
+      if (player) return;
+      const rawName = typeof msg.name === "string" ? msg.name : "";
+      const name = rawName.trim().slice(0, 18) || "Player";
+      const skinId = typeof msg.skin === "string" ? msg.skin.slice(0, 128) : "";
+      const id = newId("h");
       player = {
         id,
         socket: ws,
         isBot: false,
         name,
-        color: pickColor(),
+        color: pickPaletteColor(),
         skinId,
         cells: [],
-        input: { dx: 0, dy: 0 },
+        input: { dx: 0, dy: 0, attack: false, lastDir: { x: 1, y: 0 }, seq: 0 },
         dead: false,
-        deadUntil: 0,
-        lastSplitAt: 0,
-        lastEjectAt: 0,
-        spawnTime: Date.now(),
-        highestMass: START_MASS,
+        deadAt: 0,
+        lastInputSeq: 0,
         lastSeenAt: Date.now(),
-        nextDecideAt: 0,
+        spawnAt: Date.now(),
+        highestMass: 76,
+        aiDir: { x: 0, y: 0 },
+        aiNextDecide: 0,
+        aiNextSplit: 0,
+        aiNextEject: 0,
+        seenCells: new Set(),
+        seenPellets: new Set(),
+        seenViruses: new Set(),
+        seenEjected: new Set(),
       };
       spawnCellForPlayer(player);
       players.set(id, player);
       safeSend({
-        type: "connected",
+        type: "welcome",
         id,
-        mapWidth: MAP_W,
-        mapHeight: MAP_H,
+        worldSize: WORLD_SIZE,
         tickRate: TICK_RATE,
+        tickMs: TICK_MS,
         name: player.name,
       });
-    } else if (type === "input") {
-      if (!player) return;
-      const dx = Number(msg.dx);
-      const dy = Number(msg.dy);
+      return;
+    }
+
+    if (!player) return;
+    player.lastSeenAt = Date.now();
+
+    if (type === "input") {
+      const dx = Number(msg.dx), dy = Number(msg.dy);
+      const seq = Number(msg.seq);
+      const attack = !!msg.attack;
       if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
       player.input.dx = clamp(dx, -1, 1);
       player.input.dy = clamp(dy, -1, 1);
-      player.lastSeenAt = Date.now();
+      player.input.attack = attack;
+      if (Number.isFinite(seq) && seq > player.lastInputSeq) {
+        player.lastInputSeq = seq;
+      }
     } else if (type === "split") {
-      if (!player) return;
-      console.log("[action] split", player.id, player.cells.length, player.cells[0]?.mass);
-      tryDoSplit(player);
-      player.lastSeenAt = Date.now();
+      const seq = Number(msg.seq);
+      if (Number.isFinite(seq) && seq > player.lastInputSeq) {
+        player.lastInputSeq = seq;
+      }
+      let dx = player.input.dx, dy = player.input.dy;
+      const m = Math.hypot(dx, dy);
+      if (m < 0.05) { dx = player.input.lastDir.x; dy = player.input.lastDir.y; }
+      tryDoSplit(player, dx, dy);
     } else if (type === "eject") {
-      if (!player) return;
-      console.log("[action] eject", player.id, player.cells.length, player.cells[0]?.mass);
-      tryDoEject(player);
-      player.lastSeenAt = Date.now();
+      const seq = Number(msg.seq);
+      if (Number.isFinite(seq) && seq > player.lastInputSeq) {
+        player.lastInputSeq = seq;
+      }
+      let dx = player.input.dx, dy = player.input.dy;
+      const m = Math.hypot(dx, dy);
+      if (m < 0.05) { dx = player.input.lastDir.x; dy = player.input.lastDir.y; }
+      tryDoEject(player, dx, dy);
     } else if (type === "respawn") {
-      if (!player) return;
       if (player.dead) spawnCellForPlayer(player);
-      player.lastSeenAt = Date.now();
     } else if (type === "ping") {
       const t = Number(msg.t);
-      safeSend({ type: "pong", t: Number.isFinite(t) ? t : 0 });
-      if (player) player.lastSeenAt = Date.now();
+      safeSend({ type: "pong", t: Number.isFinite(t) ? t : 0, now: Date.now() });
     }
   });
 
   ws.on("close", () => {
-    if (player) {
-      players.delete(player.id);
-      player = null;
-    }
+    if (player) { players.delete(player.id); player = null; }
   });
-
   ws.on("error", () => { /* ignore */ });
 });
 
 http.listen(PORT, () => {
-  console.log(`[yazario] Online Classic server listening on :${PORT}`);
+  console.log(`[yazario-v2] Online Classic V2 server listening on :${PORT}`);
 });

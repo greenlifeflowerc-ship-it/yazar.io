@@ -19,7 +19,7 @@ import '../widgets/shop_button.dart';
 import '../widgets/game_modes_dropdown.dart';
 import 'capsule_screen.dart';
 import 'game_screen.dart';
-import 'online_classic_screen.dart';
+import '../online_v2/online_classic_v2_screen.dart';
 import 'profile_screen.dart';
 import 'settings_screen.dart';
 import 'skin_chooser_screen.dart';
@@ -132,7 +132,7 @@ class _MainMenuScreenState extends State<MainMenuScreen> {
       Navigator.push(
         context,
         MaterialPageRoute(
-          builder: (_) => OnlineClassicScreen(
+          builder: (_) => OnlineClassicV2Screen(
             nickname: _nicknameController.text,
           ),
         ),
