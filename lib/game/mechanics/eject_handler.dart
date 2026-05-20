@@ -130,7 +130,14 @@ class EjectHandler {
   }
 
   /// Per-frame motion + friction decay + magnet effect.
-  void update(double dt, {Iterable<Offset>? extraAttractors}) {
+  ///
+  /// [enableMagnet] gates the magnet computation. Offline classic leaves this
+  /// at the default `true` so feed snaps to nearby cells (Agar.io mobile
+  /// behaviour). Online V2 passes `false` because the authoritative server
+  /// does NOT magnet — running magnet here would produce client-only motion
+  /// the server can't reproduce, causing visible rubber-banding when the next
+  /// state snapshot arrives.
+  void update(double dt, {Iterable<Offset>? extraAttractors, bool enableMagnet = true}) {
     final s = GameSettings.instance;
     // Decouple speed and distance:
     // Distance = v0 / (1 - friction).
@@ -147,35 +154,37 @@ class EjectHandler {
     for (final e in engine.ejectedMasses) {
       if (e.velocity == Offset.zero) continue;
 
-      // --- Subtle Magnet Effect for Ejected Feed ---
-      Offset magnetForce = Offset.zero;
-      
-      // Attract toward known player cells in the engine.
-      for (final p in engine.players) {
-        if (p.isDead) continue;
-        for (final c in p.cells) {
-          final delta = c.position - e.position;
-          final d = delta.distance;
-          if (d < 150 && d > 10) {
-            final strength = (1.0 - d / 150) * 800.0;
-            magnetForce += (delta / d) * strength;
-          }
-        }
-      }
-      
-      // Attract toward extra attractors (e.g. remote players in online mode).
-      if (extraAttractors != null) {
-        for (final pos in extraAttractors) {
-          final delta = pos - e.position;
-          final d = delta.distance;
-          if (d < 150 && d > 10) {
-            final strength = (1.0 - d / 150) * 800.0;
-            magnetForce += (delta / d) * strength;
-          }
-        }
-      }
+      // --- Subtle Magnet Effect for Ejected Feed (offline only) ---
+      if (enableMagnet) {
+        Offset magnetForce = Offset.zero;
 
-      e.velocity += magnetForce * dt;
+        // Attract toward known player cells in the engine.
+        for (final p in engine.players) {
+          if (p.isDead) continue;
+          for (final c in p.cells) {
+            final delta = c.position - e.position;
+            final d = delta.distance;
+            if (d < 150 && d > 10) {
+              final strength = (1.0 - d / 150) * 800.0;
+              magnetForce += (delta / d) * strength;
+            }
+          }
+        }
+
+        // Attract toward extra attractors (e.g. remote players in online mode).
+        if (extraAttractors != null) {
+          for (final pos in extraAttractors) {
+            final delta = pos - e.position;
+            final d = delta.distance;
+            if (d < 150 && d > 10) {
+              final strength = (1.0 - d / 150) * 800.0;
+              magnetForce += (delta / d) * strength;
+            }
+          }
+        }
+
+        e.velocity += magnetForce * dt;
+      }
 
       e.position += e.velocity * dt;
       e.velocity = e.velocity * fric;

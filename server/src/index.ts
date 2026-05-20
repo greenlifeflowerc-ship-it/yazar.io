@@ -534,11 +534,32 @@ function applyInputForce(p: Player, dt: number): void {
   }
   const mag = Math.hypot(dx, dy);
   if (mag < 0.05) return;
+<<<<<<< HEAD
   const ux = dx / mag, uy = dy / mag;
   const f = INPUT_MOVE_STRENGTH * dt;
   for (const c of p.cells) {
     c.vx += ux * f;
     c.vy += uy * f;
+=======
+  // Convergent movement: all cells aim for a target point X (Agar.io mobile).
+  // Simple impulse — let damping + per-radius speed clamp in integrateCells
+  // shape the feel. The previous version multiplied accel by maxSpeed and an
+  // "agility" pow() per cell which made cells burst then snap-clamp every
+  // tick (visible jitter) AND added 3 expensive pow() calls per cell-tick.
+  const intensity = mag > 1 ? 1 : mag;
+  const com = centerOfMass(p);
+  const tx = com.x + (dx / mag) * 800;
+  const ty = com.y + (dy / mag) * 800;
+
+  const f = intensity * INPUT_MOVE_STRENGTH * dt;
+  for (const c of p.cells) {
+    const tdx = tx - c.x, tdy = ty - c.y;
+    const d = Math.hypot(tdx, tdy);
+    if (d > 0.1) {
+      c.vx += (tdx / d) * f;
+      c.vy += (tdy / d) * f;
+    }
+>>>>>>> a59fcc0 (full change)
   }
 }
 
@@ -579,6 +600,13 @@ function applySeparation(p: Player, dt: number): void {
       const overlap = minDist - d;
       const nx = dx / d, ny = dy / d;
       const totMass = a.mass + b.mass;
+<<<<<<< HEAD
+=======
+
+      // Velocity-based push (smooth ramp-up). The previous version added a
+      // hard position correction here too which caused visible snapping when
+      // many cells overlapped after a multi-split.
+>>>>>>> a59fcc0 (full change)
       const fx = nx * overlap * SEPARATION_STRENGTH;
       const fy = ny * overlap * SEPARATION_STRENGTH;
       a.vx += fx * (b.mass / totMass) * dt;
@@ -649,6 +677,13 @@ function integrateCells(p: Player, dt: number): void {
       const nm = c.mass * Math.pow(1 - MASS_DECAY_RATE, dt);
       c.mass = nm < DECAY_THRESHOLD ? DECAY_THRESHOLD : nm;
     }
+<<<<<<< HEAD
+=======
+    // NOTE: wall-sticking velocity zero-out removed — it caused cells to
+    // freeze flush against the wall instead of sliding along it (which made
+    // multi-cell parties get stuck whenever any cell touched the boundary).
+    // Plain clamp lets the cell slide naturally.
+>>>>>>> a59fcc0 (full change)
     const inset = r * 0.75;
     c.x = clamp(c.x, inset, WORLD_SIZE - inset);
     c.y = clamp(c.y, inset, WORLD_SIZE - inset);
@@ -723,6 +758,14 @@ function tryDoEject(p: Player, dirX: number, dirY: number): void {
       color: c.color,
       spawnedAt: Date.now(),
     });
+<<<<<<< HEAD
+=======
+
+    // NOTE: ejection recoil on the cell was removed — it caused cells to
+    // drift sideways unexpectedly during rapid feeding (the per-burst recoil
+    // accumulated faster than damping could absorb it), and the client's
+    // local prediction did not mirror it, producing visible rubber-banding.
+>>>>>>> a59fcc0 (full change)
   }
 }
 
@@ -732,6 +775,14 @@ function updateEjected(dt: number): void {
   const er = radius(EJECT_MASS);
   for (const e of ejected.values()) {
     if (e.vx === 0 && e.vy === 0) continue;
+<<<<<<< HEAD
+=======
+
+    // NOTE: subtle magnet was removed — O(E×P×C) cost per tick and caused
+    // ejected mass to drift erratically toward cells (visible jitter).
+    // Feed is consumed by resolveEatEjected() on contact.
+
+>>>>>>> a59fcc0 (full change)
     e.x += e.vx * dt;
     e.y += e.vy * dt;
     e.vx *= fric;
@@ -813,6 +864,13 @@ function resolveEatEjected(): void {
       for (const [id, e] of ejected) {
         if (e.ownerId === c.ownerId && now - e.spawnedAt < EJECT_OWNER_IMMUNITY_MS) continue;
         const er = radius(EJECT_MASS);
+<<<<<<< HEAD
+=======
+        // eatR matches Offline Classic: cell eats the pellet when its centre
+        // overlaps with 60% of the cell radius. The previous `r + er` made
+        // cells appear to "vacuum" feed from a distance (and clients without
+        // the same rule predicted differently → rubber-banding).
+>>>>>>> a59fcc0 (full change)
         const eatR = r - er * 0.4;
         const dx = e.x - c.x, dy = e.y - c.y;
         if (dx * dx + dy * dy < eatR * eatR) {
@@ -1236,6 +1294,13 @@ setInterval(() => {
     integrateCells(p, dt);
   }
 
+<<<<<<< HEAD
+=======
+  // NOTE: pellet magnet removed — it was O(P×C) per tick (8000 pellets ×
+  // ~1100 cells = 8.8M operations/tick) and destroyed server FPS.
+  // Pellets are picked up via resolveEatPellets() on contact.
+
+>>>>>>> a59fcc0 (full change)
   updateViruses(dt);
   updateEjected(dt);
 

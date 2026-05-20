@@ -147,69 +147,53 @@ class V2LocalSim {
       attackMode: attackMode,
       aimDir: lastNonZeroDir,
     );
-    _applyMagnetEffects(dt, world);
     _integrate(player, dt);
-    
-    final remotePositions = world?.cells.values
-        .where((c) => !c.isSelf)
-        .map((c) => Offset(c.renderX, c.renderY));
-    _eject.update(dt, extraAttractors: remotePositions);
+
+    // Online: server does NOT magnet ejected mass — pass enableMagnet:false
+    // so local prediction matches the authoritative trajectory exactly.
+    // Without this, feed visibly snaps back when each state snapshot arrives.
+    _eject.update(dt, enableMagnet: false);
 
     _merge.processMerges(player);
     _split.enforceAutoSplit(player);
   }
 
-  void _applyMagnetEffects(double dt, V2World? world) {
-    if (world == null) return;
-    for (final c in player.cells) {
-      // 1. Pellet Magnet (Client Prediction)
-      for (final pe in world.pellets.values) {
-        final dx = pe.x - c.position.dx;
-        final dy = pe.y - c.position.dy;
-        final d2 = dx * dx + dy * dy;
-        if (d2 < 100 * 100 && d2 > 1) {
-          final d = math.sqrt(d2);
-          final strength = (1.0 - d / 100) * 150.0;
-          c.velocity += Offset(dx / d, dy / d) * strength * dt;
-        }
-      }
-    }
-  }
+  // NOTE: pellet magnet client prediction removed — the server does not pull
+  // cells toward pellets, so predicting it locally caused the player's cell to
+  // visibly drift between snapshots (rubber-banding into pellets, then back
+  // out when the server's authoritative position arrived). Pellet pickup is
+  // already instantaneous on contact via resolveEatPellets() server-side.
 
   // ────────────────────────── ported from GameEngine ──────────────────────
   // We can't call the engine's private `_applyInputForce` / `_integrateCells`
   // directly, so the formulas are reproduced verbatim here. Any tuning of
   // GameConstants in `lib/game/game_engine.dart` flows through automatically.
 
+  /// Mirrors the server's [applyInputForce] EXACTLY. The previous version
+  /// used `maxSpeed * dampingPerSecond * agility` as acceleration, which:
+  ///   1. Required two pow() calls per cell per tick (server didn't pay this
+  ///      cost, so client was strictly slower).
+  ///   2. Drove velocity to ≈400 units which the per-radius speed clamp in
+  ///      [_integrate] then chopped to ≈260 — every tick — producing
+  ///      micro-jitter on small cells.
+  ///   3. Used targetDist=1000 vs server's 800 → cells aimed at slightly
+  ///      different points than the server thought → constant correction.
   void _applyInputForce(Player p, Offset rawDir, double dt) {
     final mag = rawDir.distance;
     if (mag < 0.05) return;
     final intensity = mag > 1.0 ? 1.0 : mag;
 
     final com = p.centerOfMass;
-    
-    double maxR = 0;
-    for (final c in p.cells) {
-      if (c.radius > maxR) maxR = c.radius;
-    }
-    
-    const targetDist = 1000.0;
+    const targetDist = 800.0; // matches server
     final targetPoint = com + (rawDir / mag) * targetDist;
 
+    final f = intensity * GameConstants.inputMoveStrength * dt;
     for (final c in p.cells) {
       final toTarget = targetPoint - c.position;
       final dist = toTarget.distance;
       if (dist < 0.1) continue;
-      
       final dir = toTarget / dist;
-      final maxSpeed = GameConstants.maxSpeedForRadius(c.radius);
-      // Agility: smaller cells feel lighter and accelerate faster.
-      // Large cells feel heavier with lower relative acceleration.
-      final agility = math.pow(150.0 / (c.mass + 50.0), 0.15).clamp(0.7, 1.5).toDouble();
-      
-      final acceleration = maxSpeed * GameConstants.dampingPerSecond * agility;
-      
-      c.velocity += dir * acceleration * intensity * dt;
+      c.velocity += dir * f;
     }
   }
 
