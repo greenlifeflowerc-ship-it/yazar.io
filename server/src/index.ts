@@ -85,8 +85,8 @@ const LANE_FORWARD_DEPTH_FACTOR = 2.8;
 // Per-radius speed clamp.
 const REFERENCE_RADIUS = 35.0;
 const MAX_SMALL_CELL_SPEED = 360.0;
-const MAX_LARGE_CELL_SPEED = 115.0;
-const SPEED_RADIUS_POWER = 0.38;
+const MAX_LARGE_CELL_SPEED = 95.0;
+const SPEED_RADIUS_POWER = 0.42;
 const SPEED_SCALE_BASE = 260.0;
 
 // Merge.
@@ -200,13 +200,6 @@ interface Player {
   lastSeenAt: number;
   spawnAt: number;
   highestMass: number;
-  /// Mass boost multiplier the client sent at join. Applied to starting mass
-  /// on every spawn (mirrors the offline GameEngine behaviour).
-  massMult: number;
-  /// Number of enemy cells this player has eaten in the current life. Reset
-  /// on spawn. Reported to the client in each `state.self` payload so the
-  /// client can submit accurate kill counts at end-of-match.
-  eatenCount: number;
   // bot scratch
   aiDir: { x: number; y: number };
   aiNextDecide: number;
@@ -304,10 +297,7 @@ function spawnVirus(): Virus {
 
 function spawnCellForPlayer(p: Player): void {
   const pos = safeSpawnPos();
-  // Apply the human player's mass-boost multiplier (sent at join). Bots
-  // always spawn at 100 — the boost is only for the joined human.
-  const mult = p.isBot ? 1.0 : clamp(p.massMult, 0.5, 10.0);
-  const startMass = p.isBot ? 100 : Math.round(76 * mult);
+  const startMass = p.isBot ? 100 : 76;
   p.cells = [{
     id: newId("c"),
     ownerId: p.id,
@@ -326,7 +316,6 @@ function spawnCellForPlayer(p: Player): void {
   p.deadAt = 0;
   p.spawnAt = Date.now();
   p.highestMass = startMass;
-  p.eatenCount = 0;
   p.input.dx = 0;
   p.input.dy = 0;
   p.input.attack = false;
@@ -349,8 +338,6 @@ function makeBot(): Player {
     lastSeenAt: Date.now(),
     spawnAt: Date.now(),
     highestMass: 100,
-    massMult: 1.0,
-    eatenCount: 0,
     aiDir: { x: 0, y: 0 },
     aiNextDecide: 0,
     aiNextSplit: 0,
@@ -547,35 +534,11 @@ function applyInputForce(p: Player, dt: number): void {
   }
   const mag = Math.hypot(dx, dy);
   if (mag < 0.05) return;
-  const intensity = mag > 1 ? 1 : mag;
-
-  const com = centerOfMass(p);
-
-  let maxR = 0;
+  const ux = dx / mag, uy = dy / mag;
+  const f = INPUT_MOVE_STRENGTH * dt;
   for (const c of p.cells) {
-    const r = radius(c.mass);
-    if (r > maxR) maxR = r;
-  }
-
-  const targetDist = 1000;
-  const tx = com.x + (dx / mag) * targetDist;
-  const ty = com.y + (dy / mag) * targetDist;
-
-  for (const c of p.cells) {
-    const tdx = tx - c.x, tdy = ty - c.y;
-    const d = Math.hypot(tdx, tdy);
-    if (d > 0.1) {
-      const r = radius(c.mass);
-      const maxSpeed = maxSpeedForRadius(r);
-      // Agility scaling: small = light/fast acceleration, large = heavy/slow.
-      const agility = Math.pow(150 / (c.mass + 50), 0.15);
-      const finalAgility = Math.max(0.7, Math.min(1.5, agility));
-
-      const accel = maxSpeed * DAMPING_PER_SECOND * finalAgility;
-
-      c.vx += (tdx / d) * accel * intensity * dt;
-      c.vy += (tdy / d) * accel * intensity * dt;
-    }
+    c.vx += ux * f;
+    c.vy += uy * f;
   }
 }
 
@@ -608,33 +571,20 @@ function applySeparation(p: Player, dt: number): void {
       const b = cs[j];
       if (now >= a.mergeReadyAt && now >= b.mergeReadyAt) continue;
       const dx = a.x - b.x, dy = a.y - b.y;
-      let d = Math.hypot(dx, dy);
+      const d = Math.hypot(dx, dy);
       const ar = radius(a.mass), br = radius(b.mass);
       const minDist = ar + br + MIN_GAP;
       if (d >= minDist) continue;
-      if (d === 0) { a.x += 0.5; d = 0.5; }
+      if (d === 0) { a.x += 0.5; continue; }
       const overlap = minDist - d;
       const nx = dx / d, ny = dy / d;
       const totMass = a.mass + b.mass;
-
-      // Velocity-based push (smooth ramp-up).
       const fx = nx * overlap * SEPARATION_STRENGTH;
       const fy = ny * overlap * SEPARATION_STRENGTH;
       a.vx += fx * (b.mass / totMass) * dt;
       a.vy += fy * (b.mass / totMass) * dt;
       b.vx -= fx * (a.mass / totMass) * dt;
       b.vy -= fy * (a.mass / totMass) * dt;
-
-      // Hard position correction: cells that can't merge yet MUST NOT
-      // overlap. Without this, a fast-moving cell punches through its
-      // sibling because velocity-only separation can't outrun the impulse
-      // in a single tick. Mass-weighted so big cells move less.
-      const aPush = overlap * (b.mass / totMass);
-      const bPush = overlap * (a.mass / totMass);
-      a.x += nx * aPush;
-      a.y += ny * aPush;
-      b.x -= nx * bPush;
-      b.y -= ny * bPush;
     }
   }
 }
@@ -699,17 +649,7 @@ function integrateCells(p: Player, dt: number): void {
       const nm = c.mass * Math.pow(1 - MASS_DECAY_RATE, dt);
       c.mass = nm < DECAY_THRESHOLD ? DECAY_THRESHOLD : nm;
     }
-
-    // Wall Sticking Physics — cancel velocity pushing into the wall so the
-    // cell doesn't grind against it forever.
     const inset = r * 0.75;
-    if ((c.x <= inset && c.vx < 0) || (c.x >= WORLD_SIZE - inset && c.vx > 0)) {
-      c.vx = 0;
-    }
-    if ((c.y <= inset && c.vy < 0) || (c.y >= WORLD_SIZE - inset && c.vy > 0)) {
-      c.vy = 0;
-    }
-
     c.x = clamp(c.x, inset, WORLD_SIZE - inset);
     c.y = clamp(c.y, inset, WORLD_SIZE - inset);
   }
@@ -783,20 +723,6 @@ function tryDoEject(p: Player, dirX: number, dirY: number): void {
       color: c.color,
       spawnedAt: Date.now(),
     });
-
-    // --- Recoil Sticking Physics ---
-    // If cell is at boundary and feeding TOWARDS it, cancel recoil that pushes
-    // away. Reuses `cr` computed above (cell radius post-mass-deduction).
-    const recoilScale = 0.35;
-    let rvx = fx * (EJECT_MASS / c.mass) * EJECT_VELOCITY_INITIAL * recoilScale;
-    let rvy = fy * (EJECT_MASS / c.mass) * EJECT_VELOCITY_INITIAL * recoilScale;
-
-    const recoilInset = cr * 0.85;
-    if ((c.x <= recoilInset && fx < -0.2) || (c.x >= WORLD_SIZE - recoilInset && fx > 0.2)) rvx = 0;
-    if ((c.y <= recoilInset && fy < -0.2) || (c.y >= WORLD_SIZE - recoilInset && fy > 0.2)) rvy = 0;
-
-    c.vx -= rvx;
-    c.vy -= rvy;
   }
 }
 
@@ -806,21 +732,6 @@ function updateEjected(dt: number): void {
   const er = radius(EJECT_MASS);
   for (const e of ejected.values()) {
     if (e.vx === 0 && e.vy === 0) continue;
-
-    // --- Subtle Magnet Effect for Ejected Feed ---
-    for (const p of players.values()) {
-      if (p.dead) continue;
-      for (const c of p.cells) {
-        const dx = c.x - e.x, dy = c.y - e.y;
-        const d = Math.hypot(dx, dy);
-        if (d < 150 && d > 10) {
-          const strength = (1.0 - d / 150) * 800.0;
-          e.vx += (dx / d) * strength * dt;
-          e.vy += (dy / d) * strength * dt;
-        }
-      }
-    }
-
     e.x += e.vx * dt;
     e.y += e.vy * dt;
     e.vx *= fric;
@@ -850,14 +761,10 @@ function tryDoSplit(p: Player, dirX: number, dirY: number): void {
     const cd = mergeCooldownMsForRadius(sR);
     source.mergeReadyAt = now + cd;
     source.freshSplit = true;
-    // Big cells should reach far when double/triple splitting. Exponent
-    // 0.5 + cap 5.0 ≈ Agar.io mobile feel: at radius 35 (start mass 76) →
-    // scale 1.0, at radius 268 (max mass) → scale ~2.77, at radius 500 →
-    // capped at 5.0.
     const radiusScale = clamp(
-      Math.pow(sR / REFERENCE_RADIUS, 0.5),
+      Math.pow(sR / REFERENCE_RADIUS, 0.35),
       1.0,
-      5.0,
+      2.5,
     );
     const id = newId("c");
     p.cells.push({
@@ -874,25 +781,6 @@ function tryDoSplit(p: Player, dirX: number, dirY: number): void {
       freshSplit: true,
       mergeReadyAt: now + cd,
     });
-  }
-}
-
-function applyPelletMagnet(dt: number): void {
-  for (const p of players.values()) {
-    if (p.dead) continue;
-    for (const c of p.cells) {
-      // Very subtle pull toward nearby pellets.
-      for (const pe of pellets.values()) {
-        const dx = pe.x - c.x, dy = pe.y - c.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < 100 * 100 && d2 > 1) {
-          const d = Math.sqrt(d2);
-          const strength = (1.0 - d / 100) * 150.0;
-          c.vx += (dx / d) * strength * dt;
-          c.vy += (dy / d) * strength * dt;
-        }
-      }
-    }
   }
 }
 
@@ -925,7 +813,7 @@ function resolveEatEjected(): void {
       for (const [id, e] of ejected) {
         if (e.ownerId === c.ownerId && now - e.spawnedAt < EJECT_OWNER_IMMUNITY_MS) continue;
         const er = radius(EJECT_MASS);
-        const eatR = r + er; // Eat as soon as it touches the edge
+        const eatR = r - er * 0.4;
         const dx = e.x - c.x, dy = e.y - c.y;
         if (dx * dx + dy * dy < eatR * eatR) {
           if (c.mass < MAX_CELL_MASS) c.mass += EJECT_CONSUMED_MASS;
@@ -994,10 +882,6 @@ function resolveCellVsCell(): void {
       if (dx * dx + dy * dy < eatR * eatR) {
         if (a.mass < MAX_CELL_MASS) a.mass = Math.min(MAX_CELL_MASS, a.mass + b.mass);
         dead.add(b);
-        // Track the kill on the eater's owning player so the client can
-        // submit accurate kill counts at end-of-match.
-        const eater = players.get(a.ownerId);
-        if (eater) eater.eatenCount++;
       }
     }
   }
@@ -1307,8 +1191,6 @@ function buildSnapshot(p: Player, lb: LBEntry[], sendSlow: boolean): unknown {
       dead: p.dead,
       cm: { x: Math.round(com.x * 10) / 10, y: Math.round(com.y * 10) / 10 },
       mass: Math.round(totalMass(p)),
-      kills: p.eatenCount,
-      highestMass: Math.round(p.highestMass),
     },
     addCells, updCells, rmCells,
     addPellets, rmPellets,
@@ -1353,10 +1235,6 @@ setInterval(() => {
     applyAttackSpread(p, dt);
     integrateCells(p, dt);
   }
-
-  // Pellet magnet iterates all players internally — call once per tick, not
-  // per player (otherwise the pull is applied N² times and scales O(N²)).
-  applyPelletMagnet(dt);
 
   updateViruses(dt);
   updateEjected(dt);
@@ -1420,8 +1298,6 @@ wss.on("connection", (ws) => {
       const rawName = typeof msg.name === "string" ? msg.name : "";
       const name = rawName.trim().slice(0, 18) || "Player";
       const skinId = typeof msg.skin === "string" ? msg.skin.slice(0, 128) : "";
-      const rawMult = Number(msg.massMult);
-      const massMult = Number.isFinite(rawMult) ? clamp(rawMult, 0.5, 10.0) : 1.0;
       const id = newId("h");
       player = {
         id,
@@ -1438,8 +1314,6 @@ wss.on("connection", (ws) => {
         lastSeenAt: Date.now(),
         spawnAt: Date.now(),
         highestMass: 76,
-        massMult,
-        eatenCount: 0,
         aiDir: { x: 0, y: 0 },
         aiNextDecide: 0,
         aiNextSplit: 0,
@@ -1493,16 +1367,7 @@ wss.on("connection", (ws) => {
       let dx = player.input.dx, dy = player.input.dy;
       const m = Math.hypot(dx, dy);
       if (m < 0.05) { dx = player.input.lastDir.x; dy = player.input.lastDir.y; }
-      // Honour the client's burst count so high-speed feed matches the local
-      // EjectHandler's loop exactly. Clamped to a sane range so a malicious
-      // client can't flood the world by claiming count = 10000.
-      const rawCount = Number(msg.count);
-      const count = Number.isFinite(rawCount)
-        ? Math.max(1, Math.min(10, Math.floor(rawCount)))
-        : 1;
-      for (let i = 0; i < count; i++) {
-        tryDoEject(player, dx, dy);
-      }
+      tryDoEject(player, dx, dy);
     } else if (type === "respawn") {
       if (player.dead) spawnCellForPlayer(player);
     } else if (type === "ping") {
