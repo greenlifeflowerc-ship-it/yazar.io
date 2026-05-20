@@ -112,10 +112,14 @@ class V2Painter extends CustomPainter {
   // ────────────────────────────────────────────────── pellets
   void _drawPellets(Canvas canvas, Rect view) {
     final paint = Paint();
+    // Inline AABB cull — avoids one Offset alloc per pellet per frame, which
+    // adds up fast at 8 K pellets × 60 fps on mid-tier mobile GC.
+    final left = view.left, top = view.top, right = view.right, bottom = view.bottom;
     for (final p in controller.world.pellets.values) {
-      if (!view.contains(Offset(p.x, p.y))) continue;
+      final px = p.x, py = p.y;
+      if (px < left || px > right || py < top || py > bottom) continue;
       paint.color = p.color;
-      canvas.drawCircle(Offset(p.x, p.y), 6.0, paint);
+      canvas.drawCircle(Offset(px, py), 6.0, paint);
     }
   }
 

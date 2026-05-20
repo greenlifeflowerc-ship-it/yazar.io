@@ -1,10 +1,11 @@
 /// World cache for Online Classic V2.
 ///
 /// Owns the client-side mirror of every server-authoritative entity that
-/// isn't the local player. Each entity carries a *target* (the value most
-/// recently received from the server) and a *render* value that the
-/// controller smooths toward the target every frame — that's the only thing
-/// that prevents stutter from a 30 Hz snapshot stream.
+/// isn't the local player. Each remote entity keeps a short ring of recent
+/// server samples (prev + new) plus the wall-clock time they arrived. The
+/// renderer plays the world back at `nowMs - interpDelay` so it always
+/// interpolates between two KNOWN samples — that smooths out per-snapshot
+/// jitter the way Source-engine clients do for agar.io-style games.
 library;
 
 import 'dart:math' as math;
@@ -21,6 +22,14 @@ Color _parseHex(String hex) {
 }
 
 /// One remote (non-local) cell as the renderer needs it.
+///
+/// Holds two samples in addition to the live render value:
+///   • prev*  — the previous server snapshot for this cell
+///   • new*   — the latest server snapshot for this cell (= "target")
+/// The renderer linearly interpolates between them based on
+/// `(renderAtMs - prevRecvAt) / (newRecvAt - prevRecvAt)`. If `renderAtMs`
+/// goes past `newRecvAt` we extrapolate up to a small budget so a single
+/// dropped packet doesn't freeze the entity.
 class V2WorldCell {
   V2WorldCell({
     required this.id,
@@ -35,9 +44,15 @@ class V2WorldCell {
     required double initialMass,
     required this.freshSplit,
     required this.mergeReadyAtMs,
-  })  : targetX = initialX,
-        targetY = initialY,
-        targetMass = initialMass,
+    required int recvAtMs,
+  })  : prevX = initialX,
+        prevY = initialY,
+        prevMass = initialMass,
+        prevRecvAt = recvAtMs,
+        newX = initialX,
+        newY = initialY,
+        newMass = initialMass,
+        newRecvAt = recvAtMs,
         renderX = initialX,
         renderY = initialY,
         renderMass = initialMass;
@@ -52,26 +67,60 @@ class V2WorldCell {
   int mergeReadyAtMs;
   bool freshSplit;
 
-  double targetX, targetY, targetMass;
+  // Snapshot buffer (prev + new).
+  double prevX, prevY, prevMass;
+  int prevRecvAt;
+  double newX, newY, newMass;
+  int newRecvAt;
+
+  // Render-time interpolated values consumed by the painter.
   double renderX, renderY, renderMass;
+
+  // Aliases kept for the controller's reconcile code, which targets the
+  // authoritative server state regardless of interpolation timing.
+  double get targetX => newX;
+  double get targetY => newY;
+  double get targetMass => newMass;
 
   double get renderRadius => math.sqrt(renderMass / math.pi) * 10;
 
-  void applyUpdate(V2UpdCell u) {
-    targetX = u.x;
-    targetY = u.y;
-    targetMass = u.mass;
+  /// Push a fresh server update. Always rotates new→prev so the next render
+  /// has two samples to interpolate between. If two updates arrive within
+  /// the same wall-clock millisecond we keep the spacing non-zero so the
+  /// interp denominator can't go to zero.
+  void applyUpdate(V2UpdCell u, int recvAtMs) {
+    prevX = newX;
+    prevY = newY;
+    prevMass = newMass;
+    prevRecvAt = newRecvAt;
+    newX = u.x;
+    newY = u.y;
+    newMass = u.mass;
+    newRecvAt = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
     freshSplit = u.freshSplit;
   }
 
-  /// Exponentially smooth render position toward target. [dt] is seconds.
-  /// At [smoothing] = 18 the half-life is ~38 ms — fast enough to look real,
-  /// slow enough to swallow per-tick jitter.
-  void tick(double dt, {double smoothing = 25}) {
-    final f = 1 - math.exp(-smoothing * dt);
-    renderX += (targetX - renderX) * f;
-    renderY += (targetY - renderY) * f;
-    renderMass += (targetMass - renderMass) * f;
+  /// Resolve [renderX/Y/Mass] for the given wall-clock render time.
+  /// Extrapolation budget is capped at 60 ms so a lost snapshot still keeps
+  /// the cell moving briefly instead of freezing.
+  void tickInterp(int renderAtMs) {
+    final span = newRecvAt - prevRecvAt;
+    double t;
+    if (span <= 0) {
+      t = 1.0;
+    } else {
+      t = (renderAtMs - prevRecvAt) / span;
+      if (t < 0) t = 0;
+      if (t > 1) {
+        final extraMs = renderAtMs - newRecvAt;
+        if (extraMs > 60) {
+          t = 1 + 60 / span;
+        }
+      }
+    }
+    renderX = prevX + (newX - prevX) * t;
+    renderY = prevY + (newY - prevY) * t;
+    renderMass = prevMass + (newMass - prevMass) * t;
   }
 }
 
@@ -94,20 +143,51 @@ class V2WorldVirus {
     required double initialX,
     required double initialY,
     required this.mass,
-  })  : targetX = initialX,
-        targetY = initialY,
+    required int recvAtMs,
+  })  : prevX = initialX,
+        prevY = initialY,
+        prevRecvAt = recvAtMs,
+        newX = initialX,
+        newY = initialY,
+        newRecvAt = recvAtMs,
         renderX = initialX,
         renderY = initialY;
   final String id;
   double mass;
-  double targetX, targetY;
+  double prevX, prevY;
+  int prevRecvAt;
+  double newX, newY;
+  int newRecvAt;
   double renderX, renderY;
+  double get targetX => newX;
+  double get targetY => newY;
   double get renderRadius => math.sqrt(mass / math.pi) * 10;
 
-  void tick(double dt, {double smoothing = 22}) {
-    final f = 1 - math.exp(-smoothing * dt);
-    renderX += (targetX - renderX) * f;
-    renderY += (targetY - renderY) * f;
+  void applyUpdate(double x, double y, double m, int recvAtMs) {
+    prevX = newX;
+    prevY = newY;
+    prevRecvAt = newRecvAt;
+    newX = x;
+    newY = y;
+    newRecvAt = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
+    mass = m;
+  }
+
+  void tickInterp(int renderAtMs) {
+    final span = newRecvAt - prevRecvAt;
+    double t;
+    if (span <= 0) {
+      t = 1.0;
+    } else {
+      t = (renderAtMs - prevRecvAt) / span;
+      if (t < 0) t = 0;
+      if (t > 1) {
+        final extraMs = renderAtMs - newRecvAt;
+        if (extraMs > 60) t = 1 + 60 / span;
+      }
+    }
+    renderX = prevX + (newX - prevX) * t;
+    renderY = prevY + (newY - prevY) * t;
   }
 }
 
@@ -119,21 +199,51 @@ class V2WorldEjected {
     required this.color,
     required this.ownerId,
     required this.addedAt,
-  })  : targetX = initialX,
-        targetY = initialY,
+    required int recvAtMs,
+  })  : prevX = initialX,
+        prevY = initialY,
+        prevRecvAt = recvAtMs,
+        newX = initialX,
+        newY = initialY,
+        newRecvAt = recvAtMs,
         renderX = initialX,
         renderY = initialY;
   final String id;
   final Color color;
   final String ownerId;
   final int addedAt; // ms timestamp when this entry was added to world
-  double targetX, targetY;
+  double prevX, prevY;
+  int prevRecvAt;
+  double newX, newY;
+  int newRecvAt;
   double renderX, renderY;
+  double get targetX => newX;
+  double get targetY => newY;
 
-  void tick(double dt, {double smoothing = 32}) {
-    final f = 1 - math.exp(-smoothing * dt);
-    renderX += (targetX - renderX) * f;
-    renderY += (targetY - renderY) * f;
+  void applyUpdate(double x, double y, int recvAtMs) {
+    prevX = newX;
+    prevY = newY;
+    prevRecvAt = newRecvAt;
+    newX = x;
+    newY = y;
+    newRecvAt = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
+  }
+
+  void tickInterp(int renderAtMs) {
+    final span = newRecvAt - prevRecvAt;
+    double t;
+    if (span <= 0) {
+      t = 1.0;
+    } else {
+      t = (renderAtMs - prevRecvAt) / span;
+      if (t < 0) t = 0;
+      if (t > 1) {
+        final extraMs = renderAtMs - newRecvAt;
+        if (extraMs > 60) t = 1 + 60 / span;
+      }
+    }
+    renderX = prevX + (newX - prevX) * t;
+    renderY = prevY + (newY - prevY) * t;
   }
 }
 
@@ -155,6 +265,13 @@ class V2World {
   int lastServerTick = -1;
   int lastServerNow = 0;
   int lastAckSeq = 0;
+  int lastSnapshotAtMs = 0;
+
+  /// Render delay in ms — the renderer plays back the world this many ms in
+  /// the past so it always has two real snapshots to interpolate between.
+  /// ~110 ms = 3.3 server ticks @ 30 Hz: tolerates a single lost packet
+  /// without freezing. Adjusted by the controller based on measured ping.
+  int interpDelayMs = 110;
 
   String selfId = '';
 
@@ -166,6 +283,8 @@ class V2World {
     lastServerTick = s.serverTick;
     lastServerNow = s.serverNow;
     lastAckSeq = s.ackSeq;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    lastSnapshotAtMs = nowMs;
 
     // ── cells ──
     for (final c in s.addCells) {
@@ -182,10 +301,11 @@ class V2World {
         initialMass: c.mass,
         freshSplit: c.freshSplit,
         mergeReadyAtMs: c.mergeReadyAt,
+        recvAtMs: nowMs,
       );
     }
     for (final u in s.updCells) {
-      cells[u.id]?.applyUpdate(u);
+      cells[u.id]?.applyUpdate(u, nowMs);
     }
     for (final id in s.rmCells) {
       cells.remove(id);
@@ -216,21 +336,17 @@ class V2World {
         initialX: v.x,
         initialY: v.y,
         mass: v.mass,
+        recvAtMs: nowMs,
       );
     }
     for (final u in s.updViruses) {
-      final v = viruses[u.id];
-      if (v == null) continue;
-      v.targetX = u.x;
-      v.targetY = u.y;
-      v.mass = u.mass;
+      viruses[u.id]?.applyUpdate(u.x, u.y, u.mass, nowMs);
     }
     for (final id in s.rmViruses) {
       viruses.remove(id);
     }
 
     // ── ejected ──
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
     for (final e in s.addEjected) {
       ejected[e.id] = V2WorldEjected(
         id: e.id,
@@ -239,13 +355,11 @@ class V2World {
         color: _parseHex(e.colorHex),
         ownerId: e.ownerId,
         addedAt: nowMs,
+        recvAtMs: nowMs,
       );
     }
     for (final u in s.updEjected) {
-      final e = ejected[u.id];
-      if (e == null) continue;
-      e.targetX = u.x;
-      e.targetY = u.y;
+      ejected[u.id]?.applyUpdate(u.x, u.y, nowMs);
     }
     for (final id in s.rmEjected) {
       ejected.remove(id);
@@ -261,21 +375,23 @@ class V2World {
         DateTime.now().millisecondsSinceEpoch + _locallyEatenTtlMs;
   }
 
-  /// Decay smoothing for every render-position-tracked entity, expire the
-  /// locally-eaten cache. Call this every frame.
-  void tickRender(double dt) {
+  /// Resolve all interpolated render positions at the given wall-clock time.
+  /// Pass the same `nowMs` you intend to use for camera / HUD so visuals
+  /// stay temporally consistent. The render time fed to each entity is
+  /// `nowMs - interpDelayMs`, which is how we always have two real samples.
+  void tickRender(int nowMs) {
+    final renderAt = nowMs - interpDelayMs;
     for (final c in cells.values) {
-      c.tick(dt);
+      c.tickInterp(renderAt);
     }
     for (final v in viruses.values) {
-      v.tick(dt);
+      v.tickInterp(renderAt);
     }
     for (final e in ejected.values) {
-      e.tick(dt);
+      e.tickInterp(renderAt);
     }
     if (locallyEatenPellets.isNotEmpty) {
-      final now = DateTime.now().millisecondsSinceEpoch;
-      locallyEatenPellets.removeWhere((_, exp) => exp <= now);
+      locallyEatenPellets.removeWhere((_, exp) => exp <= nowMs);
     }
   }
 

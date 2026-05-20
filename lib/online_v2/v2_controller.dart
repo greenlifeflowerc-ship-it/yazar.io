@@ -206,6 +206,12 @@ class V2Controller extends ChangeNotifier {
   void _onPong(V2Pong p) {
     final now = DateTime.now().millisecondsSinceEpoch;
     _pingMs = (now - p.clientT).clamp(0, 5000);
+    // Adaptive interpolation delay. Baseline 95 ms (≈ 3 server ticks) covers
+    // typical packet jitter on a stable connection. On a laggier link we add
+    // a fraction of the ping so the buffer always holds two real snapshots
+    // even when arrival times jitter. Cap at 240 ms so the visual lag stays
+    // sub-perceptible.
+    world.interpDelayMs = (95 + (_pingMs ~/ 4)).clamp(95, 240);
   }
 
   void _onSnapshot(V2State s) {
@@ -400,11 +406,14 @@ class V2Controller extends ChangeNotifier {
     //    aggressive plays feel sluggish.
     _predictCellEating();
 
-    // 6. Smooth render positions of every remote-authoritative entity.
-    world.tickRender(dt);
-
-    // 6. Throttled input send to the server.
+    // 6. Snapshot-buffer interpolation for every remote entity. Render time
+    //    is `now - interpDelayMs` so we always interpolate between two real
+    //    samples instead of chasing the latest one with exponential decay
+    //    (which trails the target and visibly jitters on variable latency).
     final nowMs = DateTime.now().millisecondsSinceEpoch;
+    world.tickRender(nowMs);
+
+    // 7. Throttled input send to the server.
     if (nowMs - _lastInputSendMs >= _inputIntervalMs) {
       _lastInputSendMs = nowMs;
       if (client.isConnected) {
@@ -416,7 +425,11 @@ class V2Controller extends ChangeNotifier {
       }
     }
 
-    notifyListeners();
+    // Intentionally NOT calling notifyListeners() per tick. The screen drives
+    // the painter via its own per-frame ValueNotifier(_frame) and only needs
+    // ChangeNotifier wake-ups on real state changes (snapshot, welcome,
+    // connection change, death). Rebuilding the HUD subtree at 60 Hz was a
+    // major source of jank on mid-tier mobile devices.
   }
 
   void _predictPelletEating() {
@@ -768,16 +781,21 @@ class V2Controller extends ChangeNotifier {
       final dy = best.targetY - l.position.dy;
       final massDelta = best.targetMass - l.mass;
 
-      // Tiny drift: ignore — local sim is matching the server.
-      if (d < 12 && massDelta.abs() < l.mass * 0.02) continue;
+      // Tiny drift: ignore — local sim is matching the server. Slightly wider
+      // dead zone (was 12 u) because the camera follows the local COM and any
+      // sub-radius tug creates visible jitter on the player's own cell.
+      if (d < 22 && massDelta.abs() < l.mass * 0.03) continue;
 
-      // Medium drift: blend position gently, mass more aggressively.
-      if (d < 220 && massDelta.abs() < l.mass * 0.15) {
+      // Medium drift: blend position GENTLY (≈ 6 % per snapshot ≈ 2 s half-
+      // life) and let mass catch up faster. The previous 14 % blend tugged
+      // the local cell 4-5 u every snapshot, which the camera then followed
+      // — looked like a persistent 30 Hz wobble even on a stable link.
+      if (d < 280 && massDelta.abs() < l.mass * 0.15) {
         l.position = Offset(
-          l.position.dx + dx * 0.14,
-          l.position.dy + dy * 0.14,
+          l.position.dx + dx * 0.06,
+          l.position.dy + dy * 0.06,
         );
-        l.mass += massDelta * 0.55;
+        l.mass += massDelta * 0.35;
         continue;
       }
 
