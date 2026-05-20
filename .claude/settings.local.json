@@ -14,7 +14,8 @@
       "Bash(npm install *)",
       "Bash(npm run *)",
       "Bash(timeout 4 node dist/index.js)",
-      "Bash(timeout 3 node dist/index.js)"
+      "Bash(timeout 3 node dist/index.js)",
+      "Bash(timeout 6 node dist/index.js)"
     ]
   }
 }
