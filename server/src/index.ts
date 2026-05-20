@@ -695,11 +695,13 @@ function integrateCells(p: Player, dt: number): void {
     }
     c.x += c.vx * dt;
     c.y += c.vy * dt;
-    const nm = c.mass * Math.pow(1 - MASS_DECAY_RATE, dt);
+    if (c.mass > DECAY_THRESHOLD) {
+      const nm = c.mass * Math.pow(1 - MASS_DECAY_RATE, dt);
       c.mass = nm < DECAY_THRESHOLD ? DECAY_THRESHOLD : nm;
     }
 
-    // Wall Sticking Physics
+    // Wall Sticking Physics — cancel velocity pushing into the wall so the
+    // cell doesn't grind against it forever.
     const inset = r * 0.75;
     if ((c.x <= inset && c.vx < 0) || (c.x >= WORLD_SIZE - inset && c.vx > 0)) {
       c.vx = 0;
@@ -783,15 +785,15 @@ function tryDoEject(p: Player, dirX: number, dirY: number): void {
     });
 
     // --- Recoil Sticking Physics ---
-    // If cell is at boundary and feeding TOWARDS it, cancel recoil that pushes away.
+    // If cell is at boundary and feeding TOWARDS it, cancel recoil that pushes
+    // away. Reuses `cr` computed above (cell radius post-mass-deduction).
     const recoilScale = 0.35;
     let rvx = fx * (EJECT_MASS / c.mass) * EJECT_VELOCITY_INITIAL * recoilScale;
     let rvy = fy * (EJECT_MASS / c.mass) * EJECT_VELOCITY_INITIAL * recoilScale;
 
-    const cr = radius(c.mass);
-    const inset = cr * 0.85;
-    if ((c.x <= inset && fx < -0.2) || (c.x >= WORLD_SIZE - inset && fx > 0.2)) rvx = 0;
-    if ((c.y <= inset && fy < -0.2) || (c.y >= WORLD_SIZE - inset && fy > 0.2)) rvy = 0;
+    const recoilInset = cr * 0.85;
+    if ((c.x <= recoilInset && fx < -0.2) || (c.x >= WORLD_SIZE - recoilInset && fx > 0.2)) rvx = 0;
+    if ((c.y <= recoilInset && fy < -0.2) || (c.y >= WORLD_SIZE - recoilInset && fy > 0.2)) rvy = 0;
 
     c.vx -= rvx;
     c.vy -= rvy;
@@ -1349,9 +1351,12 @@ setInterval(() => {
     applyCohesion(p, dt);
     applySeparation(p, dt);
     applyAttackSpread(p, dt);
-    applyPelletMagnet(dt);
     integrateCells(p, dt);
   }
+
+  // Pellet magnet iterates all players internally — call once per tick, not
+  // per player (otherwise the pull is applied N² times and scales O(N²)).
+  applyPelletMagnet(dt);
 
   updateViruses(dt);
   updateEjected(dt);
