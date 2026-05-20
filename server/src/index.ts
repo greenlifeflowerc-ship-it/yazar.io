@@ -82,14 +82,14 @@ const LANE_WIDTH_BASE = 18.0;
 const LANE_WIDTH_RADIUS_FACTOR = 0.72;
 const LANE_FORWARD_DEPTH_FACTOR = 2.8;
 
-// Per-radius speed clamp — values copied verbatim from
-// lib/game/game_engine.dart GameConstants so server motion matches Offline
-// Classic 1:1. Previously the server used 95 / 0.42 which made large cells
-// ~21 % slower than Offline (visible "sluggish" feel online vs offline).
+// Per-radius speed clamp — Desktop reference values. Tried matching Offline
+// (115 / 0.38) but it pushed velocity above the clamp every tick, creating
+// constant micro-clamping = visible stutter. These values keep equilibrium
+// velocity below the clamp ceiling → motion stays smooth.
 const REFERENCE_RADIUS = 35.0;
 const MAX_SMALL_CELL_SPEED = 360.0;
-const MAX_LARGE_CELL_SPEED = 115.0;
-const SPEED_RADIUS_POWER = 0.38;
+const MAX_LARGE_CELL_SPEED = 95.0;
+const SPEED_RADIUS_POWER = 0.42;
 const SPEED_SCALE_BASE = 260.0;
 
 // Merge.
@@ -542,31 +542,17 @@ function applyInputForce(p: Player, dt: number): void {
   }
   const mag = Math.hypot(dx, dy);
   if (mag < 0.05) return;
-  // Agar.io mobile movement model — ported verbatim from
-  // lib/game/game_engine.dart `_applyInputForce` so Online feels identical to
-  // Offline Classic. Three pieces:
-  //   1. Convergent target point at distance 1000 from CoM — every cell
-  //      aims for the same world point so a multi-cell party converges.
-  //   2. Acceleration = maxSpeed × damping × agility — gives heavy cells a
-  //      heavier feel and light cells a snappier one (matches mobile Agar).
-  //   3. Agility = pow(150/(m+50), 0.15) clamped [0.7, 1.5] — smooth mass
-  //      → responsiveness curve.
-  // Simple-impulse version was tried and felt sluggish vs Offline.
-  const intensity = mag > 1 ? 1 : mag;
-  const com = centerOfMass(p);
-  const tx = com.x + (dx / mag) * 1000;
-  const ty = com.y + (dy / mag) * 1000;
+  // Simple impulse — the Desktop reference model that the user confirmed
+  // works without lag. Each cell receives the same per-tick velocity kick.
+  // Damping in integrateCells handles the easing; per-radius speed clamp
+  // shapes the heavy-vs-light feel. We tried convergent + agility (offline
+  // GameEngine model) and it drove velocity above the clamp every tick,
+  // causing visible stutter. THIS version stays under the clamp → smooth.
+  const ux = dx / mag, uy = dy / mag;
+  const f = INPUT_MOVE_STRENGTH * dt;
   for (const c of p.cells) {
-    const tdx = tx - c.x, tdy = ty - c.y;
-    const d = Math.hypot(tdx, tdy);
-    if (d < 0.1) continue;
-    const r = radius(c.mass);
-    const maxSpeed = maxSpeedForRadius(r);
-    const agilityRaw = Math.pow(150 / (c.mass + 50), 0.15);
-    const agility = agilityRaw < 0.7 ? 0.7 : agilityRaw > 1.5 ? 1.5 : agilityRaw;
-    const accel = maxSpeed * DAMPING_PER_SECOND * agility;
-    c.vx += (tdx / d) * accel * intensity * dt;
-    c.vy += (tdy / d) * accel * intensity * dt;
+    c.vx += ux * f;
+    c.vy += uy * f;
   }
 }
 
@@ -607,24 +593,17 @@ function applySeparation(p: Player, dt: number): void {
       const overlap = minDist - d;
       const nx = dx / d, ny = dy / d;
       const totMass = a.mass + b.mass;
-      // Velocity force — smooth, mass-weighted push.
+      // Velocity force only — Desktop reference model. Hard position
+      // correction was tried (matching offline MergeHandler) but caused
+      // visible stutter when multi-cell parties packed tight: every tick
+      // each cell pair would snap a few pixels apart, accumulating jitter.
+      // Velocity-based push lets cells settle smoothly via damping.
       const fx = nx * overlap * SEPARATION_STRENGTH;
       const fy = ny * overlap * SEPARATION_STRENGTH;
       a.vx += fx * (b.mass / totMass) * dt;
       a.vy += fy * (b.mass / totMass) * dt;
       b.vx -= fx * (a.mass / totMass) * dt;
       b.vy -= fy * (a.mass / totMass) * dt;
-      // Hard position correction — ported from offline MergeHandler. Cells
-      // not yet allowed to merge MUST NOT overlap (Agar.io feel). Velocity
-      // alone can't outrun a fast split impulse in one tick, so we resolve
-      // the overlap directly here, mass-weighted so big cells barely move.
-      // Removing this caused visible "glitches when split" because the
-      // client (which DOES apply this via MergeHandler) ran ahead of the
-      // server, then snapped back on each snapshot.
-      a.x += nx * (overlap * (b.mass / totMass));
-      a.y += ny * (overlap * (b.mass / totMass));
-      b.x -= nx * (overlap * (a.mass / totMass));
-      b.y -= ny * (overlap * (a.mass / totMass));
     }
   }
 }
@@ -779,27 +758,11 @@ function updateEjected(dt: number): void {
   const er = radius(EJECT_MASS);
   for (const e of ejected.values()) {
     if (e.vx === 0 && e.vy === 0) continue;
-
-    // Subtle feed magnet — matches offline `EjectHandler.update` so feed
-    // "locks on" to nearby cells (Agar.io mobile feel). Cost is bounded:
-    // typical ejected count ~50, players ~71, avg cells ~5 → ~18 k ops/tick
-    // ≈ 0.5 M ops/sec which is negligible compared to pellet collision pass.
-    let mfx = 0, mfy = 0;
-    for (const p of players.values()) {
-      if (p.dead) continue;
-      for (const c of p.cells) {
-        const dx = c.x - e.x, dy = c.y - e.y;
-        const d = Math.hypot(dx, dy);
-        if (d < 150 && d > 10) {
-          const strength = (1.0 - d / 150) * 800.0;
-          mfx += (dx / d) * strength;
-          mfy += (dy / d) * strength;
-        }
-      }
-    }
-    e.vx += mfx * dt;
-    e.vy += mfy * dt;
-
+    // No feed magnet — Desktop reference behaviour. Magnet was tried but
+    // created sync mismatch with the client (server iterates all players,
+    // client only knows visible ones) and the per-tick attractor pass
+    // added jitter to feed trajectories. Friction-only gives clean
+    // predictable motion that the client mirrors exactly.
     e.x += e.vx * dt;
     e.y += e.vy * dt;
     e.vx *= fric;

@@ -149,13 +149,9 @@ class V2LocalSim {
     );
     _integrate(player, dt);
 
-    // Feed magnet — server now runs an equivalent pass (see updateEjected),
-    // so local prediction with extraAttractors=remote cells stays in sync.
-    // Without this, feed feels sluggish vs Offline (visible "slow feed").
-    final remotePositions = world?.cells.values
-        .where((c) => !c.isSelf)
-        .map((c) => Offset(c.renderX, c.renderY));
-    _eject.update(dt, extraAttractors: remotePositions);
+    // No feed magnet — Desktop reference behaviour. Server's updateEjected
+    // runs friction-only, so client must do the same to stay in sync.
+    _eject.update(dt, enableMagnet: false);
 
     _merge.processMerges(player);
     _split.enforceAutoSplit(player);
@@ -170,29 +166,19 @@ class V2LocalSim {
   // directly, so the formulas are reproduced verbatim here. Any tuning of
   // GameConstants in `lib/game/game_engine.dart` flows through automatically.
 
-  /// Mirrors the server's [applyInputForce] EXACTLY — the Agar.io mobile
-  /// convergent + agility model from `GameEngine._applyInputForce`. Every
-  /// constant here (targetDist=1000, agility curve, accel formula) is the
-  /// same on server and Offline so the local prediction stays in sync with
-  /// every snapshot.
+  /// Simple impulse — mirrors the server's [applyInputForce] EXACTLY.
+  /// Each cell gets the same per-tick velocity kick; damping in [_integrate]
+  /// + per-radius speed clamp shape the feel. No convergent target point,
+  /// no agility scaling, no per-cell pow() calls. This is what the user
+  /// confirmed feels smooth (Desktop reference style).
   void _applyInputForce(Player p, Offset rawDir, double dt) {
     final mag = rawDir.distance;
     if (mag < 0.05) return;
-    final intensity = mag > 1.0 ? 1.0 : mag;
-
-    final com = p.centerOfMass;
-    const targetDist = 1000.0;
-    final targetPoint = com + (rawDir / mag) * targetDist;
-
+    final ux = rawDir.dx / mag;
+    final uy = rawDir.dy / mag;
+    final f = GameConstants.inputMoveStrength * dt;
     for (final c in p.cells) {
-      final toTarget = targetPoint - c.position;
-      final dist = toTarget.distance;
-      if (dist < 0.1) continue;
-      final dir = toTarget / dist;
-      final maxSpeed = GameConstants.maxSpeedForRadius(c.radius);
-      final agility = math.pow(150.0 / (c.mass + 50.0), 0.15).clamp(0.7, 1.5).toDouble();
-      final accel = maxSpeed * GameConstants.dampingPerSecond * agility;
-      c.velocity += dir * accel * intensity * dt;
+      c.velocity += Offset(ux * f, uy * f);
     }
   }
 
