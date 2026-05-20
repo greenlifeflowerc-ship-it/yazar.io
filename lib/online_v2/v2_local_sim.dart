@@ -149,51 +149,50 @@ class V2LocalSim {
     );
     _integrate(player, dt);
 
-    // Online: server does NOT magnet ejected mass — pass enableMagnet:false
-    // so local prediction matches the authoritative trajectory exactly.
-    // Without this, feed visibly snaps back when each state snapshot arrives.
-    _eject.update(dt, enableMagnet: false);
+    // Feed magnet — server now runs an equivalent pass (see updateEjected),
+    // so local prediction with extraAttractors=remote cells stays in sync.
+    // Without this, feed feels sluggish vs Offline (visible "slow feed").
+    final remotePositions = world?.cells.values
+        .where((c) => !c.isSelf)
+        .map((c) => Offset(c.renderX, c.renderY));
+    _eject.update(dt, extraAttractors: remotePositions);
 
     _merge.processMerges(player);
     _split.enforceAutoSplit(player);
   }
 
-  // NOTE: pellet magnet client prediction removed — the server does not pull
-  // cells toward pellets, so predicting it locally caused the player's cell to
-  // visibly drift between snapshots (rubber-banding into pellets, then back
-  // out when the server's authoritative position arrived). Pellet pickup is
-  // already instantaneous on contact via resolveEatPellets() server-side.
+  // NOTE: pellet magnet is still off both client and server — it cost the
+  // server 8.8 M ops/tick and is not part of Offline Classic either. Pellets
+  // are picked up via resolveEatPellets() on contact (zero predicted drift).
 
   // ────────────────────────── ported from GameEngine ──────────────────────
   // We can't call the engine's private `_applyInputForce` / `_integrateCells`
   // directly, so the formulas are reproduced verbatim here. Any tuning of
   // GameConstants in `lib/game/game_engine.dart` flows through automatically.
 
-  /// Mirrors the server's [applyInputForce] EXACTLY. The previous version
-  /// used `maxSpeed * dampingPerSecond * agility` as acceleration, which:
-  ///   1. Required two pow() calls per cell per tick (server didn't pay this
-  ///      cost, so client was strictly slower).
-  ///   2. Drove velocity to ≈400 units which the per-radius speed clamp in
-  ///      [_integrate] then chopped to ≈260 — every tick — producing
-  ///      micro-jitter on small cells.
-  ///   3. Used targetDist=1000 vs server's 800 → cells aimed at slightly
-  ///      different points than the server thought → constant correction.
+  /// Mirrors the server's [applyInputForce] EXACTLY — the Agar.io mobile
+  /// convergent + agility model from `GameEngine._applyInputForce`. Every
+  /// constant here (targetDist=1000, agility curve, accel formula) is the
+  /// same on server and Offline so the local prediction stays in sync with
+  /// every snapshot.
   void _applyInputForce(Player p, Offset rawDir, double dt) {
     final mag = rawDir.distance;
     if (mag < 0.05) return;
     final intensity = mag > 1.0 ? 1.0 : mag;
 
     final com = p.centerOfMass;
-    const targetDist = 800.0; // matches server
+    const targetDist = 1000.0;
     final targetPoint = com + (rawDir / mag) * targetDist;
 
-    final f = intensity * GameConstants.inputMoveStrength * dt;
     for (final c in p.cells) {
       final toTarget = targetPoint - c.position;
       final dist = toTarget.distance;
       if (dist < 0.1) continue;
       final dir = toTarget / dist;
-      c.velocity += dir * f;
+      final maxSpeed = GameConstants.maxSpeedForRadius(c.radius);
+      final agility = math.pow(150.0 / (c.mass + 50.0), 0.15).clamp(0.7, 1.5).toDouble();
+      final accel = maxSpeed * GameConstants.dampingPerSecond * agility;
+      c.velocity += dir * accel * intensity * dt;
     }
   }
 

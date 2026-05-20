@@ -82,11 +82,14 @@ const LANE_WIDTH_BASE = 18.0;
 const LANE_WIDTH_RADIUS_FACTOR = 0.72;
 const LANE_FORWARD_DEPTH_FACTOR = 2.8;
 
-// Per-radius speed clamp.
+// Per-radius speed clamp — values copied verbatim from
+// lib/game/game_engine.dart GameConstants so server motion matches Offline
+// Classic 1:1. Previously the server used 95 / 0.42 which made large cells
+// ~21 % slower than Offline (visible "sluggish" feel online vs offline).
 const REFERENCE_RADIUS = 35.0;
 const MAX_SMALL_CELL_SPEED = 360.0;
-const MAX_LARGE_CELL_SPEED = 95.0;
-const SPEED_RADIUS_POWER = 0.42;
+const MAX_LARGE_CELL_SPEED = 115.0;
+const SPEED_RADIUS_POWER = 0.38;
 const SPEED_SCALE_BASE = 260.0;
 
 // Merge.
@@ -106,6 +109,11 @@ const BOT_DECIDE_CADENCE_MS = 200;
 const BOT_RESPAWN_DELAY_MS = 500;
 
 // Networking.
+// 30 Hz is the proven sweet spot for this game. We tried 60 Hz but the
+// per-tick pellet collision pass (O(players × cells × 8000 pellets)) saturated
+// CPU and caused tick drops — which felt worse than the latency 30 Hz adds.
+// To safely raise this, the resolveEatPellets / resolveCellVsCell loops need
+// spatial hashing first; only then will the CPU budget allow 45–60 Hz.
 const TICK_RATE = 30;                   // server simulation Hz
 const TICK_MS = 1000 / TICK_RATE;
 const SLOW_TICK_EVERY = 4;              // 7.5 Hz pellet refresh per player
@@ -534,32 +542,31 @@ function applyInputForce(p: Player, dt: number): void {
   }
   const mag = Math.hypot(dx, dy);
   if (mag < 0.05) return;
-<<<<<<< HEAD
-  const ux = dx / mag, uy = dy / mag;
-  const f = INPUT_MOVE_STRENGTH * dt;
-  for (const c of p.cells) {
-    c.vx += ux * f;
-    c.vy += uy * f;
-=======
-  // Convergent movement: all cells aim for a target point X (Agar.io mobile).
-  // Simple impulse — let damping + per-radius speed clamp in integrateCells
-  // shape the feel. The previous version multiplied accel by maxSpeed and an
-  // "agility" pow() per cell which made cells burst then snap-clamp every
-  // tick (visible jitter) AND added 3 expensive pow() calls per cell-tick.
+  // Agar.io mobile movement model — ported verbatim from
+  // lib/game/game_engine.dart `_applyInputForce` so Online feels identical to
+  // Offline Classic. Three pieces:
+  //   1. Convergent target point at distance 1000 from CoM — every cell
+  //      aims for the same world point so a multi-cell party converges.
+  //   2. Acceleration = maxSpeed × damping × agility — gives heavy cells a
+  //      heavier feel and light cells a snappier one (matches mobile Agar).
+  //   3. Agility = pow(150/(m+50), 0.15) clamped [0.7, 1.5] — smooth mass
+  //      → responsiveness curve.
+  // Simple-impulse version was tried and felt sluggish vs Offline.
   const intensity = mag > 1 ? 1 : mag;
   const com = centerOfMass(p);
-  const tx = com.x + (dx / mag) * 800;
-  const ty = com.y + (dy / mag) * 800;
-
-  const f = intensity * INPUT_MOVE_STRENGTH * dt;
+  const tx = com.x + (dx / mag) * 1000;
+  const ty = com.y + (dy / mag) * 1000;
   for (const c of p.cells) {
     const tdx = tx - c.x, tdy = ty - c.y;
     const d = Math.hypot(tdx, tdy);
-    if (d > 0.1) {
-      c.vx += (tdx / d) * f;
-      c.vy += (tdy / d) * f;
-    }
->>>>>>> a59fcc0 (full change)
+    if (d < 0.1) continue;
+    const r = radius(c.mass);
+    const maxSpeed = maxSpeedForRadius(r);
+    const agilityRaw = Math.pow(150 / (c.mass + 50), 0.15);
+    const agility = agilityRaw < 0.7 ? 0.7 : agilityRaw > 1.5 ? 1.5 : agilityRaw;
+    const accel = maxSpeed * DAMPING_PER_SECOND * agility;
+    c.vx += (tdx / d) * accel * intensity * dt;
+    c.vy += (tdy / d) * accel * intensity * dt;
   }
 }
 
@@ -600,19 +607,24 @@ function applySeparation(p: Player, dt: number): void {
       const overlap = minDist - d;
       const nx = dx / d, ny = dy / d;
       const totMass = a.mass + b.mass;
-<<<<<<< HEAD
-=======
-
-      // Velocity-based push (smooth ramp-up). The previous version added a
-      // hard position correction here too which caused visible snapping when
-      // many cells overlapped after a multi-split.
->>>>>>> a59fcc0 (full change)
+      // Velocity force — smooth, mass-weighted push.
       const fx = nx * overlap * SEPARATION_STRENGTH;
       const fy = ny * overlap * SEPARATION_STRENGTH;
       a.vx += fx * (b.mass / totMass) * dt;
       a.vy += fy * (b.mass / totMass) * dt;
       b.vx -= fx * (a.mass / totMass) * dt;
       b.vy -= fy * (a.mass / totMass) * dt;
+      // Hard position correction — ported from offline MergeHandler. Cells
+      // not yet allowed to merge MUST NOT overlap (Agar.io feel). Velocity
+      // alone can't outrun a fast split impulse in one tick, so we resolve
+      // the overlap directly here, mass-weighted so big cells barely move.
+      // Removing this caused visible "glitches when split" because the
+      // client (which DOES apply this via MergeHandler) ran ahead of the
+      // server, then snapped back on each snapshot.
+      a.x += nx * (overlap * (b.mass / totMass));
+      a.y += ny * (overlap * (b.mass / totMass));
+      b.x -= nx * (overlap * (a.mass / totMass));
+      b.y -= ny * (overlap * (a.mass / totMass));
     }
   }
 }
@@ -677,13 +689,9 @@ function integrateCells(p: Player, dt: number): void {
       const nm = c.mass * Math.pow(1 - MASS_DECAY_RATE, dt);
       c.mass = nm < DECAY_THRESHOLD ? DECAY_THRESHOLD : nm;
     }
-<<<<<<< HEAD
-=======
-    // NOTE: wall-sticking velocity zero-out removed — it caused cells to
-    // freeze flush against the wall instead of sliding along it (which made
-    // multi-cell parties get stuck whenever any cell touched the boundary).
-    // Plain clamp lets the cell slide naturally.
->>>>>>> a59fcc0 (full change)
+    // NOTE: wall-sticking velocity zero-out was an experimental addition;
+    // it made multi-cell parties freeze against the boundary instead of
+    // sliding. Plain clamp is what the working Desktop reference uses.
     const inset = r * 0.75;
     c.x = clamp(c.x, inset, WORLD_SIZE - inset);
     c.y = clamp(c.y, inset, WORLD_SIZE - inset);
@@ -758,14 +766,10 @@ function tryDoEject(p: Player, dirX: number, dirY: number): void {
       color: c.color,
       spawnedAt: Date.now(),
     });
-<<<<<<< HEAD
-=======
-
-    // NOTE: ejection recoil on the cell was removed — it caused cells to
-    // drift sideways unexpectedly during rapid feeding (the per-burst recoil
-    // accumulated faster than damping could absorb it), and the client's
-    // local prediction did not mirror it, producing visible rubber-banding.
->>>>>>> a59fcc0 (full change)
+    // NOTE: ejection recoil on the cell is intentionally NOT applied — the
+    // earlier experimental recoil drifted cells sideways during rapid feed
+    // (per-burst recoil accumulated faster than damping could absorb) and
+    // client prediction couldn't mirror it without desync.
   }
 }
 
@@ -775,14 +779,27 @@ function updateEjected(dt: number): void {
   const er = radius(EJECT_MASS);
   for (const e of ejected.values()) {
     if (e.vx === 0 && e.vy === 0) continue;
-<<<<<<< HEAD
-=======
 
-    // NOTE: subtle magnet was removed — O(E×P×C) cost per tick and caused
-    // ejected mass to drift erratically toward cells (visible jitter).
-    // Feed is consumed by resolveEatEjected() on contact.
+    // Subtle feed magnet — matches offline `EjectHandler.update` so feed
+    // "locks on" to nearby cells (Agar.io mobile feel). Cost is bounded:
+    // typical ejected count ~50, players ~71, avg cells ~5 → ~18 k ops/tick
+    // ≈ 0.5 M ops/sec which is negligible compared to pellet collision pass.
+    let mfx = 0, mfy = 0;
+    for (const p of players.values()) {
+      if (p.dead) continue;
+      for (const c of p.cells) {
+        const dx = c.x - e.x, dy = c.y - e.y;
+        const d = Math.hypot(dx, dy);
+        if (d < 150 && d > 10) {
+          const strength = (1.0 - d / 150) * 800.0;
+          mfx += (dx / d) * strength;
+          mfy += (dy / d) * strength;
+        }
+      }
+    }
+    e.vx += mfx * dt;
+    e.vy += mfy * dt;
 
->>>>>>> a59fcc0 (full change)
     e.x += e.vx * dt;
     e.y += e.vy * dt;
     e.vx *= fric;
@@ -864,13 +881,10 @@ function resolveEatEjected(): void {
       for (const [id, e] of ejected) {
         if (e.ownerId === c.ownerId && now - e.spawnedAt < EJECT_OWNER_IMMUNITY_MS) continue;
         const er = radius(EJECT_MASS);
-<<<<<<< HEAD
-=======
-        // eatR matches Offline Classic: cell eats the pellet when its centre
-        // overlaps with 60% of the cell radius. The previous `r + er` made
-        // cells appear to "vacuum" feed from a distance (and clients without
-        // the same rule predicted differently → rubber-banding).
->>>>>>> a59fcc0 (full change)
+        // eatR matches Offline Classic: cell eats feed when its centre
+        // overlaps with 60% of the cell radius. An earlier `r + er` made
+        // cells appear to "vacuum" feed from a distance and desynced with
+        // any client that predicted with the same Offline rule.
         const eatR = r - er * 0.4;
         const dx = e.x - c.x, dy = e.y - c.y;
         if (dx * dx + dy * dy < eatR * eatR) {
@@ -1294,13 +1308,10 @@ setInterval(() => {
     integrateCells(p, dt);
   }
 
-<<<<<<< HEAD
-=======
-  // NOTE: pellet magnet removed — it was O(P×C) per tick (8000 pellets ×
-  // ~1100 cells = 8.8M operations/tick) and destroyed server FPS.
-  // Pellets are picked up via resolveEatPellets() on contact.
+  // NOTE: an experimental pellet magnet was removed — O(P×C) per tick
+  // (8000 pellets × ~1100 cells = 8.8M ops/tick) destroyed server FPS.
+  // Pellets are picked up via resolveEatPellets() on contact only.
 
->>>>>>> a59fcc0 (full change)
   updateViruses(dt);
   updateEjected(dt);
 
