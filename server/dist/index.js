@@ -1137,13 +1137,17 @@ function buildSnapshot(p, lb, sendSlow) {
                 p.lastSent.set(c.id, [cx, cy, cm]);
             }
             else {
-                // Skip if neither position nor mass crossed the epsilon threshold.
-                // A still cell with 1e-3 drift used to get a 40-byte update every
-                // tick — over 30 visible cells × 30 Hz that's 36 KB / s of pure
-                // noise. The client interpolation buffer doesn't need updates the
-                // human eye can't see anyway.
+                // Skip ONLY for cells that are truly idle (no velocity, no split
+                // impulse). Moving cells must keep their full 30 Hz update stream
+                // so the client interp span stays at one server tick (~33 ms) —
+                // otherwise the cell visibly "ticks forward" every 100 ms instead
+                // of flowing smoothly.
+                const speed2 = c.vx * c.vx + c.vy * c.vy;
+                const splitSpeed2 = c.spX * c.spX + c.spY * c.spY;
+                const truelyIdle = speed2 < 1 && splitSpeed2 < 1;
                 const last = p.lastSent.get(c.id);
-                const moved = last === undefined ||
+                const moved = !truelyIdle ||
+                    last === undefined ||
                     Math.abs(cx - last[0]) >= posEps ||
                     Math.abs(cy - last[1]) >= posEps ||
                     Math.abs(cm - last[2]) >= massEps ||
@@ -1196,7 +1200,11 @@ function buildSnapshot(p, lb, sendSlow) {
         }
         else {
             const last = p.lastSentVirus.get(v.id);
-            const moved = last === undefined ||
+            // A virus that's just been "shot" by repeated feed has high vx/vy and
+            // must keep streaming every tick; an idle virus rarely sends.
+            const virusMoving = (v.vx * v.vx + v.vy * v.vy) > 1;
+            const moved = virusMoving ||
+                last === undefined ||
                 Math.abs(vx - last[0]) >= posEps ||
                 Math.abs(vy - last[1]) >= posEps ||
                 Math.abs(vm - last[2]) >= 1;
@@ -1231,7 +1239,9 @@ function buildSnapshot(p, lb, sendSlow) {
         }
         else {
             const last = p.lastSentEjected.get(e.id);
-            const moved = last === undefined ||
+            const ejectedMoving = (e.vx * e.vx + e.vy * e.vy) > 1;
+            const moved = ejectedMoving ||
+                last === undefined ||
                 Math.abs(ex - last[0]) >= posEps ||
                 Math.abs(ey - last[1]) >= posEps;
             if (moved) {

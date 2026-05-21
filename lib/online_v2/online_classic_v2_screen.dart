@@ -217,8 +217,15 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
     // attackMode intentionally NOT toggled on feed — see comment in
     // game_screen._startEjectHold; matches offline behaviour 1:1.
     _ctrl.doEject();
+    // Online-mode floor: cap the timer at 50 ms (20 Hz). The offline screen
+    // can hammer this at >100 Hz because there's no network in the loop, but
+    // online every fire spawns a local ejected mass AND sends a WebSocket
+    // packet. 100+ packets/sec floods both Dart's event loop and the server
+    // — that's the "feed eject feels frozen for a second" stutter. The
+    // server-side burst count (sendEject's count parameter) already covers
+    // ranks > 1, so we don't lose ejection mass per call.
     final speed = GameSettings.instance.feedSpeedMultiplier;
-    final ms = (100 / speed).round().clamp(1, 500);
+    final ms = (100 / speed).round().clamp(50, 500);
     _ejectHoldTimer = Timer.periodic(
       Duration(milliseconds: ms),
       (_) => _ctrl.doEject(),
@@ -235,7 +242,8 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
     if (_ejectHoldTimer2 != null) return;
     _ctrl.doEject();
     final speed = GameSettings.instance.feedSpeedMultiplier2;
-    final ms = (100 / speed).round().clamp(1, 500);
+    // Same 50 ms online floor — see comment on _startEjectHold above.
+    final ms = (100 / speed).round().clamp(50, 500);
     _ejectHoldTimer2 = Timer.periodic(
       Duration(milliseconds: ms),
       (_) => _ctrl.doEject(),

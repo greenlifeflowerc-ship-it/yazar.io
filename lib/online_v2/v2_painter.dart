@@ -205,25 +205,21 @@ class V2Painter extends CustomPainter {
   }
 
   static const double _ejectedRadius = 20.34; // sqrt(13/pi)*10 — eject mass=13
+  // Border tint, allocated once. The previous code built a fresh radial
+  // Gradient per ejected piece per frame — at sustained feed (≥ 300 pieces
+  // on screen) that meant ~18 K shader builds / sec, the single biggest
+  // jank source of continuous "W" feed. A flat fill + thin grey ring looks
+  // virtually identical at game zoom and costs ~30× less.
+  static final Paint _ejectedBorder = Paint()
+    ..style = PaintingStyle.stroke
+    ..color = const Color(0x7F808080);
   void _drawEjectedCircle(Canvas canvas, Offset pos, double r, Color color) {
-    final gradient = ui.Gradient.radial(
-      pos,
-      r,
-      [
-        color,
-        color,
-        Colors.grey.withValues(alpha: 0.5),
-        Colors.grey.withValues(alpha: 0),
-      ],
-      [
-        0.0,
-        ((r - 10) / r).clamp(0.0, 1.0),
-        ((r - 2) / r).clamp(0.0, 1.0),
-        1.0,
-      ],
-    );
-    _ejectedPaint.shader = gradient;
+    _ejectedPaint
+      ..shader = null
+      ..color = color;
     canvas.drawCircle(pos, r, _ejectedPaint);
+    _ejectedBorder.strokeWidth = math.max(1.0, r * 0.06);
+    canvas.drawCircle(pos, r - _ejectedBorder.strokeWidth * 0.5, _ejectedBorder);
   }
 
   // ─────────────────────────────── pooled drawable buffer (static, reused)

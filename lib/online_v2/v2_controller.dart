@@ -811,21 +811,23 @@ class V2Controller extends ChangeNotifier {
       final dy = best.targetY - l.position.dy;
       final massDelta = best.targetMass - l.mass;
 
-      // Tiny drift: ignore — local sim is matching the server. Slightly wider
-      // dead zone (was 12 u) because the camera follows the local COM and any
-      // sub-radius tug creates visible jitter on the player's own cell.
-      if (d < 22 && massDelta.abs() < l.mass * 0.03) continue;
+      // Tiny drift: ignore — local sim is matching the server. Wide dead
+      // zone (was 22 u) because steady RTT drift sits around 25-40 u on a
+      // typical mobile link, and any reconcile inside that band creates a
+      // perpetual ~1 u camera tug at 30 Hz that the eye reads as wobble.
+      // The local cell is the only thing the player aims with anyway, so
+      // a 40 u local-vs-server gap is invisible until the player stops.
+      if (d < 40 && massDelta.abs() < l.mass * 0.04) continue;
 
-      // Medium drift: blend position GENTLY (≈ 6 % per snapshot ≈ 2 s half-
-      // life) and let mass catch up faster. The previous 14 % blend tugged
-      // the local cell 4-5 u every snapshot, which the camera then followed
-      // — looked like a persistent 30 Hz wobble even on a stable link.
+      // Medium drift: blend position GENTLY (~ 3 % per snapshot, half-life
+      // ~ 1 s) and let mass catch up moderately. Anything above this we
+      // count as "real divergence" and fall through to the hard snap.
       if (d < 280 && massDelta.abs() < l.mass * 0.15) {
         l.position = Offset(
-          l.position.dx + dx * 0.06,
-          l.position.dy + dy * 0.06,
+          l.position.dx + dx * 0.03,
+          l.position.dy + dy * 0.03,
         );
-        l.mass += massDelta * 0.35;
+        l.mass += massDelta * 0.30;
         continue;
       }
 
