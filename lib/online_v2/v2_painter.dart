@@ -210,20 +210,34 @@ class V2Painter extends CustomPainter {
   }
 
   static const double _ejectedRadius = 20.34; // sqrt(13/pi)*10 — eject mass=13
-  // Border tint, allocated once. The previous code built a fresh radial
-  // Gradient per ejected piece per frame — at sustained feed (≥ 300 pieces
-  // on screen) that meant ~18 K shader builds / sec, the single biggest
-  // jank source of continuous "W" feed. A flat fill + thin grey ring looks
-  // virtually identical at game zoom and costs ~30× less.
-  static final Paint _ejectedBorder = Paint()
-    ..style = PaintingStyle.stroke
-    ..color = const Color(0x7F808080);
+  // Two reusable paints — keep allocations off the hot path. The colours
+  // are written per-call.
+  static final Paint _ejectedHalo = Paint();
+  static final Paint _ejectedBorder = Paint()..style = PaintingStyle.stroke;
   void _drawEjectedCircle(Canvas canvas, Offset pos, double r, Color color) {
+    // Layered "neon stone" look:
+    //   1. Outer halo — same hue, low alpha, wider radius. Reads as a
+    //      glow without needing a real blur (which is GPU-expensive).
+    //   2. Main fill — fully saturated neon colour.
+    //   3. Rim — same hue, darkened, thin stroke. Defines the silhouette
+    //      against the background without the previous "dirty grey" tint.
+    _ejectedHalo
+      ..shader = null
+      ..color = color.withValues(alpha: 0.35);
+    canvas.drawCircle(pos, r * 1.30, _ejectedHalo);
+
     _ejectedPaint
       ..shader = null
       ..color = color;
     canvas.drawCircle(pos, r, _ejectedPaint);
-    _ejectedBorder.strokeWidth = math.max(1.0, r * 0.06);
+
+    final hsl = HSLColor.fromColor(color);
+    final rim = hsl
+        .withLightness((hsl.lightness * 0.55).clamp(0.0, 1.0))
+        .toColor();
+    _ejectedBorder
+      ..color = rim
+      ..strokeWidth = math.max(1.2, r * 0.10);
     canvas.drawCircle(pos, r - _ejectedBorder.strokeWidth * 0.5, _ejectedBorder);
   }
 

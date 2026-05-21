@@ -403,9 +403,11 @@ class V2Controller extends ChangeNotifier {
     // by feedSpeedMultiplier). The server must do the same number per packet
     // — otherwise local mass drops further than server confirms, and the
     // reconcile snaps it back (visible as "mass disappearing" then refilling).
+    // Cap 30 matches the server-side clamp so the network rate stays bounded
+    // even at extreme feedSpeedMultiplier values.
     final burst = (GameSettings.instance.feedSpeedMultiplier / 10)
         .floor()
-        .clamp(1, 10);
+        .clamp(1, 30);
     client.sendEject(count: burst);
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     _seqStampMs[client.lastSentSeq] = nowMs;

@@ -225,14 +225,13 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
     // attackMode intentionally NOT toggled on feed — see comment in
     // game_screen._startEjectHold; matches offline behaviour 1:1.
     _ctrl.doEject();
-    // Same timer math as offline classic so the feedSpeedMultiplier
-    // slider scales the online feed rate identically. 5 ms floor caps
-    // the packet rate at 200 Hz which the websocket can comfortably
-    // sustain on a 2-vCPU host; above that the offline path is faster
-    // by allocation rate, not by packet rate, so the visible loss is
-    // tiny.
+    // Same timer math as offline classic. 1 ms floor lets micro reach
+    // ~ 1000 Hz fire rate (matches offline above feedSpeedMultiplier=100).
+    // Per-packet burst is capped server-side at 30, so practical max
+    // ejects/sec = 1000 × 30 = 30K per cell. The websocket can sustain
+    // 1000 packets/sec from one client on a 2-vCPU host.
     final speed = GameSettings.instance.feedSpeedMultiplier;
-    final ms = (100 / speed).round().clamp(5, 500);
+    final ms = (100 / speed).round().clamp(1, 500);
     _ejectHoldTimer = Timer.periodic(
       Duration(milliseconds: ms),
       (_) => _ctrl.doEject(),
@@ -249,8 +248,8 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
     if (_ejectHoldTimer2 != null) return;
     _ctrl.doEject();
     final speed = GameSettings.instance.feedSpeedMultiplier2;
-    // 5 ms floor — see comment on _startEjectHold.
-    final ms = (100 / speed).round().clamp(5, 500);
+    // 1 ms floor — see comment on _startEjectHold.
+    final ms = (100 / speed).round().clamp(1, 500);
     _ejectHoldTimer2 = Timer.periodic(
       Duration(milliseconds: ms),
       (_) => _ctrl.doEject(),
