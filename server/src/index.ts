@@ -1392,7 +1392,10 @@ wss.on("connection", (ws) => {
       const name = rawName.trim().slice(0, 18) || "Player";
       const skinId = typeof msg.skin === "string" ? msg.skin.slice(0, 128) : "";
       const rawMult = Number(msg.massMult);
-      const massMult = Number.isFinite(rawMult) ? clamp(rawMult, 0.5, 10.0) : 1.0;
+      // Upper bound generous (300×) so the client can drive a dev /
+      // testing spawn mass of up to ~ 22 500 (matches the in-engine cap).
+      // The server still validates Number.isFinite to reject bad data.
+      const massMult = Number.isFinite(rawMult) ? clamp(rawMult, 0.5, 300.0) : 1.0;
       // Per-player eject tuning. Sane clamps so a malicious / desynced
       // client can't ship pieces at world-spanning velocities.
       const rawEsm = Number(msg.ejectSpeedMult);

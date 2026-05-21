@@ -121,6 +121,22 @@ class GameSettings extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Dev / QA-only spawn-mass override for online matches. 0 = no override
+  /// (the server uses the player's normal start mass × active boost). Any
+  /// positive value is converted to a massMultiplier by the V2 controller
+  /// before being sent on `join`, and the server clamps it to a sane upper
+  /// bound. Useful for quickly testing late-game scenarios (splits, large
+  /// virus pops, max-cell-count behaviour) without grinding up.
+  double _devStartMass = 0;
+  double get devStartMass => _devStartMass;
+  set devStartMass(double v) {
+    final c = v.clamp(0.0, 22500.0);
+    if (_devStartMass == c) return;
+    _devStartMass = c;
+    StorageService.instance.setDouble('devStartMass', c);
+    notifyListeners();
+  }
+
   // Controls
   double _buttonScale = 1.0;
   double get buttonScale => _buttonScale;
@@ -174,6 +190,7 @@ class GameSettings extends ChangeNotifier {
     _feedSpeedMultiplier = storage.getDouble('feedSpeedMultiplier') ?? 1.0;
     _feedSpeedMultiplier2 = storage.getDouble('feedSpeedMultiplier2') ?? 1.0;
     _stopOnRelease = storage.getBool('stopOnRelease') ?? false;
+    _devStartMass = storage.getDouble('devStartMass') ?? 0;
     _buttonScale = storage.getDouble('buttonScale') ?? 1.0;
     _joystickOnRight = storage.getBool('joystickOnRight') ?? false;
     _pcMode = storage.getBool('pcMode') ?? false;

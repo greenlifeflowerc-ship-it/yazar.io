@@ -91,11 +91,19 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
     // Pass the player's chosen skin asset path so the server can broadcast
     // it; other clients lazy-load the image via V2SkinCache. Also forward
     // the active mass-boost multiplier so the server applies it on spawn
-    // exactly like Offline Classic does.
+    // exactly like Offline Classic does. The dev-only `devStartMass`
+    // override (set via the settings screen) takes precedence so testing
+    // late-game scenarios doesn't require a real boost.
+    final devMass = GameSettings.instance.devStartMass;
+    final activeBoostMult = AuthService.instance.activeMassMultiplier;
+    // Server's base start mass = 76, so multiplier × 76 = effective spawn.
+    final effectiveMult = devMass > 0
+        ? (devMass / 76.0).clamp(0.5, 300.0)
+        : activeBoostMult;
     _ctrl.connect(
       playerName: widget.nickname.trim(),
       skin: SkinSettings.instance.skinPath ?? '',
-      massMultiplier: AuthService.instance.activeMassMultiplier,
+      massMultiplier: effectiveMult,
     );
     _ticker = createTicker(_onTick)..start();
     if (GameSettings.instance.pcMode) _focus.requestFocus();

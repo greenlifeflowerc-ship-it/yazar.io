@@ -238,6 +238,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
             _s.stopOnRelease,
             (v) => _s.stopOnRelease = v,
           ),
+          _sliderRow(
+            'Dev start mass (online)',
+            _s.devStartMass,
+            min: 0.0,
+            max: 15000.0,
+            onChanged: (v) => _s.devStartMass = v,
+          ),
         ],
       ),
     );
