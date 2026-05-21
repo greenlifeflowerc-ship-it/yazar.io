@@ -148,7 +148,22 @@ class V2Controller extends ChangeNotifier {
   static const _inputIntervalMs = 33; // ~30 Hz, mirrors server tick
   int _lastInputSendMs = 0;
 
-  // ── reconciliation state ──────────────────────────────────────────────
+  // ── input-replay reconciliation ───────────────────────────────────────
+  // The agar.io-quality reconciliation pattern: snapshot the local sim's
+  // step-by-step inputs each frame, then on every server snapshot:
+  //   1. snap local cells to the authoritative server position
+  //   2. replay every frame we've recorded since `ackSeq` was sent
+  //   3. the resulting local cells reflect what the player sees NOW, with
+  //      zero blend, zero rubber-banding, zero perpetual drift.
+  /// Per-frame inputs since the most recent server-acked tick. Capped to
+  /// 1.5 s at 60 Hz worth of frames. Oldest frames are evicted whenever
+  /// the server acks past them.
+  final List<_FrameInput> _frameHistory = [];
+  static const _frameHistoryMaxLen = 96;
+  /// Maps an outbound input sequence number to the wall-clock ms when we
+  /// stamped it. We use this to find "the frame where the server's `ack`
+  /// caught up to" — every later frame is what needs replaying.
+  final Map<int, int> _seqStampMs = {};
   /// Pending action sequence numbers we've sent but haven't seen acked yet.
   /// Used to know how far behind the server's view is and to optionally
   /// time out unconfirmed local actions.
@@ -394,7 +409,16 @@ class V2Controller extends ChangeNotifier {
     final aim = _moveDir.distance > 0.05 ? _moveDir : _lastDir;
     sim.doSplit(aim);
     client.sendSplit();
-    _pendingActions.add(_PendingAction(client.lastSentSeq, 'split'));
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    _seqStampMs[client.lastSentSeq] = nowMs;
+    _pendingActions.add(_PendingAction(client.lastSentSeq, 'split', nowMs, aim));
+    // Tag the current frame record so input-replay re-fires the split when
+    // we rewind to before this seq.
+    if (_frameHistory.isNotEmpty) {
+      _frameHistory.last
+        ..splitFired = true
+        ..splitAim = aim;
+    }
   }
 
   void doEject() {
@@ -409,7 +433,14 @@ class V2Controller extends ChangeNotifier {
         .floor()
         .clamp(1, 10);
     client.sendEject(count: burst);
-    _pendingActions.add(_PendingAction(client.lastSentSeq, 'eject'));
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    _seqStampMs[client.lastSentSeq] = nowMs;
+    _pendingActions.add(_PendingAction(client.lastSentSeq, 'eject', nowMs, aim));
+    if (_frameHistory.isNotEmpty) {
+      _frameHistory.last
+        ..ejectBurst = burst
+        ..ejectAim = aim;
+    }
   }
 
   void respawn() {
@@ -418,16 +449,32 @@ class V2Controller extends ChangeNotifier {
   }
 
   // ──────────────────────────────────────────────────────── frame tick
-  // Prediction throttle — pellet eating, ejected eating, virus pops, and
-  // cell-vs-cell are all O(local × remote) loops. At 60 / 120 Hz they
-  // dominate the per-frame budget for no perceptible gain (server confirms
-  // these events every 33 ms anyway). Running them at 30 Hz cuts the
-  // prediction CPU cost in half while still leading the server by 1 tick.
+  // Prediction throttle — eating predictions (pellet, ejected) MUST run
+  // every frame because they gate visible feedback: a missed collision in
+  // a single 16 ms frame = "the dot's under my cell but it isn't being
+  // eaten". The heavier topology-changing predictions (virus pop, cell-
+  // vs-cell) can safely run at 30 Hz — collision radii for those are 5–
+  // 10× larger so a 33 ms skip never misses a hit.
   int _predictFrameCounter = 0;
   /// Drive simulation + interpolation + input send. Call from the screen's
   /// per-frame ticker.
   void tick(double dt) {
     if (dt <= 0) return;
+
+    final nowMsFrame = DateTime.now().millisecondsSinceEpoch;
+    // Open a NEW frame record FIRST so doSplit / doEject called between
+    // ticks can tag it. The split / eject button taps that fire on this
+    // frame will be appended to this record before it is closed.
+    _frameHistory.add(_FrameInput(
+      stampMs: nowMsFrame,
+      dt: dt,
+      moveDir: _moveDir,
+      attack: _attackMode,
+      lastDir: _lastDir,
+    ));
+    if (_frameHistory.length > _frameHistoryMaxLen) {
+      _frameHistory.removeAt(0);
+    }
 
     // 1. Local sim step (movement, cohesion, separation, integrate, eject,
     //    merge, auto-split cap). Mirrors Offline Classic 1:1. This MUST
@@ -435,21 +482,18 @@ class V2Controller extends ChangeNotifier {
     //    camera follows; throttling it would visibly cap the input rate.
     sim.step(dt, world: world);
 
-    // Prediction passes run on alternating frames. At 60 fps that's 30 Hz,
-    // which matches the server tick. At 120 fps it's 60 Hz which is still
-    // ahead of the server. Pellet eating runs every frame because a missed
-    // pellet contact is immediately visible (the dot stays under the cell).
+    // Eating predictions run EVERY frame so a fast cell never passes over
+    // food without consuming it.
     _predictPelletEating();
+    _predictEjectedEating();
+    _expireLocalEjected();
+
+    // Heavy topology predictions alternate frames (≈ 30 Hz on a 60 Hz
+    // device).
     final runHeavy = (_predictFrameCounter++ & 1) == 0;
     if (runHeavy) {
-      _predictEjectedEating();
-      _expireLocalEjected();
       _predictVirusPops();
       _predictCellEating();
-    } else {
-      // Even on the "off" frame, keep local-ejected lifetime accurate so
-      // they expire on schedule even if we skip the eating pass.
-      _expireLocalEjected();
     }
 
     // 6. Snapshot-buffer interpolation for every remote entity. Render time
@@ -459,7 +503,9 @@ class V2Controller extends ChangeNotifier {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     world.tickRender(nowMs);
 
-    // 7. Throttled input send to the server.
+    // 7. Throttled input send to the server. Stamp the resulting seq so
+    //    when the server's snapshot acks this seq we know which frame to
+    //    rewind to for input replay.
     if (nowMs - _lastInputSendMs >= _inputIntervalMs) {
       _lastInputSendMs = nowMs;
       if (client.isConnected) {
@@ -468,6 +514,7 @@ class V2Controller extends ChangeNotifier {
           dy: _moveDir.dy,
           attack: _attackMode,
         );
+        _seqStampMs[client.lastSentSeq] = nowMs;
       }
     }
 
@@ -562,22 +609,34 @@ class V2Controller extends ChangeNotifier {
       sim.localEjected.removeWhere((e) => localToRemove.contains(e));
     }
 
-    // ── server-broadcast ejected (other players' feed) ──
-    // Only predict eating ENEMY feed locally. Our own feed is server-
-    // authoritative: the local cell sits ahead of the server cell, so a
-    // local "I caught my own feed" prediction routinely runs ahead of the
-    // server and silently wipes feed that the server still has alive — the
-    // visible symptom is "my feed pieces vanished for no reason". Letting
-    // the server's rmEjected drive the removal of own feed eliminates the
-    // false positive entirely while staying responsive for enemy feed.
+    // ── server-broadcast ejected (every piece — own and enemy) ──
+    // Predict eating for BOTH enemy and own server-side feed. The previous
+    // skip-own logic was meant to prevent the "feed disappears" false
+    // positive, but it produced the opposite problem the player ran into:
+    // once the FIFO match handed a local piece off to its server twin, the
+    // player could no longer eat their own feed at all until the server
+    // round-trip confirmed it. Now we keep an `addedAt` gate per piece —
+    // server pieces that are < 250 ms old (still in the "flight from the
+    // owner's cell" window) are NOT eligible for own-eating; older pieces
+    // are. This mirrors the server's EJECT_OWNER_IMMUNITY_MS but adds a
+    // little extra slack for the 110 ms interp delay.
     final serverToRemove = <String>[];
     for (final c in sim.cells) {
       if (c.mass < 22) continue;
       for (final e in world.ejected.values) {
-        if (e.ownerId == selfId) continue;
+        final isOwn = e.ownerId == selfId;
+        if (isOwn) {
+          // Skip while still in owner-immunity window — match server.
+          if (nowMs - e.addedAt < 250) continue;
+        }
         final eatR = c.radius + ejectedRadius;
-        final dx = e.renderX - c.position.dx;
-        final dy = e.renderY - c.position.dy;
+        // Use targetX/Y for own feed (we know exactly where the server has
+        // it and we are sitting ahead, so a near-now check is correct) and
+        // renderX/Y for enemy feed (player aims at what they see).
+        final ex = isOwn ? e.targetX : e.renderX;
+        final ey = isOwn ? e.targetY : e.renderY;
+        final dx = ex - c.position.dx;
+        final dy = ey - c.position.dy;
         if (dx * dx + dy * dy < eatR * eatR) {
           if (c.mass < GameConstants.maxCellMass) {
             c.mass += GameConstants.ejectConsumedMass;
@@ -815,78 +874,99 @@ class V2Controller extends ChangeNotifier {
     }
     _countMismatchTicks = 0;
 
-    // Same cell count — pair each local cell with its NEAREST server cell
-    // (capped to a reasonable radius) instead of by mass index. Mass-index
-    // pairing fights split/merge cycles when two new cells start with the
-    // same mass at very different positions.
-    final usedServer = <V2WorldCell>{};
-    for (final l in sim.cells) {
-      V2WorldCell? best;
-      double bestD2 = double.infinity;
-      for (final r in serverCells) {
-        if (usedServer.contains(r)) continue;
-        final dx = r.targetX - l.position.dx;
-        final dy = r.targetY - l.position.dy;
-        final d2 = dx * dx + dy * dy;
-        if (d2 < bestD2) {
-          bestD2 = d2;
-          best = r;
-        }
-      }
-      if (best == null) continue;
-      usedServer.add(best);
-      // Don't pull across long distances — pairing is likely wrong if the
-      // match is more than 400 u away (a split cell can drift faster than
-      // that legitimately, so this guards against bad pairings only).
-      final d = math.sqrt(bestD2);
-      if (d > 400) continue;
+    // ─────────────────────── input-replay reconciliation ───────────────
+    // Cell counts match. Instead of blending positions toward the server
+    // sample (which always lags by RTT/2), we:
+    //   1. Rebuild the local cells *from* the server sample (authoritative
+    //      position, mass, mergeReadyAt, freshSplit — everything).
+    //   2. Replay every per-frame input recorded since the seq the server
+    //      just ack'd. After replay, the local sim is exactly where the
+    //      player's inputs would have driven it had the server been
+    //      infinitely fast.
+    // This is the same loop Source-engine / agar.io use: no perpetual tug,
+    // no rubber-band, no dead-zone tuning. The only visible discrepancy
+    // is during the first RTT after a fresh divergence (rare).
+    _replayFromServer(s, serverCells);
+  }
 
-      final dx = best.targetX - l.position.dx;
-      final dy = best.targetY - l.position.dy;
-      final massDelta = best.targetMass - l.mass;
+  /// Replay all frames recorded since `ackSeq` was sent. Mutates
+  /// `sim.player.cells` in place: starts from the server-authoritative
+  /// rebuild, then re-applies every recorded movement / split / eject so
+  /// the local sim ends up at its "current predicted" state.
+  void _replayFromServer(V2State s, List<V2WorldCell> serverCells) {
+    // Cap the ack-time lookup. If we don't have a stamp (very early
+    // session) replay from the head of the buffer.
+    final ackStamp = _seqStampMs[s.ackSeq];
 
-      // Tiny drift: ignore — local sim is matching the server. Wide dead
-      // zone (was 22 u) because steady RTT drift sits around 25-40 u on a
-      // typical mobile link, and any reconcile inside that band creates a
-      // perpetual ~1 u camera tug at 30 Hz that the eye reads as wobble.
-      // The local cell is the only thing the player aims with anyway, so
-      // a 40 u local-vs-server gap is invisible until the player stops.
-      if (d < 40 && massDelta.abs() < l.mass * 0.04) continue;
-
-      // Medium drift: blend position GENTLY (~ 3 % per snapshot, half-life
-      // ~ 1 s) and let mass catch up moderately. Anything above this we
-      // count as "real divergence" and fall through to the hard snap.
-      if (d < 280 && massDelta.abs() < l.mass * 0.15) {
-        l.position = Offset(
-          l.position.dx + dx * 0.03,
-          l.position.dy + dy * 0.03,
-        );
-        l.mass += massDelta * 0.30;
-        continue;
-      }
-
-      // Large drift: snap hard — prediction is meaningfully wrong.
-      l.position = Offset(
-        l.position.dx + dx * 0.55,
-        l.position.dy + dy * 0.55,
+    // Drop locally-ejected feed that was spawned AFTER the server-ack
+    // timestamp. Replay below will re-fire the corresponding doEject calls
+    // and re-create them — without this, the original local pieces plus
+    // the replay-spawned pieces would double-render until the FIFO match
+    // drains them.
+    if (ackStamp != null && sim.localEjected.isNotEmpty) {
+      sim.localEjected.removeWhere(
+        (e) => e.spawnTime.millisecondsSinceEpoch > ackStamp,
       );
-      l.mass += massDelta * 0.90;
     }
 
-    // Total-mass correction: if local total diverges >8% from server-reported
-    // mass, scale all cells proportionally. This catches accumulated pellet-
-    // eating divergence that per-cell blending is too slow to close alone.
+    // Rebuild local cells from the server snapshot. This blows away any
+    // local prediction state — it's about to be re-derived from the input
+    // history below.
+    _rebuildLocalFromServer(serverCells);
+
+    // Find the first frame the server has NOT seen yet.
+    int startIdx = 0;
+    if (ackStamp != null) {
+      while (startIdx < _frameHistory.length &&
+          _frameHistory[startIdx].stampMs <= ackStamp) {
+        startIdx++;
+      }
+    }
+
+    // Walk forward through unacknowledged frames re-running the sim with
+    // the recorded inputs so the cell ends up where the player visually
+    // expects, not 1 RTT behind.
+    for (int i = startIdx; i < _frameHistory.length; i++) {
+      final f = _frameHistory[i];
+      sim.moveDir = f.moveDir;
+      sim.lastNonZeroDir = f.lastDir;
+      sim.attackMode = f.attack;
+      if (f.splitFired) {
+        sim.doSplit(f.splitAim);
+      }
+      if (f.ejectBurst > 0) {
+        // doEject also re-spawns the local pieces we just culled above.
+        // Mass deduction + recoil are intentionally re-applied since the
+        // rebuilt cells started from the SERVER's pre-eject mass.
+        sim.doEject(f.ejectAim);
+      }
+      sim.step(f.dt, world: world, replay: true);
+    }
+
+    // After replay, restore the controller's current input to the live
+    // values (the loop above scrubbed them while walking history).
+    sim.moveDir = _moveDir;
+    sim.lastNonZeroDir = _lastDir;
+    sim.attackMode = _attackMode;
+
+    // Total-mass correction kept as a safety net for pellet eating, which
+    // is purely a client-side prediction and can drift. Pellet eats are
+    // not part of the input record so replay can't recover them.
     if (s.self.mass > 0 && sim.cells.isNotEmpty) {
       final localTotal = sim.cells.fold(0.0, (acc, c) => acc + c.mass);
       final serverTotal = s.self.mass;
       final drift = (serverTotal - localTotal).abs();
-      if (drift > localTotal * 0.08 && localTotal > 0) {
+      if (drift > localTotal * 0.10 && localTotal > 0) {
         final scale = serverTotal / localTotal;
         for (final c in sim.cells) {
           c.mass = (c.mass * scale).clamp(1.0, GameConstants.maxCellMass);
         }
       }
     }
+
+    // Trim the seq-stamp map of entries the server has already ack'd —
+    // we'll never need to rewind to those again.
+    _seqStampMs.removeWhere((seq, _) => seq <= s.ackSeq);
   }
 
   void _rebuildLocalFromServer(List<V2WorldCell> serverCells) {
@@ -930,7 +1010,7 @@ class V2Controller extends ChangeNotifier {
         }
       }
 
-      fresh.add(ge.Cell(
+      final cell = ge.Cell(
         id: s.id,
         ownerId: s.ownerId,
         position: Offset(s.targetX, s.targetY),
@@ -943,7 +1023,16 @@ class V2Controller extends ChangeNotifier {
         // stop the frame we rebuild it.
         velocity: donor?.velocity ?? Offset.zero,
         splitImpulse: donor?.splitImpulse ?? Offset.zero,
-      ));
+      );
+      // Preserve visual animation state across the rebuild — bumps decay
+      // smoothly from collisions and wobblePhase drives the jelly idle
+      // animation. Without preserving them the cell would visually
+      // "snap" back to a perfect disc every 33 ms.
+      if (donor != null) {
+        cell.bumps.addAll(donor.bumps);
+        cell.wobblePhase = donor.wobblePhase;
+      }
+      fresh.add(cell);
     }
     sim.player.cells
       ..clear()
@@ -964,7 +1053,34 @@ class V2Controller extends ChangeNotifier {
 }
 
 class _PendingAction {
-  _PendingAction(this.seq, this.kind);
+  _PendingAction(this.seq, this.kind, this.stampMs, this.aim);
   final int seq;
-  final String kind;
+  final String kind; // 'split' | 'eject'
+  final int stampMs;
+  final Offset aim;
+}
+
+/// One frame's worth of input + simulation parameters. Replaying these in
+/// order from the server-confirmed cell state reproduces the local sim's
+/// current state — that's what gives the player zero-lag prediction
+/// without rubber-banding when the server's view differs.
+class _FrameInput {
+  _FrameInput({
+    required this.stampMs,
+    required this.dt,
+    required this.moveDir,
+    required this.attack,
+    required this.lastDir,
+  });
+  final int stampMs;
+  final double dt;
+  final Offset moveDir;
+  final bool attack;
+  final Offset lastDir;
+  // Discrete actions fired DURING this frame (set immediately when
+  // doSplit / doEject runs, before the frame record is closed).
+  bool splitFired = false;
+  Offset splitAim = Offset.zero;
+  int ejectBurst = 0;
+  Offset ejectAim = Offset.zero;
 }

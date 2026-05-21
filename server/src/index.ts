@@ -51,14 +51,13 @@ import { WebSocketServer, WebSocket } from "ws";
 const PORT = Number(process.env.PORT ?? 2567);
 
 const WORLD_SIZE = 14142;
-const TARGET_PELLETS = 6500;            // was 8000 — saves ~20 % broadcast bytes
-const TARGET_VIRUSES = 25;              // was 30
-// Hard-tuned for a Lightsail 1-vCPU host. Previous 50 routinely pushed past
-// the 26 ms tick budget once 3+ humans connected (snapshot build is roughly
-// O(humans × visible_bot_cells)). At 35 we leave ~40 % headroom even with
-// 8 concurrent humans, which is what kills the stutter the client sees as
-// "snapshots arrive in bursts then 80 ms gaps".
-const TARGET_BOTS = 35;
+const TARGET_PELLETS = 7500;
+const TARGET_VIRUSES = 30;
+// Tuned for a Lightsail 2-vCPU host. With ~50 ms of CPU budget across both
+// cores per tick, 50 bots + 8 humans fits well within the 26 ms wall-clock
+// budget (Node is single-thread, but the OS scheduling on the second core
+// keeps the WS i/o & GC out of the tick path).
+const TARGET_BOTS = 50;
 
 const MAX_CELLS_PER_PLAYER = 16;
 const MAX_CELL_MASS = 22500;
@@ -132,10 +131,11 @@ const TICK_MS = 1000 / TICK_RATE;
 const TICK_BUDGET_MS = TICK_MS * 0.8;   // warn when >80 % of budget used
 const SLOW_TICK_EVERY = 4;              // 7.5 Hz pellet refresh
 const VIEWPORT_RADIUS = 2200;
-// Entities outside this multiple of VIEWPORT_RADIUS are NOT sent. Was 1.3
-// which sent a lot of off-screen junk; 1.08 keeps a one-cell margin for
-// scroll smoothing but cuts ~30 % of payload in dense areas.
-const VIEWPORT_SEND_MULT = 1.08;
+// Entities outside this multiple of VIEWPORT_RADIUS are NOT sent. 1.15
+// gives a comfortable scroll margin so entities don't pop into view at the
+// viewport edge, while still cutting ~20 % of the payload vs. the legacy
+// 1.3 oversend. The 2-vCPU host can comfortably handle this.
+const VIEWPORT_SEND_MULT = 1.15;
 const LEADERBOARD_SIZE = 10;
 const STALE_PLAYER_MS = 20000;
 const EJECT_OWNER_IMMUNITY_MS = 200;

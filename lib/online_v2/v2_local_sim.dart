@@ -132,7 +132,14 @@ class V2LocalSim {
 
   /// One simulation step. Mirrors the offline engine sequence for the local
   /// player only — no bot AI, no global collision pass, no pellet spawner.
-  void step(double dt, {V2World? world}) {
+  ///
+  /// [replay] tells the step it's being re-run inside the controller's
+  /// input-replay reconciliation pass. In replay we must NOT re-integrate
+  /// local ejected mass (it was already advanced to the current wall-clock
+  /// time during the original real-time tick — replaying it would over-
+  /// advance it by the entire replay window), and we skip the auto-split
+  /// enforcement (it's already been applied historically).
+  void step(double dt, {V2World? world, bool replay = false}) {
     if (!_initialized || player.isDead || dt <= 0) return;
     engine.elapsed += dt;
 
@@ -149,12 +156,17 @@ class V2LocalSim {
     );
     _integrate(player, dt);
 
-    // No feed magnet — Desktop reference behaviour. Server's updateEjected
-    // runs friction-only, so client must do the same to stay in sync.
-    _eject.update(dt, enableMagnet: false);
+    if (!replay) {
+      // No feed magnet — Desktop reference behaviour. Server's
+      // updateEjected runs friction-only, so client must do the same to
+      // stay in sync.
+      _eject.update(dt, enableMagnet: false);
+    }
 
     _merge.processMerges(player);
-    _split.enforceAutoSplit(player);
+    if (!replay) {
+      _split.enforceAutoSplit(player);
+    }
   }
 
   // NOTE: pellet magnet is still off both client and server — it cost the
