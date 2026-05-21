@@ -859,18 +859,34 @@ class V2Controller extends ChangeNotifier {
       _rebuildLocalFromServer(serverCells);
     }
 
-    // Mass-scale correction stays — pellet eating accumulates tiny
-    // prediction errors that mass-aware physics (max-speed clamp) needs
-    // the server view to correct. Bumped threshold to 12 % because we no
-    // longer do per-cell mass correction on every snapshot.
+    // Mass-scale correction is ONE-WAY: we scale UP when the server has
+    // more mass than we do (we missed an eat — pellet or feed contact the
+    // local prediction didn't catch) but we DO NOT scale down for any
+    // amount of local over-prediction less than a runaway-bug threshold.
+    // Scaling down would silently undo locally predicted own-feed eats
+    // during the ~ 1 RTT window before the server has mirrored them, and
+    // the path divergence between the client's random RNG and the
+    // server's path means the server may NEVER mirror them — the player
+    // would see their cell shrink without explanation.
     if (s.self.mass > 0 && sim.cells.isNotEmpty) {
       final localTotal = sim.cells.fold(0.0, (acc, c) => acc + c.mass);
       final serverTotal = s.self.mass;
-      final drift = (serverTotal - localTotal).abs();
-      if (drift > localTotal * 0.12 && localTotal > 0) {
-        final scale = serverTotal / localTotal;
-        for (final c in sim.cells) {
-          c.mass = (c.mass * scale).clamp(1.0, GameConstants.maxCellMass);
+      if (localTotal > 0) {
+        final drift = serverTotal - localTotal;
+        if (drift > localTotal * 0.05) {
+          // Local is BEHIND server — missed an eat. Scale up.
+          final scale = serverTotal / localTotal;
+          for (final c in sim.cells) {
+            c.mass = (c.mass * scale).clamp(1.0, GameConstants.maxCellMass);
+          }
+        } else if (drift < -localTotal * 0.50) {
+          // Local has predicted 50 %+ more mass than the server. This is
+          // almost certainly a real bug (we ate phantom food) — pull
+          // back to authoritative server view.
+          final scale = serverTotal / localTotal;
+          for (final c in sim.cells) {
+            c.mass = (c.mass * scale).clamp(1.0, GameConstants.maxCellMass);
+          }
         }
       }
     }
