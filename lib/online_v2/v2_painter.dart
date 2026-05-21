@@ -210,33 +210,44 @@ class V2Painter extends CustomPainter {
   }
 
   static const double _ejectedRadius = 20.34; // sqrt(13/pi)*10 — eject mass=13
-  // Two reusable paints — keep allocations off the hot path. The colours
-  // are written per-call.
-  static final Paint _ejectedHalo = Paint();
+  // Single border paint, allocated once. Halo layer removed — at micro
+  // feed the 1.3× translucent halo on each piece created massive overdraw
+  // (pieces cluster near the cell via magnet, alphas pile up to fully
+  // opaque, the resulting smear reads as a "glitch zone"). Solid fill +
+  // dark hue-matched rim still gives a clean neon look without the chaos.
   static final Paint _ejectedBorder = Paint()..style = PaintingStyle.stroke;
-  void _drawEjectedCircle(Canvas canvas, Offset pos, double r, Color color) {
-    // Layered "neon stone" look:
-    //   1. Outer halo — same hue, low alpha, wider radius. Reads as a
-    //      glow without needing a real blur (which is GPU-expensive).
-    //   2. Main fill — fully saturated neon colour.
-    //   3. Rim — same hue, darkened, thin stroke. Defines the silhouette
-    //      against the background without the previous "dirty grey" tint.
-    _ejectedHalo
-      ..shader = null
-      ..color = color.withValues(alpha: 0.35);
-    canvas.drawCircle(pos, r * 1.30, _ejectedHalo);
+  // HSL → darken → toColor is ~ 1 μs per call but at micro-feed peak
+  // (1000s of pieces per frame) the cumulative cost is enough to drop
+  // frames on mid-tier mobile. Pieces share a small palette of colours
+  // (cell tints + per-player skin colour) so memoising the rim colour by
+  // the source color value drops the painter's per-frame HSL conversions
+  // from O(pieces) to O(distinct-colours-ever-seen) — typically < 20.
+  static final Map<int, Color> _rimColorCache = <int, Color>{};
+  static const int _rimCacheMax = 64;
+  static Color _rimFor(Color color) {
+    final key = color.toARGB32();
+    final cached = _rimColorCache[key];
+    if (cached != null) return cached;
+    final hsl = HSLColor.fromColor(color);
+    final rim = hsl
+        .withLightness((hsl.lightness * 0.55).clamp(0.0, 1.0))
+        .toColor();
+    if (_rimColorCache.length >= _rimCacheMax) _rimColorCache.clear();
+    _rimColorCache[key] = rim;
+    return rim;
+  }
 
+  void _drawEjectedCircle(Canvas canvas, Offset pos, double r, Color color) {
+    // Two layers:
+    //   1. Solid fill — saturated neon colour.
+    //   2. Dark hue-matched rim — defines the silhouette.
     _ejectedPaint
       ..shader = null
       ..color = color;
     canvas.drawCircle(pos, r, _ejectedPaint);
 
-    final hsl = HSLColor.fromColor(color);
-    final rim = hsl
-        .withLightness((hsl.lightness * 0.55).clamp(0.0, 1.0))
-        .toColor();
     _ejectedBorder
-      ..color = rim
+      ..color = _rimFor(color)
       ..strokeWidth = math.max(1.2, r * 0.10);
     canvas.drawCircle(pos, r - _ejectedBorder.strokeWidth * 0.5, _ejectedBorder);
   }
@@ -510,9 +521,12 @@ class V2Painter extends CustomPainter {
       Offset(pos.dx - tp.width / 2, pos.dy - tp.height / 2 - fontSize * 0.4),
     );
     if (screenR < 24 || !GameSettings.instance.showMassLabels) return;
-    // Bucket mass to nearest 10 — a 320 → 330 → 340 transition is what the
-    // player sees anyway, and it gives 90 %+ cache hit-rate across frames.
-    final massBucket = (mass / 10).round() * 10;
+    // Bucket mass to nearest 100. Was 10 — at micro feed the ± 13-mass
+    // per-eject churn made the label flip every frame between two
+    // adjacent buckets (e.g. "5000" ↔ "4990"), reading as a glitch.
+    // 100-step bucketing eats those small oscillations and only updates
+    // when the player has genuinely gained/lost ≥ 50 mass.
+    final massBucket = ((mass + 50) / 100).floor() * 100;
     final mp = _label(massBucket.toString(), fontSize * 0.7, bold: false);
     mp.paint(
       canvas,
