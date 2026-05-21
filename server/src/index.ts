@@ -392,7 +392,11 @@ function spawnVirus(): Virus {
 
 function spawnCellForPlayer(p: Player): void {
   const pos = safeSpawnPos();
-  const mult = p.isBot ? 1.0 : clamp(p.massMult, 0.5, 10.0);
+  // Honour the wider clamp range the join handler accepts (matches dev /
+  // test scenarios where a player wants to spawn at ~ 5 K mass). The
+  // 300× upper bound caps spawn mass at ~ 22 800, just under the engine
+  // MAX_CELL_MASS so the cell doesn't trip the auto-split limit on spawn.
+  const mult = p.isBot ? 1.0 : clamp(p.massMult, 0.5, 300.0);
   const startMass = p.isBot ? 100 : Math.round(76 * mult);
   p.cells = [{
     id: newId("c"),

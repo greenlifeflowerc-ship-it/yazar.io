@@ -44,11 +44,14 @@ class V2Controller extends ChangeNotifier {
   final V2LocalSim sim = V2LocalSim();
   final V2SkinCache skinCache = V2SkinCache();
 
-  /// Hard cap on how many local pieces we keep alive simultaneously. With
-  /// the 50 ms eject timer floor and ~80 ms RTT, we expect ≤ 8 pending at a
-  /// time. 64 is a comfortable ceiling so unbounded growth can't happen
-  /// even if the server stops broadcasting (extremely degraded link).
-  static const _localEjectedHardCap = 64;
+  /// Hard cap on how many local pieces we keep alive simultaneously.
+  /// Set high because the player needs to be able to come back and eat
+  /// pieces they fed minutes ago. Was 64 — too aggressive: at micro feed
+  /// rate (~ 60 pieces / sec) the cap drained pieces faster than the
+  /// player could circle back to consume them. 256 covers ~ 4 seconds of
+  /// max-rate micro before the oldest start to drop, which is far more
+  /// than anyone naturally fires before chasing their own feed.
+  static const _localEjectedHardCap = 256;
   /// Local prediction window for virus pops, used to suppress accidental
   /// re-pop of the same virus across two ticks before the server confirms.
   final Set<String> _locallyPoppedViruses = {};
@@ -530,12 +533,21 @@ class V2Controller extends ChangeNotifier {
     // ── local-only ejected (our own feed) ──
     final localToRemove = <EjectedMass>[];
     // Check if MY cells eat MY local feed.
+    //   • 200 ms post-spawn immunity — same as offline / server.
+    //   • In-flight skip — pieces still travelling at > 80 u/s are
+    //     considered "en route" and not eligible for re-absorb. Stops
+    //     huge cells (after dev-mass spawn or big splits) from sucking
+    //     in their own feed mid-air just because their eat-radius
+    //     overlaps the piece while it's still flying away from them.
+    //     Friction takes pieces below the 80 u/s gate in ~ 500 ms, after
+    //     which the player can deliberately come back and catch them.
     for (final c in sim.cells) {
       if (c.mass < 22) continue;
       for (final e in sim.localEjected) {
         if (localToRemove.contains(e)) continue;
         final age = nowMs - e.spawnTime.millisecondsSinceEpoch;
         if (e.ownerId == c.ownerId && age < 200) continue;
+        if (e.velocity.distance > 80) continue;
         final eatR = c.radius + e.radius;
         final dx = e.position.dx - c.position.dx;
         final dy = e.position.dy - c.position.dy;
@@ -548,13 +560,23 @@ class V2Controller extends ChangeNotifier {
       }
     }
     // Check if OTHER players' cells eat MY local feed.
+    // Use the SERVER-STYLE strict overlap (`r - er * 0.4`, piece center
+    // must be > 50 % inside enemy cell) — NOT the lenient touch-circles
+    // rule we use for our own cells. Enemy positions come from the
+    // 110 ms-delayed render interpolation, so a lenient rule fires the
+    // moment the enemy's rendered shape just kisses a piece — which
+    // produces the "feed disappears glitch" the player sees when an
+    // enemy flies past without actually eating anything. The strict
+    // rule fires only when the piece is unambiguously inside the
+    // enemy's body, matching what the server's collision pass thinks.
     for (final c in world.cells.values) {
-      if (c.isSelf) continue; // skipped, we use sim.cells above
+      if (c.isSelf) continue;
       if (c.targetMass < 22) continue;
       final cRadius = c.renderRadius;
       for (final e in sim.localEjected) {
         if (localToRemove.contains(e)) continue;
-        final eatR = cRadius + e.radius;
+        final eatR = cRadius - e.radius * 0.4;
+        if (eatR <= 0) continue;
         final dx = e.position.dx - c.renderX;
         final dy = e.position.dy - c.renderY;
         if (dx * dx + dy * dy < eatR * eatR) {
