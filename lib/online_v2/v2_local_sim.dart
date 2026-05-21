@@ -161,10 +161,12 @@ class V2LocalSim {
     _integrate(player, dt);
 
     if (!replay) {
-      // No feed magnet — Desktop reference behaviour. Server's
-      // updateEjected runs friction-only, so client must do the same to
-      // stay in sync.
-      _eject.update(dt, enableMagnet: false);
+      // Feed magnet ON — matches Offline Classic exactly. Pieces within
+      // ~150 u of any of the player's cells get pulled back so most of
+      // a micro burst is recovered as it slows. The server runs the
+      // same magnet logic in `updateEjected` so the two views agree on
+      // where each piece ends up.
+      _eject.update(dt, enableMagnet: true);
     }
 
     _merge.processMerges(player);

@@ -813,6 +813,23 @@ function updateEjected(dt: number): void {
   const dt60 = dt * 60;
   for (const e of ejected.values()) {
     if (e.vx === 0 && e.vy === 0) continue;
+    // Feed magnet — pulls pieces toward nearby cells within 150 u so
+    // ejected mass tends to flow back into the player after slowing.
+    // Mirrors the client's offline EjectHandler magnet so server and
+    // client agree on where each piece ends up over its flight. Without
+    // this, ~50 % of a micro burst sat on the ground stranded, which
+    // the player perceived as "half my ejected mass vanished".
+    let magVx = 0, magVy = 0;
+    cellGrid.queryEach(e.x, e.y, 150, (c) => {
+      const dx = c.x - e.x, dy = c.y - e.y;
+      const d = Math.hypot(dx, dy);
+      if (d < 10 || d > 150) return;
+      const strength = (1 - d / 150) * 800;
+      magVx += (dx / d) * strength;
+      magVy += (dy / d) * strength;
+    });
+    e.vx += magVx * dt;
+    e.vy += magVy * dt;
     // Per-piece friction so each owner's pieces honour that owner's
     // ejectSpeedMult / ejectDistMult tuning. The math matches the
     // client EjectHandler.update exactly.
