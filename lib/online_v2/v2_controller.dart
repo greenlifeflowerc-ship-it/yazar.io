@@ -44,15 +44,6 @@ class V2Controller extends ChangeNotifier {
   final V2LocalSim sim = V2LocalSim();
   final V2SkinCache skinCache = V2SkinCache();
 
-  /// Safety net only: local ejected pieces normally live until the server
-  /// FIFO-matches them via `addEjected`, at which point we transfer their
-  /// render position to the server piece and drop the local copy. This
-  /// timeout only matters when the server never confirms (rare: server
-  /// rejected the eject because mass dropped below threshold, or the
-  /// packet was lost). Generous 2 s window so the feed never visually
-  /// "blinks" out on a momentary network hiccup — agar.io mobile parity:
-  /// feed only disappears when something physically eats it.
-  static const _localEjectedLifetimeMs = 2000;
   /// Hard cap on how many local pieces we keep alive simultaneously. With
   /// the 50 ms eject timer floor and ~80 ms RTT, we expect ≤ 8 pending at a
   /// time. 64 is a comfortable ceiling so unbounded growth can't happen
@@ -194,10 +185,17 @@ class V2Controller extends ChangeNotifier {
       client.pongs.listen(_onPong),
       client.stateChanges.listen(_onConnStateChanged),
     ];
+    final gs = GameSettings.instance;
     await client.connect(
       playerName: _playerName,
       skin: skin,
       massMultiplier: massMultiplier,
+      // Forward the player's eject tuning so the server-side physics
+      // mirror the local sim — without this the server's copy of our
+      // feed flies at the default speed/distance and visually drifts
+      // away from the local rendering.
+      ejectSpeedMultiplier: gs.ejectSpeedMultiplier,
+      ejectDistanceMultiplier: gs.ejectDistanceMultiplier,
     );
   }
 
@@ -288,49 +286,22 @@ class V2Controller extends ChangeNotifier {
       });
     }
 
-    final selfId = _playerId;
-    final inheritedRenderPos = <String, Offset>{};
-    if (selfId != null && s.addEjected.isNotEmpty && sim.localEjected.isNotEmpty) {
-      final ownAdds = <V2AddEjected>[];
-      for (final e in s.addEjected) {
-        if (e.ownerId == selfId) ownAdds.add(e);
-      }
-      if (ownAdds.isNotEmpty) {
-        final toDrop = ownAdds.length > sim.localEjected.length
-            ? sim.localEjected.length
-            : ownAdds.length;
-        for (int i = 0; i < toDrop; i++) {
-          inheritedRenderPos[ownAdds[i].id] = sim.localEjected[i].position;
-        }
-        sim.localEjected.removeRange(0, toDrop);
-      }
-    }
-
+    // Own ejected feed is rendered OFFLINE-STYLE from sim.localEjected for
+    // the whole flight. The server still mirrors our pieces (so other
+    // players see them) but we DO NOT FIFO-match local↔server, we DO NOT
+    // seed render positions, and the painter SKIPS world.ejected entries
+    // where ownerId == selfId. Reasoning:
+    //   • Server RNG ≠ client RNG, so the server's piece flies on a
+    //     slightly different path/speed. The handoff used to look like
+    //     a tiny stutter every snapshot.
+    //   • The 110 ms snapshot interp delay made the server copy lag
+    //     behind the local one, producing a visible "speed-brake" the
+    //     moment FIFO match swapped them.
+    //   • All consumption (cell eats own feed, enemy eats own feed,
+    //     virus eats own feed) is detected locally against
+    //     sim.localEjected, so the local copy is authoritative for the
+    //     owner's view.
     world.applySnapshot(s);
-
-    // Seed the snapshot interp so the visual continues from where the local
-    // piece was instead of teleporting to the server's spawn location. We
-    // overwrite BOTH `prev` AND `render` to the inherited position, then
-    // bump `prevRecvAt` ~100 ms into the past so the interp will spend that
-    // time converging from the inherited spot toward the server target.
-    // (Without the prev rewrite, tickInterp would compute t = 1 immediately
-    // because span == 0 — visible as a one-frame teleport.)
-    if (inheritedRenderPos.isNotEmpty) {
-      final nowMs = DateTime.now().millisecondsSinceEpoch;
-      for (final entry in inheritedRenderPos.entries) {
-        final w = world.ejected[entry.key];
-        if (w != null) {
-          w.renderX = entry.value.dx;
-          w.renderY = entry.value.dy;
-          w.prevX = entry.value.dx;
-          w.prevY = entry.value.dy;
-          // 110 ms is the default interp delay — matches world.interpDelayMs
-          // so the piece is rendered at the inherited position for one full
-          // interp window, then converges to the server's path.
-          w.prevRecvAt = nowMs - 110;
-        }
-      }
-    }
     _online = s.online;
     leaderboard = s.leaderboard;
 
@@ -609,34 +580,19 @@ class V2Controller extends ChangeNotifier {
       sim.localEjected.removeWhere((e) => localToRemove.contains(e));
     }
 
-    // ── server-broadcast ejected (every piece — own and enemy) ──
-    // Predict eating for BOTH enemy and own server-side feed. The previous
-    // skip-own logic was meant to prevent the "feed disappears" false
-    // positive, but it produced the opposite problem the player ran into:
-    // once the FIFO match handed a local piece off to its server twin, the
-    // player could no longer eat their own feed at all until the server
-    // round-trip confirmed it. Now we keep an `addedAt` gate per piece —
-    // server pieces that are < 250 ms old (still in the "flight from the
-    // owner's cell" window) are NOT eligible for own-eating; older pieces
-    // are. This mirrors the server's EJECT_OWNER_IMMUNITY_MS but adds a
-    // little extra slack for the 110 ms interp delay.
+    // ── server-broadcast ejected (ENEMY feed only) ──
+    // Own pieces are rendered & consumed via sim.localEjected, so we skip
+    // them here entirely. Predict eating enemy feed against the RENDERED
+    // position (what the player sees) — the eat triggers the instant the
+    // cell visually overlaps the piece.
     final serverToRemove = <String>[];
     for (final c in sim.cells) {
       if (c.mass < 22) continue;
       for (final e in world.ejected.values) {
-        final isOwn = e.ownerId == selfId;
-        if (isOwn) {
-          // Skip while still in owner-immunity window — match server.
-          if (nowMs - e.addedAt < 250) continue;
-        }
+        if (e.ownerId == selfId) continue;
         final eatR = c.radius + ejectedRadius;
-        // Use targetX/Y for own feed (we know exactly where the server has
-        // it and we are sitting ahead, so a near-now check is correct) and
-        // renderX/Y for enemy feed (player aims at what they see).
-        final ex = isOwn ? e.targetX : e.renderX;
-        final ey = isOwn ? e.targetY : e.renderY;
-        final dx = ex - c.position.dx;
-        final dy = ey - c.position.dy;
+        final dx = e.renderX - c.position.dx;
+        final dy = e.renderY - c.position.dy;
         if (dx * dx + dy * dy < eatR * eatR) {
           if (c.mass < GameConstants.maxCellMass) {
             c.mass += GameConstants.ejectConsumedMass;
@@ -650,26 +606,13 @@ class V2Controller extends ChangeNotifier {
     }
   }
 
-  /// Local feed normally goes away via FIFO match in `_onSnapshot` once the
-  /// server broadcasts the equivalent `addEjected`. This is the safety net
-  /// for two cases:
-  ///   • Server rejected the eject (mass dropped below threshold mid-burst)
-  ///     so no `addEjected` will ever come. Without this, the local piece
-  ///     would render forever.
-  ///   • Network dropped the snapshot containing the match. RTT spike.
-  /// Either way 2 s is long enough that the eye won't see a "blink" — the
-  /// piece has long since landed and decayed to zero velocity.
-  ///
-  /// Also enforces the hard cap so a runaway eject loop (or a malicious
-  /// network condition) can't grow the list unbounded. We drop the OLDEST
-  /// pieces (those most likely already confirmed by server, just stuck in
-  /// the queue because they're un-FIFO-matched for some reason) — not the
-  /// newest, so the player keeps seeing their freshest feed on screen.
+  /// With the offline-style approach there is no time-based lifetime —
+  /// local pieces live until something physically consumes them (cell,
+  /// virus, enemy), exactly like Offline Classic. The hard cap is the
+  /// only safety net so a runaway feed loop can't grow the list
+  /// unbounded; we drop the OLDEST pieces (they've travelled the
+  /// furthest and are most likely already off-screen anyway).
   void _expireLocalEjected() {
-    if (sim.localEjected.isEmpty) return;
-    final nowMs = DateTime.now().millisecondsSinceEpoch;
-    sim.localEjected.removeWhere((e) =>
-        nowMs - e.spawnTime.millisecondsSinceEpoch > _localEjectedLifetimeMs);
     if (sim.localEjected.length > _localEjectedHardCap) {
       sim.localEjected.removeRange(
         0,

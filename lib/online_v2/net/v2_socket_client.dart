@@ -42,6 +42,8 @@ class V2SocketClient {
   String? _lastName;
   String _lastSkin = 'default';
   double _lastMassMult = 1.0;
+  double _lastEjectSpeedMult = 1.0;
+  double _lastEjectDistMult = 1.0;
 
   final _welcome = StreamController<V2Welcome>.broadcast();
   final _states = StreamController<V2State>.broadcast();
@@ -64,10 +66,17 @@ class V2SocketClient {
   }
 
   /// Open the socket and immediately send `join`. Idempotent.
+  /// Physics-relevant multipliers are sent along with `join` so the server
+  /// can produce eject pieces with the SAME speed and friction the client
+  /// sim uses. Without this the client's feed flies on a different path
+  /// from the server's copy and enemies appear to eat pieces before the
+  /// player visually sees the contact (the "fake position" complaint).
   Future<void> connect({
     required String playerName,
     String skin = 'default',
     double massMultiplier = 1.0,
+    double ejectSpeedMultiplier = 1.0,
+    double ejectDistanceMultiplier = 1.0,
   }) async {
     if (_disposed) return;
     _wantConnected = true;
@@ -75,6 +84,8 @@ class V2SocketClient {
     _lastName = playerName;
     _lastSkin = skin;
     _lastMassMult = massMultiplier;
+    _lastEjectSpeedMult = ejectSpeedMultiplier;
+    _lastEjectDistMult = ejectDistanceMultiplier;
     await _openOnce();
   }
 
@@ -98,6 +109,8 @@ class V2SocketClient {
         'name': _lastName ?? 'Player',
         'skin': _lastSkin,
         'massMult': _lastMassMult,
+        'ejectSpeedMult': _lastEjectSpeedMult,
+        'ejectDistMult': _lastEjectDistMult,
       });
       _pingTimer?.cancel();
       _pingTimer = Timer.periodic(const Duration(seconds: 1), (_) => sendPing());

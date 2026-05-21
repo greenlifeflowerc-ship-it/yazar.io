@@ -239,16 +239,20 @@ class V2WorldEjected {
   double get targetY => newY;
 
   void applyUpdate(double x, double y, int recvAtMs) {
-    prevX = newX;
-    prevY = newY;
+    // Anchor `prev` at the CURRENT render position, not at the old `new`.
+    // For most entities the two are identical (since render has already
+    // converged onto `new` by the time the next update arrives), but for
+    // ejected pieces that were FIFO-matched from a local prediction the
+    // render position was seeded to the inherited spot and is still
+    // mid-interpolation toward the server-add-position when the next
+    // update lands. Anchoring at renderX keeps the visible path smooth
+    // through the handoff instead of snapping to where the server thinks
+    // the piece spawned.
+    prevX = renderX;
+    prevY = renderY;
     prevRecvAt = newRecvAt;
     newX = x;
     newY = y;
-    // Guard against burst arrivals: if two snapshots land within < 16 ms of
-    // each other (TCP coalescing on a flaky link) the natural span shrinks
-    // to a few ms and the interp would complete instantly, producing a
-    // visible "jump-then-freeze" cycle. Spacing the receive time to one
-    // server tick interval keeps playback smooth.
     final minSpan = 28;
     final candidate = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
     newRecvAt = (candidate - prevRecvAt) < minSpan

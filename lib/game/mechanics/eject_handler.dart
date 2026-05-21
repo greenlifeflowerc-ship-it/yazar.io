@@ -19,7 +19,14 @@ class EjectHandler {
   /// nudged forward in 2-unit increments (max 30 iterations) until it's no
   /// longer inside any friendly cell — projectiles never spawn inside the
   /// player's own body.
-  void ejectPlayer(Player p, Offset aimDir, {double? multiplier}) {
+  ///
+  /// [deterministic] disables the ± 6 ° angular spread and ± 5 % speed
+  /// variance. Offline classic leaves the wobble on for visual texture,
+  /// but the online controller passes `true` so the local sim's piece
+  /// flies on the EXACT same arc the server's mirrored piece does — any
+  /// random divergence makes the server's eat-detection fire while the
+  /// player's eye still sees the piece short of the target.
+  void ejectPlayer(Player p, Offset aimDir, {double? multiplier, bool deterministic = false}) {
     if (p.isDead) return;
     final mag = aimDir.distance;
     final unit = mag > 0 ? aimDir / mag : const Offset(1, 0);
@@ -34,13 +41,15 @@ class EjectHandler {
 
     for (final c in p.cells) {
       if (c.mass < GameConstants.ejectMinMass) continue;
-      
+
       for (int i = 0; i < burstCount; i++) {
         if (c.mass < GameConstants.ejectMinMass) break;
         c.mass -= GameConstants.ejectCost;
 
-        final randomRad = (rng.nextDouble() * 12 - 6) * (pi / 180);
-        final speedVar = 0.95 + rng.nextDouble() * 0.1;
+        final randomRad = deterministic
+            ? 0.0
+            : (rng.nextDouble() * 12 - 6) * (pi / 180);
+        final speedVar = deterministic ? 1.0 : 0.95 + rng.nextDouble() * 0.1;
 
         // Direction vector from cell position toward the targetPoint (or aimDir)
         final finalDir = Offset(

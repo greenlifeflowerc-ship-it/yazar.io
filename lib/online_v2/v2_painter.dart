@@ -191,8 +191,13 @@ class V2Painter extends CustomPainter {
 
   // ────────────────────────────────────────────────── ejected mass
   void _drawEjected(Canvas canvas, Rect view) {
-    // Server-side ejected (every other player's feed).
+    final selfId = controller.playerId;
+    // Server-side ejected — every OTHER player's feed. Pieces we own are
+    // rendered from sim.localEjected below (offline-style), so we skip
+    // their server-mirrored entries here to avoid the visible double-
+    // render / lag-handoff that comes from network interp delay.
     for (final e in controller.world.ejected.values) {
+      if (e.ownerId == selfId) continue;
       final pos = Offset(e.renderX, e.renderY);
       if (!view.contains(pos)) continue;
       _drawEjectedCircle(canvas, pos, _ejectedRadius, e.color);

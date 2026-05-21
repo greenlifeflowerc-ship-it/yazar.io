@@ -293,6 +293,14 @@ interface Player {
   spawnAt: number;
   highestMass: number;
   massMult: number;
+  // Per-player eject tuning, sent by the client on join. These match the
+  // GameSettings sliders in the offline classic so the server reproduces
+  // the player's chosen feed feel — without this, the server's copy of
+  // every piece flies on the default arc while the client's local copy
+  // flies on the player's tuned arc, and the two diverge by the per-tick
+  // friction × speed delta over the ~1 s flight.
+  ejectSpeedMult: number;
+  ejectDistMult: number;
   eatenCount: number;
   // bot scratch
   aiDir: { x: number; y: number };
@@ -314,7 +322,18 @@ interface Player {
 
 interface Pellet { id: string; x: number; y: number; color: string; }
 interface Virus { id: string; x: number; y: number; vx: number; vy: number; mass: number; feedCount: number; lfX: number; lfY: number; }
-interface EjectedMass { id: string; ownerId: string; x: number; y: number; vx: number; vy: number; color: string; spawnedAt: number; }
+interface EjectedMass {
+  id: string;
+  ownerId: string;
+  x: number; y: number;
+  vx: number; vy: number;
+  color: string;
+  spawnedAt: number;
+  // Per-piece friction baked in at spawn from the owner's
+  // ejectSpeedMult / ejectDistMult so the piece honours the player's
+  // tuning even after they disconnect.
+  fric: number;
+}
 
 // ─────────────────────────────────────────────────────── world state
 const players = new Map<string, Player>();
@@ -406,7 +425,9 @@ function makeBot(): Player {
     input: { dx: 0, dy: 0, attack: false, lastDir: { x: 1, y: 0 }, seq: 0 },
     dead: false, deadAt: 0, lastInputSeq: 0,
     lastSeenAt: Date.now(), spawnAt: Date.now(),
-    highestMass: 100, massMult: 1.0, eatenCount: 0,
+    highestMass: 100, massMult: 1.0,
+    ejectSpeedMult: 1.0, ejectDistMult: 1.0,
+    eatenCount: 0,
     aiDir: { x: 0, y: 0 }, aiNextDecide: 0, aiNextSplit: 0, aiNextEject: 0,
     seenCells: new Set(), seenPellets: new Set(),
     seenViruses: new Set(), seenEjected: new Set(),
@@ -728,14 +749,32 @@ function tryDoEject(p: Player, dirX: number, dirY: number): void {
   const ux = m > 0.05 ? dirX / m : p.input.lastDir.x;
   const uy = m > 0.05 ? dirY / m : p.input.lastDir.y;
   const er = radius(EJECT_MASS);
+  // Per-player tuning, sent at join. Mirror the client's offline
+  // EjectHandler so the server-side piece flies on EXACTLY the same arc
+  // the local sim is showing the player. The previous "fixed" version
+  // ignored these multipliers, which is why the user complained the
+  // feed's collision position felt "imaginary".
+  const speedMult = p.ejectSpeedMult > 0 ? p.ejectSpeedMult : 1.0;
+  const distMult = p.ejectDistMult > 0 ? p.ejectDistMult : 1.0;
+  // EjectHandler.update uses the formula:
+  //   derivedFric = 1 - (1 - baseFric) * speedMult / distMult
+  // so identical online physics requires the same per-piece friction.
+  const derivedFric = clamp(
+    1 - (1 - EJECT_FRICTION_PER_FRAME) * speedMult / distMult,
+    0.01,
+    0.99,
+  );
   for (const c of p.cells) {
     if (c.mass < EJECT_MIN_MASS) continue;
     c.mass -= EJECT_COST;
-    const ang = (Math.random() * 12 - 6) * (Math.PI / 180);
-    const cs = Math.cos(ang), sn = Math.sin(ang);
-    const fx = ux * cs - uy * sn;
-    const fy = ux * sn + uy * cs;
-    const sv = 0.95 + Math.random() * 0.1;
+    // Determinism: no randomised angular spread or speed variance.
+    // Offline classic uses a small ± 6°, ± 5 % wobble for visual
+    // texture, but for online the local sim and server sim must
+    // agree on every piece's position — otherwise the visible piece
+    // and the collision-detectable piece are at different places, and
+    // enemies appear to eat feed "out of nowhere".
+    const fx = ux;
+    const fy = uy;
     const cr = radius(c.mass);
     let lx = c.x + fx * (cr + er + LAUNCH_OFFSET);
     let ly = c.y + fy * (cr + er + LAUNCH_OFFSET);
@@ -753,19 +792,24 @@ function tryDoEject(p: Player, dirX: number, dirY: number): void {
     const id = newId("e");
     ejected.set(id, {
       id, ownerId: p.id, x: lx, y: ly,
-      vx: fx * EJECT_VELOCITY_INITIAL * sv,
-      vy: fy * EJECT_VELOCITY_INITIAL * sv,
+      vx: fx * EJECT_VELOCITY_INITIAL * speedMult,
+      vy: fy * EJECT_VELOCITY_INITIAL * speedMult,
       color: c.color, spawnedAt: Date.now(),
+      fric: derivedFric,
     });
   }
 }
 
 function updateEjected(dt: number): void {
   if (ejected.size === 0) return;
-  const fric = Math.pow(EJECT_FRICTION_PER_FRAME, dt * 60);
   const er = radius(EJECT_MASS);
+  const dt60 = dt * 60;
   for (const e of ejected.values()) {
     if (e.vx === 0 && e.vy === 0) continue;
+    // Per-piece friction so each owner's pieces honour that owner's
+    // ejectSpeedMult / ejectDistMult tuning. The math matches the
+    // client EjectHandler.update exactly.
+    const fric = Math.pow(e.fric || EJECT_FRICTION_PER_FRAME, dt60);
     e.x += e.vx * dt; e.y += e.vy * dt;
     e.vx *= fric; e.vy *= fric;
     if (Math.hypot(e.vx, e.vy) < 1) { e.vx = 0; e.vy = 0; }
@@ -1346,6 +1390,12 @@ wss.on("connection", (ws) => {
       const skinId = typeof msg.skin === "string" ? msg.skin.slice(0, 128) : "";
       const rawMult = Number(msg.massMult);
       const massMult = Number.isFinite(rawMult) ? clamp(rawMult, 0.5, 10.0) : 1.0;
+      // Per-player eject tuning. Sane clamps so a malicious / desynced
+      // client can't ship pieces at world-spanning velocities.
+      const rawEsm = Number(msg.ejectSpeedMult);
+      const ejectSpeedMult = Number.isFinite(rawEsm) ? clamp(rawEsm, 0.25, 5.0) : 1.0;
+      const rawEdm = Number(msg.ejectDistMult);
+      const ejectDistMult = Number.isFinite(rawEdm) ? clamp(rawEdm, 0.25, 5.0) : 1.0;
       const id = newId("h");
       player = {
         id, socket: ws, isBot: false, name,
@@ -1354,7 +1404,9 @@ wss.on("connection", (ws) => {
         input: { dx: 0, dy: 0, attack: false, lastDir: { x: 1, y: 0 }, seq: 0 },
         dead: false, deadAt: 0, lastInputSeq: 0,
         lastSeenAt: Date.now(), spawnAt: Date.now(),
-        highestMass: 76, massMult, eatenCount: 0,
+        highestMass: 76, massMult,
+        ejectSpeedMult, ejectDistMult,
+        eatenCount: 0,
         aiDir: { x: 0, y: 0 }, aiNextDecide: 0, aiNextSplit: 0, aiNextEject: 0,
         seenCells: new Set(), seenPellets: new Set(),
         seenViruses: new Set(), seenEjected: new Set(),

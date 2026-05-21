@@ -100,7 +100,14 @@ class V2LocalSim {
 
   void doEject(Offset aimDir) {
     if (!_initialized || player.isDead) return;
-    _eject.ejectPlayer(player, aimDir);
+    // `deterministic: true` disables the ± 6 ° angular spread + ± 5 %
+    // speed variance so the local sim's piece flies on EXACTLY the same
+    // arc the server's mirrored copy does — required for the player's
+    // visible piece position to match the position the server uses for
+    // collision / eat detection. Without this the random wobble on the
+    // two sides drifts apart over the ~ 1 s flight and enemies appear to
+    // eat feed "out of nowhere".
+    _eject.ejectPlayer(player, aimDir, deterministic: true);
   }
 
   /// Drop every cell — used when the server confirms our death.
