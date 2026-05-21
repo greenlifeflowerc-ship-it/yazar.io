@@ -333,12 +333,13 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
     final gs = GameSettings.instance;
 
     return AnimatedBuilder(
-      // Listen to BOTH GameSettings (for setting changes) AND the V2Controller
-      // (for connection state / death / leaderboard / world cache updates).
-      // Without the controller in this list the death overlay and connection
-      // chip only refresh on the lower-frequency `_hudTick`, making them feel
-      // sticky for ~100 ms after the event.
-      animation: Listenable.merge([gs, _ctrl]),
+      // Only listen to GameSettings here — the WHOLE Stack used to rebuild
+      // 30 Hz because the controller fired notifyListeners on every snapshot.
+      // Death state is consumed via `_ctrl.deathListenable` in the death
+      // overlay subtree; mass / leaderboard / connection chip refresh on the
+      // 10 Hz `_hudTick` ValueNotifier. That keeps the HUD rebuild rate
+      // bounded and frees CPU for the painter on mid-tier mobile.
+      animation: gs,
       builder: (context, _) {
         final btnScale = gs.buttonScale;
         final joystickRight = gs.joystickOnRight;
@@ -485,161 +486,178 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
 
                   // Eject button 1 — draggable + hold-to-feed.
                   if (!pcMode)
-                    ValueListenableBuilder<Offset>(
-                      valueListenable: _ejectPos,
-                      builder: (context, pos, _) {
-                        final half = 30.0 * btnScale;
-                        return Positioned(
-                          left: pos.dx * size.width - half,
-                          top: pos.dy * size.height - half,
-                          child: GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onLongPressStart: (_) =>
-                                setState(() => _draggingEject = true),
-                            onLongPressMoveUpdate: (d) {
-                              final n = Offset(
-                                (d.globalPosition.dx / size.width)
-                                    .clamp(0.04, 0.96),
-                                (d.globalPosition.dy / size.height)
-                                    .clamp(0.04, 0.96),
-                              );
-                              _ejectPos.value = n;
-                              GameSettings.instance.ejectBtnFrac = n;
-                            },
-                            onLongPressEnd: (_) =>
-                                setState(() => _draggingEject = false),
-                            child: GameButton(
-                              onPressStart: _startEjectHold,
-                              onPressEnd: _endEjectHold,
-                              color: const Color(0xFFFF7A2F),
-                              size: 60 * btnScale,
-                              enabled: !_ctrl.isDead && !_draggingEject,
-                              hint: _draggingEject ? 'hold & drag' : null,
-                              builder: (_) => const EjectIcon(),
+                    ValueListenableBuilder<bool>(
+                      valueListenable: _ctrl.deathListenable,
+                      builder: (context, dead, _) =>
+                          ValueListenableBuilder<Offset>(
+                        valueListenable: _ejectPos,
+                        builder: (context, pos, _) {
+                          final half = 30.0 * btnScale;
+                          return Positioned(
+                            left: pos.dx * size.width - half,
+                            top: pos.dy * size.height - half,
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onLongPressStart: (_) =>
+                                  setState(() => _draggingEject = true),
+                              onLongPressMoveUpdate: (d) {
+                                final n = Offset(
+                                  (d.globalPosition.dx / size.width)
+                                      .clamp(0.04, 0.96),
+                                  (d.globalPosition.dy / size.height)
+                                      .clamp(0.04, 0.96),
+                                );
+                                _ejectPos.value = n;
+                                GameSettings.instance.ejectBtnFrac = n;
+                              },
+                              onLongPressEnd: (_) =>
+                                  setState(() => _draggingEject = false),
+                              child: GameButton(
+                                onPressStart: _startEjectHold,
+                                onPressEnd: _endEjectHold,
+                                color: const Color(0xFFFF7A2F),
+                                size: 60 * btnScale,
+                                enabled: !dead && !_draggingEject,
+                                hint: _draggingEject ? 'hold & drag' : null,
+                                builder: (_) => const EjectIcon(),
+                              ),
                             ),
-                          ),
-                        );
-                      },
+                          );
+                        },
+                      ),
                     ),
 
                   // Eject button 2 — second feed button, mirrors offline.
                   if (!pcMode)
-                    ValueListenableBuilder<Offset>(
-                      valueListenable: _ejectPos2,
-                      builder: (context, pos, _) {
-                        final half = 30.0 * btnScale;
-                        return Positioned(
-                          left: pos.dx * size.width - half,
-                          top: pos.dy * size.height - half,
-                          child: GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onLongPressStart: (_) =>
-                                setState(() => _draggingEject2 = true),
-                            onLongPressMoveUpdate: (d) {
-                              final n = Offset(
-                                (d.globalPosition.dx / size.width)
-                                    .clamp(0.04, 0.96),
-                                (d.globalPosition.dy / size.height)
-                                    .clamp(0.04, 0.96),
-                              );
-                              _ejectPos2.value = n;
-                              GameSettings.instance.ejectBtnFrac2 = n;
-                            },
-                            onLongPressEnd: (_) =>
-                                setState(() => _draggingEject2 = false),
-                            child: GameButton(
-                              onPressStart: _startEjectHold2,
-                              onPressEnd: _endEjectHold2,
-                              color: const Color(0xFFFFB300),
-                              size: 60 * btnScale,
-                              enabled: !_ctrl.isDead && !_draggingEject2,
-                              hint: _draggingEject2 ? 'hold & drag' : null,
-                              builder: (_) => const EjectIcon(),
+                    ValueListenableBuilder<bool>(
+                      valueListenable: _ctrl.deathListenable,
+                      builder: (context, dead, _) =>
+                          ValueListenableBuilder<Offset>(
+                        valueListenable: _ejectPos2,
+                        builder: (context, pos, _) {
+                          final half = 30.0 * btnScale;
+                          return Positioned(
+                            left: pos.dx * size.width - half,
+                            top: pos.dy * size.height - half,
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onLongPressStart: (_) =>
+                                  setState(() => _draggingEject2 = true),
+                              onLongPressMoveUpdate: (d) {
+                                final n = Offset(
+                                  (d.globalPosition.dx / size.width)
+                                      .clamp(0.04, 0.96),
+                                  (d.globalPosition.dy / size.height)
+                                      .clamp(0.04, 0.96),
+                                );
+                                _ejectPos2.value = n;
+                                GameSettings.instance.ejectBtnFrac2 = n;
+                              },
+                              onLongPressEnd: (_) =>
+                                  setState(() => _draggingEject2 = false),
+                              child: GameButton(
+                                onPressStart: _startEjectHold2,
+                                onPressEnd: _endEjectHold2,
+                                color: const Color(0xFFFFB300),
+                                size: 60 * btnScale,
+                                enabled: !dead && !_draggingEject2,
+                                hint: _draggingEject2 ? 'hold & drag' : null,
+                                builder: (_) => const EjectIcon(),
+                              ),
                             ),
-                          ),
-                        );
-                      },
+                          );
+                        },
+                      ),
                     ),
 
                   // Split button — draggable.
                   if (!pcMode)
-                    ValueListenableBuilder<Offset>(
-                      valueListenable: _splitPos,
-                      builder: (context, pos, _) {
-                        final half = 35.0 * btnScale;
-                        return Positioned(
-                          left: pos.dx * size.width - half,
-                          top: pos.dy * size.height - half,
-                          child: GestureDetector(
-                            behavior: HitTestBehavior.opaque,
-                            onLongPressStart: (_) =>
-                                setState(() => _draggingSplit = true),
-                            onLongPressMoveUpdate: (d) {
-                              final n = Offset(
-                                (d.globalPosition.dx / size.width)
-                                    .clamp(0.04, 0.96),
-                                (d.globalPosition.dy / size.height)
-                                    .clamp(0.04, 0.96),
-                              );
-                              _splitPos.value = n;
-                              GameSettings.instance.splitBtnFrac = n;
-                            },
-                            onLongPressEnd: (_) =>
-                                setState(() => _draggingSplit = false),
-                            child: GameButton(
-                              onTap: _onSplitTap,
-                              color: const Color(0xFF3DA5F5),
-                              size: 70 * btnScale,
-                              enabled: !_ctrl.isDead && !_draggingSplit,
-                              hint: _draggingSplit ? 'hold & drag' : null,
-                              builder: (_) => const SplitIcon(),
+                    ValueListenableBuilder<bool>(
+                      valueListenable: _ctrl.deathListenable,
+                      builder: (context, dead, _) =>
+                          ValueListenableBuilder<Offset>(
+                        valueListenable: _splitPos,
+                        builder: (context, pos, _) {
+                          final half = 35.0 * btnScale;
+                          return Positioned(
+                            left: pos.dx * size.width - half,
+                            top: pos.dy * size.height - half,
+                            child: GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onLongPressStart: (_) =>
+                                  setState(() => _draggingSplit = true),
+                              onLongPressMoveUpdate: (d) {
+                                final n = Offset(
+                                  (d.globalPosition.dx / size.width)
+                                      .clamp(0.04, 0.96),
+                                  (d.globalPosition.dy / size.height)
+                                      .clamp(0.04, 0.96),
+                                );
+                                _splitPos.value = n;
+                                GameSettings.instance.splitBtnFrac = n;
+                              },
+                              onLongPressEnd: (_) =>
+                                  setState(() => _draggingSplit = false),
+                              child: GameButton(
+                                onTap: _onSplitTap,
+                                color: const Color(0xFF3DA5F5),
+                                size: 70 * btnScale,
+                                enabled: !dead && !_draggingSplit,
+                                hint: _draggingSplit ? 'hold & drag' : null,
+                                builder: (_) => const SplitIcon(),
+                              ),
                             ),
-                          ),
-                        );
-                      },
+                          );
+                        },
+                      ),
                     ),
 
-                  // PC mode hint.
-                  if (pcMode && !_ctrl.isDead)
-                    Positioned(
-                      bottom: 20,
-                      left: 0,
-                      right: 0,
-                      child: IgnorePointer(
-                        child: Center(
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 12, vertical: 6),
-                            decoration: BoxDecoration(
-                              color: Colors.black.withValues(alpha: 0.35),
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: Text(
-                              'PC Mode: Move with mouse • Split: Space • Feed: W / E',
-                              style: GoogleFonts.baloo2(
-                                color: Colors.white70,
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
+                  // PC mode hint + death overlay — both gated on the death
+                  // listenable so they flip the moment the server confirms
+                  // the transition, without subscribing the whole Stack.
+                  ValueListenableBuilder<bool>(
+                    valueListenable: _ctrl.deathListenable,
+                    builder: (context, dead, _) {
+                      if (dead) {
+                        return Positioned.fill(
+                          child: DeathScreen(
+                            highestMass: _ctrl.highestMass,
+                            timeSurvived: _ctrl.survivalSeconds.toDouble(),
+                            eatenCount: _ctrl.kills,
+                            rank: _ctrl.currentRank,
+                            onPlayAgain: _playAgain,
+                            onMainMenu: _exit,
+                          ),
+                        );
+                      }
+                      if (!pcMode) return const SizedBox.shrink();
+                      return Positioned(
+                        bottom: 20,
+                        left: 0,
+                        right: 0,
+                        child: IgnorePointer(
+                          child: Center(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 12, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: Colors.black.withValues(alpha: 0.35),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Text(
+                                'PC Mode: Move with mouse • Split: Space • Feed: W / E',
+                                style: GoogleFonts.baloo2(
+                                  color: Colors.white70,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                ),
                               ),
                             ),
                           ),
                         ),
-                      ),
-                    ),
-
-                  // Death overlay — real run stats from the controller so
-                  // the player sees their actual highest mass / kills / time.
-                  if (_ctrl.isDead)
-                    Positioned.fill(
-                      child: DeathScreen(
-                        highestMass: _ctrl.highestMass,
-                        timeSurvived: _ctrl.survivalSeconds.toDouble(),
-                        eatenCount: _ctrl.kills,
-                        rank: _ctrl.currentRank,
-                        onPlayAgain: _playAgain,
-                        onMainMenu: _exit,
-                      ),
-                    ),
+                      );
+                    },
+                  ),
                 ],
               ),
             ),

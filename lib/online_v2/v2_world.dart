@@ -96,7 +96,16 @@ class V2WorldCell {
     newX = u.x;
     newY = u.y;
     newMass = u.mass;
-    newRecvAt = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
+    // Guard against burst arrivals: if two snapshots land within < 16 ms of
+    // each other (TCP coalescing on a flaky link) the natural span shrinks
+    // to a few ms and the interp would complete instantly, producing a
+    // visible "jump-then-freeze" cycle. Spacing the receive time to one
+    // server tick interval keeps playback smooth.
+    final minSpan = 28;
+    final candidate = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
+    newRecvAt = (candidate - prevRecvAt) < minSpan
+        ? prevRecvAt + minSpan
+        : candidate;
     freshSplit = u.freshSplit;
   }
 
@@ -169,7 +178,16 @@ class V2WorldVirus {
     prevRecvAt = newRecvAt;
     newX = x;
     newY = y;
-    newRecvAt = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
+    // Guard against burst arrivals: if two snapshots land within < 16 ms of
+    // each other (TCP coalescing on a flaky link) the natural span shrinks
+    // to a few ms and the interp would complete instantly, producing a
+    // visible "jump-then-freeze" cycle. Spacing the receive time to one
+    // server tick interval keeps playback smooth.
+    final minSpan = 28;
+    final candidate = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
+    newRecvAt = (candidate - prevRecvAt) < minSpan
+        ? prevRecvAt + minSpan
+        : candidate;
     mass = m;
   }
 
@@ -226,7 +244,16 @@ class V2WorldEjected {
     prevRecvAt = newRecvAt;
     newX = x;
     newY = y;
-    newRecvAt = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
+    // Guard against burst arrivals: if two snapshots land within < 16 ms of
+    // each other (TCP coalescing on a flaky link) the natural span shrinks
+    // to a few ms and the interp would complete instantly, producing a
+    // visible "jump-then-freeze" cycle. Spacing the receive time to one
+    // server tick interval keeps playback smooth.
+    final minSpan = 28;
+    final candidate = recvAtMs <= prevRecvAt ? prevRecvAt + 1 : recvAtMs;
+    newRecvAt = (candidate - prevRecvAt) < minSpan
+        ? prevRecvAt + minSpan
+        : candidate;
   }
 
   void tickInterp(int renderAtMs) {

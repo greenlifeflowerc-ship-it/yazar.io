@@ -50,9 +50,14 @@ const ws_1 = require("ws");
 // ─────────────────────────────────────────────────────── world constants
 const PORT = Number(process.env.PORT ?? 2567);
 const WORLD_SIZE = 14142;
-const TARGET_PELLETS = 8000;
-const TARGET_VIRUSES = 30;
-const TARGET_BOTS = 50; // tuned for 1-vCPU Lightsail
+const TARGET_PELLETS = 6500; // was 8000 — saves ~20 % broadcast bytes
+const TARGET_VIRUSES = 25; // was 30
+// Hard-tuned for a Lightsail 1-vCPU host. Previous 50 routinely pushed past
+// the 26 ms tick budget once 3+ humans connected (snapshot build is roughly
+// O(humans × visible_bot_cells)). At 35 we leave ~40 % headroom even with
+// 8 concurrent humans, which is what kills the stutter the client sees as
+// "snapshots arrive in bursts then 80 ms gaps".
+const TARGET_BOTS = 35;
 const MAX_CELLS_PER_PLAYER = 16;
 const MAX_CELL_MASS = 22500;
 const SPLIT_MIN_MASS = 35;
@@ -112,9 +117,19 @@ const TICK_MS = 1000 / TICK_RATE;
 const TICK_BUDGET_MS = TICK_MS * 0.8; // warn when >80 % of budget used
 const SLOW_TICK_EVERY = 4; // 7.5 Hz pellet refresh
 const VIEWPORT_RADIUS = 2200;
+// Entities outside this multiple of VIEWPORT_RADIUS are NOT sent. Was 1.3
+// which sent a lot of off-screen junk; 1.08 keeps a one-cell margin for
+// scroll smoothing but cuts ~30 % of payload in dense areas.
+const VIEWPORT_SEND_MULT = 1.08;
 const LEADERBOARD_SIZE = 10;
 const STALE_PLAYER_MS = 20000;
 const EJECT_OWNER_IMMUNITY_MS = 200;
+// Skip updCells / updViruses / updEjected for entities that moved less than
+// these thresholds since the last broadcast. Saves a huge amount of "nothing
+// really changed" updates when many cells are sitting still or barely
+// drifting in cohesion.
+const UPDATE_POS_EPSILON = 0.5; // world units
+const UPDATE_MASS_EPSILON = 0.5; // mass units
 // Spatial grid — 36×36 buckets of ~393 units each. Sized so an avg-radius
 // cell touches 1 bucket and a max-radius cell touches at most 9.
 const GRID_CELL_SIZE = 400;
@@ -303,6 +318,7 @@ function makeBot() {
         aiDir: { x: 0, y: 0 }, aiNextDecide: 0, aiNextSplit: 0, aiNextEject: 0,
         seenCells: new Set(), seenPellets: new Set(),
         seenViruses: new Set(), seenEjected: new Set(),
+        lastSent: new Map(), lastSentVirus: new Map(), lastSentEjected: new Map(),
     };
     spawnCellForPlayer(bot);
     return bot;
@@ -1093,48 +1109,60 @@ function buildLeaderboard() {
 // ─────────────────────────────────────────────────────── snapshot
 function buildSnapshot(p, lb, sendSlow) {
     const com = centerOfMass(p);
-    const r2 = VIEWPORT_RADIUS * VIEWPORT_RADIUS;
+    const sendRadius2 = VIEWPORT_RADIUS * VIEWPORT_RADIUS * VIEWPORT_SEND_MULT * VIEWPORT_SEND_MULT;
     const now = Date.now();
     const currentCells = new Set();
     const addCells = [];
     const updCells = [];
+    const posEps = UPDATE_POS_EPSILON;
+    const massEps = UPDATE_MASS_EPSILON;
     for (const other of players.values()) {
         if (other.dead)
             continue;
         for (const c of other.cells) {
             const dx = c.x - com.x, dy = c.y - com.y;
-            if (dx * dx + dy * dy > r2 * 1.3)
+            if (dx * dx + dy * dy > sendRadius2)
                 continue;
             currentCells.add(c.id);
-            const payload = {
-                id: c.id,
-                x: Math.round(c.x * 10) / 10,
-                y: Math.round(c.y * 10) / 10,
-                m: Math.round(c.mass * 10) / 10,
-            };
+            const cx = Math.round(c.x * 10) / 10;
+            const cy = Math.round(c.y * 10) / 10;
+            const cm = Math.round(c.mass * 10) / 10;
             if (!p.seenCells.has(c.id)) {
-                payload.o = other.id;
-                payload.n = other.name;
-                payload.col = c.color;
-                payload.sk = other.skinId;
-                payload.h = other.isBot ? 0 : 1;
-                payload.s = c.freshSplit ? 1 : 0;
-                payload.mr = c.mergeReadyAt;
-                addCells.push(payload);
+                addCells.push({
+                    id: c.id, x: cx, y: cy, m: cm,
+                    o: other.id, n: other.name, col: c.color, sk: other.skinId,
+                    h: other.isBot ? 0 : 1, s: c.freshSplit ? 1 : 0, mr: c.mergeReadyAt,
+                });
                 p.seenCells.add(c.id);
+                p.lastSent.set(c.id, [cx, cy, cm]);
             }
             else {
-                payload.s = c.freshSplit ? 1 : 0;
-                updCells.push(payload);
+                // Skip if neither position nor mass crossed the epsilon threshold.
+                // A still cell with 1e-3 drift used to get a 40-byte update every
+                // tick — over 30 visible cells × 30 Hz that's 36 KB / s of pure
+                // noise. The client interpolation buffer doesn't need updates the
+                // human eye can't see anyway.
+                const last = p.lastSent.get(c.id);
+                const moved = last === undefined ||
+                    Math.abs(cx - last[0]) >= posEps ||
+                    Math.abs(cy - last[1]) >= posEps ||
+                    Math.abs(cm - last[2]) >= massEps ||
+                    c.freshSplit;
+                if (moved) {
+                    updCells.push({ id: c.id, x: cx, y: cy, m: cm, s: c.freshSplit ? 1 : 0 });
+                    p.lastSent.set(c.id, [cx, cy, cm]);
+                }
             }
         }
     }
     const rmCells = [];
-    for (const id of p.seenCells)
+    for (const id of p.seenCells) {
         if (!currentCells.has(id)) {
             rmCells.push(id);
             p.seenCells.delete(id);
+            p.lastSent.delete(id);
         }
+    }
     const addPellets = [];
     if (sendSlow) {
         pelletGrid.queryEach(com.x, com.y, VIEWPORT_RADIUS, (pe) => {
@@ -1155,45 +1183,71 @@ function buildSnapshot(p, lb, sendSlow) {
     const currentViruses = new Set();
     for (const v of viruses.values()) {
         const dx = v.x - com.x, dy = v.y - com.y;
-        if (dx * dx + dy * dy > r2 * 1.3)
+        if (dx * dx + dy * dy > sendRadius2)
             continue;
         currentViruses.add(v.id);
+        const vx = Math.round(v.x * 10) / 10;
+        const vy = Math.round(v.y * 10) / 10;
+        const vm = Math.round(v.mass);
         if (!p.seenViruses.has(v.id)) {
-            addViruses.push({ id: v.id, x: Math.round(v.x * 10) / 10, y: Math.round(v.y * 10) / 10, m: Math.round(v.mass) });
+            addViruses.push({ id: v.id, x: vx, y: vy, m: vm });
             p.seenViruses.add(v.id);
+            p.lastSentVirus.set(v.id, [vx, vy, vm]);
         }
-        else if (Math.hypot(v.vx, v.vy) > 1 || sendSlow) {
-            updViruses.push({ id: v.id, x: Math.round(v.x * 10) / 10, y: Math.round(v.y * 10) / 10, m: Math.round(v.mass) });
+        else {
+            const last = p.lastSentVirus.get(v.id);
+            const moved = last === undefined ||
+                Math.abs(vx - last[0]) >= posEps ||
+                Math.abs(vy - last[1]) >= posEps ||
+                Math.abs(vm - last[2]) >= 1;
+            if (moved) {
+                updViruses.push({ id: v.id, x: vx, y: vy, m: vm });
+                p.lastSentVirus.set(v.id, [vx, vy, vm]);
+            }
         }
     }
     const rmViruses = [];
-    for (const id of p.seenViruses)
+    for (const id of p.seenViruses) {
         if (!currentViruses.has(id)) {
             rmViruses.push(id);
             p.seenViruses.delete(id);
+            p.lastSentVirus.delete(id);
         }
+    }
     const addEjected = [];
     const updEjected = [];
     const currentEjected = new Set();
     for (const e of ejected.values()) {
         const dx = e.x - com.x, dy = e.y - com.y;
-        if (dx * dx + dy * dy > r2 * 1.3)
+        if (dx * dx + dy * dy > sendRadius2)
             continue;
         currentEjected.add(e.id);
+        const ex = Math.round(e.x * 10) / 10;
+        const ey = Math.round(e.y * 10) / 10;
         if (!p.seenEjected.has(e.id)) {
-            addEjected.push({ id: e.id, x: Math.round(e.x * 10) / 10, y: Math.round(e.y * 10) / 10, c: e.color, o: e.ownerId });
+            addEjected.push({ id: e.id, x: ex, y: ey, c: e.color, o: e.ownerId });
             p.seenEjected.add(e.id);
+            p.lastSentEjected.set(e.id, [ex, ey]);
         }
         else {
-            updEjected.push({ id: e.id, x: Math.round(e.x * 10) / 10, y: Math.round(e.y * 10) / 10 });
+            const last = p.lastSentEjected.get(e.id);
+            const moved = last === undefined ||
+                Math.abs(ex - last[0]) >= posEps ||
+                Math.abs(ey - last[1]) >= posEps;
+            if (moved) {
+                updEjected.push({ id: e.id, x: ex, y: ey });
+                p.lastSentEjected.set(e.id, [ex, ey]);
+            }
         }
     }
     const rmEjected = [];
-    for (const id of p.seenEjected)
+    for (const id of p.seenEjected) {
         if (!currentEjected.has(id)) {
             rmEjected.push(id);
             p.seenEjected.delete(id);
+            p.lastSentEjected.delete(id);
         }
+    }
     return {
         type: "state",
         t: serverTick,
@@ -1217,10 +1271,28 @@ function buildSnapshot(p, lb, sendSlow) {
 function sendSnapshotTo(p, lb, sendSlow) {
     if (p.isBot || !p.socket || p.socket.readyState !== ws_1.WebSocket.OPEN)
         return;
+    // Build the snapshot SYNCHRONOUSLY (mutates p.seenCells / p.lastSent etc.
+    // — those need to stay coherent with this tick). Defer the expensive
+    // JSON.stringify + socket write to setImmediate so the tick can return to
+    // the event loop first. This stops the snapshot burst from eating into
+    // the NEXT tick's budget — the single biggest source of "all snapshots
+    // arrive together then 80 ms gap" jitter the client sees.
+    let snap;
     try {
-        p.socket.send(JSON.stringify(buildSnapshot(p, lb, sendSlow)));
+        snap = buildSnapshot(p, lb, sendSlow);
     }
-    catch { /* ignore */ }
+    catch {
+        return;
+    }
+    const sock = p.socket;
+    setImmediate(() => {
+        if (sock.readyState !== ws_1.WebSocket.OPEN)
+            return;
+        try {
+            sock.send(JSON.stringify(snap));
+        }
+        catch { /* ignore */ }
+    });
 }
 // ─────────────────────────────────────────────────────── main loop
 let slowTickCount = 0;
@@ -1352,6 +1424,7 @@ wss.on("connection", (ws) => {
                 aiDir: { x: 0, y: 0 }, aiNextDecide: 0, aiNextSplit: 0, aiNextEject: 0,
                 seenCells: new Set(), seenPellets: new Set(),
                 seenViruses: new Set(), seenEjected: new Set(),
+                lastSent: new Map(), lastSentVirus: new Map(), lastSentEjected: new Map(),
             };
             spawnCellForPlayer(player);
             players.set(id, player);

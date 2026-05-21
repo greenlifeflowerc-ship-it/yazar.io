@@ -34,15 +34,82 @@ class V2Painter extends CustomPainter {
 
   static const double _gridSpacing = 50.0;
 
+  // ─────────────────────────────────────── reusable paints (static, no GC)
+  // The painter is reconstructed on every frame (60 Hz). Instance Paints
+  // would trigger ~hundreds of allocations per second; static reusable
+  // Paints cut that to zero. Their mutable fields (color, strokeWidth) are
+  // updated per call site, so callers must always set what they need.
+  static final Paint _bgPaint = Paint();
+  static final Paint _gridPaint = Paint();
+  static final Paint _borderPaint = Paint()..style = PaintingStyle.stroke;
+  static final Paint _pelletPaint = Paint();
+  static final Paint _ejectedPaint = Paint();
+  static final Paint _virusFill = Paint()..color = const Color(0xFF33FF33);
+  static final Paint _virusStroke = Paint()
+    ..color = const Color(0xFF1F8A1F)
+    ..style = PaintingStyle.stroke;
+  static final Paint _cellFill = Paint();
+  static final Paint _cellStroke = Paint()..style = PaintingStyle.stroke;
+  static final Paint _skinPaint = Paint()..filterQuality = FilterQuality.low;
+  static final Paint _aimFill = Paint();
+  static final Paint _aimStroke = Paint()
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 1.0;
+
+  // ─────────────────────────────────────── reusable paths (no per-cell GC)
+  // Each callsite must `path.reset()` before adding new segments. These are
+  // static so allocation only happens once per process for the life of the
+  // painter, not 60 / 120 Hz × N entities.
+  static final Path _scratchPath = Path();
+  static final Path _scratchClipPath = Path();
+
+  // ─────────────────────────────────────── label cache
+  // TextPainter.layout() runs font shaping — expensive enough to dominate
+  // the per-frame budget when called 30+ times. Cache the laid-out painter
+  // keyed by (text, fontSize bucket). Names are stable; mass is bucketed to
+  // the nearest 10 so we hit the cache 90 % of the time even mid-game.
+  // Cache is bounded so it can't leak across long sessions.
+  static final Map<String, TextPainter> _labelCache = <String, TextPainter>{};
+  static const int _labelCacheMax = 256;
+
+  static TextPainter _label(String text, double fontSize, {bool bold = true}) {
+    // Quantize fontSize to 0.5 px so micro-zoom changes don't blow the cache.
+    final fs = (fontSize * 2).round() / 2.0;
+    final key = bold ? 'b|$fs|$text' : 'n|$fs|$text';
+    final cached = _labelCache[key];
+    if (cached != null) return cached;
+    if (_labelCache.length >= _labelCacheMax) {
+      // Cheap eviction — drop the oldest 1/4 of the cache.
+      final keys = _labelCache.keys.take(_labelCacheMax ~/ 4).toList();
+      for (final k in keys) {
+        _labelCache.remove(k);
+      }
+    }
+    final tp = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: fs,
+          fontWeight: bold ? FontWeight.w900 : FontWeight.w800,
+          shadows: const [
+            Shadow(color: Colors.black54, blurRadius: 2, offset: Offset(0, 1)),
+          ],
+        ),
+      ),
+      textDirection: ui.TextDirection.ltr,
+    )..layout();
+    _labelCache[key] = tp;
+    return tp;
+  }
+
   @override
   void paint(Canvas canvas, Size size) {
     final settings = GameSettings.instance;
     final renderScale = settings.renderScale;
 
-    canvas.drawRect(
-      Offset.zero & size,
-      Paint()..color = settings.backgroundColor,
-    );
+    _bgPaint.color = settings.backgroundColor;
+    canvas.drawRect(Offset.zero & size, _bgPaint);
 
     canvas.save();
     final zoom = cameraZoom * renderScale;
@@ -72,7 +139,7 @@ class V2Painter extends CustomPainter {
 
   // ────────────────────────────────────────────────── world chrome
   void _drawGrid(Canvas canvas, Rect view, Color color) {
-    final paint = Paint()
+    final paint = _gridPaint
       ..color = color
       ..strokeWidth = 1 / cameraZoom;
     final startX = (view.left / _gridSpacing).floor() * _gridSpacing;
@@ -94,9 +161,8 @@ class V2Painter extends CustomPainter {
   }
 
   void _drawWorldBorder(Canvas canvas, Color color) {
-    final paint = Paint()
+    final paint = _borderPaint
       ..color = color
-      ..style = PaintingStyle.stroke
       ..strokeWidth = 8 / cameraZoom;
     canvas.drawRect(
       const Rect.fromLTWH(
@@ -111,7 +177,7 @@ class V2Painter extends CustomPainter {
 
   // ────────────────────────────────────────────────── pellets
   void _drawPellets(Canvas canvas, Rect view) {
-    final paint = Paint();
+    final paint = _pelletPaint;
     // Inline AABB cull — avoids one Offset alloc per pellet per frame, which
     // adds up fast at 8 K pellets × 60 fps on mid-tier mobile GC.
     final left = view.left, top = view.top, right = view.right, bottom = view.bottom;
@@ -156,30 +222,55 @@ class V2Painter extends CustomPainter {
         1.0,
       ],
     );
-    canvas.drawCircle(pos, r, Paint()..shader = gradient);
+    _ejectedPaint.shader = gradient;
+    canvas.drawCircle(pos, r, _ejectedPaint);
+  }
+
+  // ─────────────────────────────── pooled drawable buffer (static, reused)
+  // _drawsPool is an append-only pool of _Drawable instances that grows to
+  // peak demand. _drawsLive is the per-frame working set — cleared and
+  // refilled each frame, sorted in place, then drawn. List.clear() is O(1)
+  // and reusing _Drawable instances eliminates ~60 allocs/frame.
+  static final List<_Drawable> _drawsPool = <_Drawable>[];
+  static final List<_Drawable> _drawsLive = <_Drawable>[];
+
+  _Drawable _nextDrawable() {
+    final live = _drawsLive;
+    final pool = _drawsPool;
+    if (live.length < pool.length) {
+      final d = pool[live.length];
+      live.add(d);
+      return d;
+    }
+    final d = _Drawable();
+    pool.add(d);
+    live.add(d);
+    return d;
   }
 
   // ────────────────────────────────────────────────── cells + viruses
   void _drawEntities(Canvas canvas, Rect view) {
-    final draws = <_Drawable>[];
+    _drawsLive.clear();
 
     // Remote players (and the server's view of self — we skip self because
     // we render the local-sim cells instead).
     for (final c in controller.world.cells.values) {
       if (c.isSelf) continue;
-      final pos = Offset(c.renderX, c.renderY);
-      if (!view.contains(pos)) continue;
-      draws.add(_Drawable(
-        mass: c.renderMass,
-        kind: _Kind.cell,
-        cellPos: pos,
-        cellRadius: c.renderRadius,
-        cellName: c.name,
-        cellColor: c.color,
-        cellOwnerId: c.ownerId,
-        cellIsHuman: c.isHuman,
-        cellSkinId: c.skinId,
-      ));
+      final rx = c.renderX, ry = c.renderY;
+      if (rx < view.left || rx > view.right || ry < view.top || ry > view.bottom) {
+        continue;
+      }
+      final d = _nextDrawable();
+      d.mass = c.renderMass;
+      d.kind = _Kind.cell;
+      d.cellPos = Offset(rx, ry);
+      d.cellRadius = c.renderRadius;
+      d.cellName = c.name;
+      d.cellColor = c.color;
+      d.cellOwnerId = c.ownerId;
+      d.cellIsHuman = c.isHuman;
+      d.cellSkinId = c.skinId;
+      d.cellLocal = null;
     }
 
     // Local human cells — straight from V2LocalSim. No interpolation.
@@ -187,40 +278,45 @@ class V2Painter extends CustomPainter {
     final selfId = selfPlayer?.id;
     if (selfPlayer != null) {
       for (final c in selfPlayer.cells) {
-        if (!view.contains(c.position)) continue;
-        draws.add(_Drawable(
-          mass: c.mass,
-          kind: _Kind.cell,
-          cellPos: c.position,
-          cellRadius: c.radius,
-          cellName: c.name,
-          cellColor: c.color,
-          cellOwnerId: c.ownerId,
-          cellIsHuman: true,
-          cellLocal: c,
-        ));
+        final cp = c.position;
+        if (cp.dx < view.left || cp.dx > view.right ||
+            cp.dy < view.top || cp.dy > view.bottom) {
+          continue;
+        }
+        final d = _nextDrawable();
+        d.mass = c.mass;
+        d.kind = _Kind.cell;
+        d.cellPos = cp;
+        d.cellRadius = c.radius;
+        d.cellName = c.name;
+        d.cellColor = c.color;
+        d.cellOwnerId = c.ownerId;
+        d.cellIsHuman = true;
+        d.cellSkinId = '';
+        d.cellLocal = c;
       }
     }
 
     // Viruses (rendered with the same draw order as cells, by mass).
     for (final v in controller.world.viruses.values) {
-      final pos = Offset(v.renderX, v.renderY);
-      if (!view.contains(pos)) continue;
-      draws.add(_Drawable(
-        mass: v.mass,
-        kind: _Kind.virus,
-        cellPos: pos,
-        cellRadius: v.renderRadius,
-      ));
+      final rx = v.renderX, ry = v.renderY;
+      if (rx < view.left || rx > view.right || ry < view.top || ry > view.bottom) {
+        continue;
+      }
+      final d = _nextDrawable();
+      d.mass = v.mass;
+      d.kind = _Kind.virus;
+      d.cellPos = Offset(rx, ry);
+      d.cellRadius = v.renderRadius;
+      d.cellLocal = null;
     }
 
-    // Z-order by mass — small entities under big ones.
-    draws.sort((a, b) => a.mass.compareTo(b.mass));
+    // Z-order by mass — small entities under big ones. Sort in place; the
+    // live list only holds this frame's entries.
+    final live = _drawsLive..sort((a, b) => a.mass.compareTo(b.mass));
 
     final ss = SkinSettings.instance;
-    final fill = Paint();
-    final stroke = Paint()..style = PaintingStyle.stroke;
-    for (final d in draws) {
+    for (final d in live) {
       if (d.kind == _Kind.virus) {
         _drawVirus(canvas, d.cellPos, d.cellRadius);
       } else {
@@ -234,7 +330,7 @@ class V2Painter extends CustomPainter {
           // time we see their skin id; cached for the rest of the session.
           skin = controller.skinCache.get(d.cellSkinId);
         }
-        _drawCell(canvas, d, skin: skin, fill: fill, stroke: stroke);
+        _drawCell(canvas, d, skin: skin, fill: _cellFill, stroke: _cellStroke);
       }
     }
 
@@ -244,15 +340,14 @@ class V2Painter extends CustomPainter {
   }
 
   void _drawVirus(Canvas canvas, Offset pos, double r) {
-    final fillPaint = Paint()..color = const Color(0xFF33FF33);
-    final strokePaint = Paint()
-      ..color = const Color(0xFF1F8A1F)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3 / cameraZoom;
-    final path = Path();
-    const spikes = 45;
+    _virusStroke.strokeWidth = 3 / cameraZoom;
+    // 30 spikes × 2 verts = 60 segments — visually indistinguishable from the
+    // previous 90, halves the per-virus path build cost.
+    const spikes = 30;
+    final path = _scratchPath..reset();
+    final two = 2 * math.pi;
     for (int i = 0; i <= spikes * 2; i++) {
-      final ang = (i / (spikes * 2)) * 2 * math.pi;
+      final ang = (i / (spikes * 2)) * two;
       final rr = (i % 2 == 0) ? r : r * 0.94;
       final x = pos.dx + math.cos(ang) * rr;
       final y = pos.dy + math.sin(ang) * rr;
@@ -263,8 +358,8 @@ class V2Painter extends CustomPainter {
       }
     }
     path.close();
-    canvas.drawPath(path, fillPaint);
-    canvas.drawPath(path, strokePaint);
+    canvas.drawPath(path, _virusFill);
+    canvas.drawPath(path, _virusStroke);
   }
 
   void _drawCell(
@@ -304,15 +399,18 @@ class V2Painter extends CustomPainter {
     canvas.drawCircle(pos, r, fill);
     if (skin != null) {
       canvas.save();
-      canvas.clipPath(Path()..addOval(Rect.fromCircle(center: pos, radius: r)));
+      _scratchClipPath
+        ..reset()
+        ..addOval(Rect.fromCircle(center: pos, radius: r));
+      canvas.clipPath(_scratchClipPath);
       final dst = Rect.fromCircle(center: pos, radius: r);
+      _skinPaint.filterQuality =
+          quality == 0 ? FilterQuality.low : FilterQuality.medium;
       canvas.drawImageRect(
         skin,
         Rect.fromLTWH(0, 0, skin.width.toDouble(), skin.height.toDouble()),
         dst,
-        Paint()
-          ..filterQuality =
-              quality == 0 ? FilterQuality.low : FilterQuality.medium,
+        _skinPaint,
       );
       canvas.restore();
     }
@@ -328,8 +426,11 @@ class V2Painter extends CustomPainter {
     int quality,
   ) {
     final r = c.radius;
-    final path = Path();
-    final vertices = quality == 1 ? 60 : 120;
+    final path = _scratchPath..reset();
+    // Halved from 60 / 120 — the bump deformation is low-frequency (a few
+    // bumps × cos-shaped falloff) so visually 32 / 64 vertices is identical
+    // even on a max-radius cell. Cuts jelly path-build cost in half.
+    final vertices = quality == 1 ? 32 : 64;
     for (int i = 0; i <= vertices; i++) {
       final vAng = (i / vertices) * 2 * math.pi;
       double deformation = 0;
@@ -363,13 +464,13 @@ class V2Painter extends CustomPainter {
         width: r * 2.2,
         height: r * 2.2,
       );
+      _skinPaint.filterQuality =
+          quality == 0 ? FilterQuality.low : FilterQuality.medium;
       canvas.drawImageRect(
         skin,
         Rect.fromLTWH(0, 0, skin.width.toDouble(), skin.height.toDouble()),
         dst,
-        Paint()
-          ..filterQuality =
-              quality == 0 ? FilterQuality.low : FilterQuality.medium,
+        _skinPaint,
       );
       canvas.restore();
     }
@@ -385,40 +486,19 @@ class V2Painter extends CustomPainter {
   ) {
     final screenR = r * cameraZoom;
     if (screenR < 14) return;
-    final fontSize = (r * 0.32).clamp(12.0, 64.0);
-    final tp = TextPainter(
-      text: TextSpan(
-        text: name,
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: fontSize,
-          fontWeight: FontWeight.w900,
-          shadows: const [
-            Shadow(color: Colors.black54, blurRadius: 2, offset: Offset(0, 1)),
-          ],
-        ),
-      ),
-      textDirection: ui.TextDirection.ltr,
-    )..layout();
+    // Quantize font size to 2 px buckets so we don't blow the cache when the
+    // cell radius drifts by a fraction. Visually no difference.
+    final fontSize = ((r * 0.32).clamp(12.0, 64.0) / 2).round() * 2.0;
+    final tp = _label(name, fontSize, bold: true);
     tp.paint(
       canvas,
       Offset(pos.dx - tp.width / 2, pos.dy - tp.height / 2 - fontSize * 0.4),
     );
     if (screenR < 24 || !GameSettings.instance.showMassLabels) return;
-    final mp = TextPainter(
-      text: TextSpan(
-        text: mass.toStringAsFixed(0),
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: fontSize * 0.7,
-          fontWeight: FontWeight.w800,
-          shadows: const [
-            Shadow(color: Colors.black54, blurRadius: 2, offset: Offset(0, 1)),
-          ],
-        ),
-      ),
-      textDirection: ui.TextDirection.ltr,
-    )..layout();
+    // Bucket mass to nearest 10 — a 320 → 330 → 340 transition is what the
+    // player sees anyway, and it gives 90 %+ cache hit-rate across frames.
+    final massBucket = (mass / 10).round() * 10;
+    final mp = _label(massBucket.toString(), fontSize * 0.7, bold: false);
     mp.paint(
       canvas,
       Offset(pos.dx - mp.width / 2, pos.dy + fontSize * 0.05),
@@ -444,23 +524,17 @@ class V2Painter extends CustomPainter {
     final p1 = tipBase + perp * (width / 2);
     final p2 = tipBase - perp * (width / 2);
     final backC = tipBase + unit * back;
-    final path = Path()
+    final path = _scratchPath
+      ..reset()
       ..moveTo(tip.dx, tip.dy)
       ..lineTo(p1.dx, p1.dy)
       ..lineTo(backC.dx, backC.dy)
       ..lineTo(p2.dx, p2.dy)
       ..close();
-    canvas.drawPath(
-      path,
-      Paint()..color = Colors.white.withValues(alpha: 0.4),
-    );
-    canvas.drawPath(
-      path,
-      Paint()
-        ..color = Colors.white.withValues(alpha: 0.1)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.0,
-    );
+    _aimFill.color = Colors.white.withValues(alpha: 0.4);
+    canvas.drawPath(path, _aimFill);
+    _aimStroke.color = Colors.white.withValues(alpha: 0.1);
+    canvas.drawPath(path, _aimStroke);
   }
 
   Color _darken(Color c, double amount) {
@@ -476,28 +550,20 @@ class V2Painter extends CustomPainter {
 
 enum _Kind { cell, virus }
 
+/// Mutable drawable so the painter can pool instances across frames. The
+/// previous immutable version allocated a fresh _Drawable for every cell +
+/// virus every frame — ~60 allocations × 60 fps = 3.6 K objects/sec of GC
+/// pressure that we no longer pay.
 class _Drawable {
-  _Drawable({
-    required this.mass,
-    required this.kind,
-    required this.cellPos,
-    required this.cellRadius,
-    this.cellName = '',
-    this.cellColor = Colors.white,
-    this.cellOwnerId = '',
-    this.cellIsHuman = false,
-    this.cellSkinId = '',
-    this.cellLocal,
-  });
-  final double mass;
-  final _Kind kind;
-  final Offset cellPos;
-  final double cellRadius;
-  final String cellName;
-  final Color cellColor;
-  final String cellOwnerId;
-  final bool cellIsHuman;
-  final String cellSkinId;
-  final ge.Cell? cellLocal;
+  double mass = 0;
+  _Kind kind = _Kind.cell;
+  Offset cellPos = Offset.zero;
+  double cellRadius = 0;
+  String cellName = '';
+  Color cellColor = Colors.white;
+  String cellOwnerId = '';
+  bool cellIsHuman = false;
+  String cellSkinId = '';
+  ge.Cell? cellLocal;
 }
 

@@ -90,6 +90,17 @@ class V2Controller extends ChangeNotifier {
   bool _deadServerConfirmed = false;
   bool get isDead => _deadServerConfirmed && sim.cells.isEmpty;
 
+  /// Fires the moment death state transitions. The screen listens to this
+  /// directly so it can toggle the death overlay / button-enabled state
+  /// without subscribing the whole Stack to controller-wide notifyListeners
+  /// (which would force a 30 Hz rebuild of every HUD element).
+  final ValueNotifier<bool> deathListenable = ValueNotifier(false);
+
+  /// Fires once per connection state change. Cheaper to listen to than the
+  /// controller itself when all you care about is the chip color/text.
+  final ValueNotifier<V2ConnState> connStateListenable =
+      ValueNotifier(V2ConnState.idle);
+
   // ── match stats (consumed by the screen on death) ─────────────────────
   int _kills = 0;
   int get kills => _kills;
@@ -172,7 +183,7 @@ class V2Controller extends ChangeNotifier {
 
   void _onConnStateChanged(V2ConnState s) {
     _connState = s;
-    notifyListeners();
+    connStateListenable.value = s;
   }
 
   void _onWelcome(V2Welcome w) {
@@ -200,7 +211,10 @@ class V2Controller extends ChangeNotifier {
     _highestMass = 0;
     _spawnedAt = DateTime.now();
     _deathNotified = false;
-    notifyListeners();
+    // No notifyListeners — the screen's _hudTick + targeted listenables pick
+    // up the new identity / mass on the next 100 ms beat. Welcome lands
+    // before the first paint anyway, so there is no visible delay.
+    deathListenable.value = false;
   }
 
   void _onPong(V2Pong p) {
@@ -314,7 +328,18 @@ class V2Controller extends ChangeNotifier {
     if (s.self.highestMass > _highestMass) _highestMass = s.self.highestMass;
 
     _reconcileSelf(s);
-    notifyListeners();
+
+    // ChangeNotifier broadcast is intentionally OMITTED here. The whole HUD
+    // tree used to subscribe to us via Listenable.merge([gs, _ctrl]) and got
+    // rebuilt 30 Hz — that was the single biggest source of jank on mobile.
+    // Death is the only thing that needs sub-frame UI reaction, and it goes
+    // through deathListenable below. Everything else (mass, ping, leaderboard,
+    // online count) is refreshed by the screen's 10 Hz _hudTick which is
+    // plenty fast for human perception of HUD numbers.
+    final wantDeathUi = isDead;
+    if (deathListenable.value != wantDeathUi) {
+      deathListenable.value = wantDeathUi;
+    }
   }
 
   // ──────────────────────────────────────────────────────── input plumbing
@@ -377,34 +402,39 @@ class V2Controller extends ChangeNotifier {
   }
 
   // ──────────────────────────────────────────────────────── frame tick
+  // Prediction throttle — pellet eating, ejected eating, virus pops, and
+  // cell-vs-cell are all O(local × remote) loops. At 60 / 120 Hz they
+  // dominate the per-frame budget for no perceptible gain (server confirms
+  // these events every 33 ms anyway). Running them at 30 Hz cuts the
+  // prediction CPU cost in half while still leading the server by 1 tick.
+  int _predictFrameCounter = 0;
   /// Drive simulation + interpolation + input send. Call from the screen's
   /// per-frame ticker.
   void tick(double dt) {
     if (dt <= 0) return;
 
     // 1. Local sim step (movement, cohesion, separation, integrate, eject,
-    //    merge, auto-split cap). Mirrors Offline Classic 1:1.
+    //    merge, auto-split cap). Mirrors Offline Classic 1:1. This MUST
+    //    run every frame — it owns the local cell's position which the
+    //    camera follows; throttling it would visibly cap the input rate.
     sim.step(dt, world: world);
 
-    // 2. Predict pellet eating against the current world cache.
+    // Prediction passes run on alternating frames. At 60 fps that's 30 Hz,
+    // which matches the server tick. At 120 fps it's 60 Hz which is still
+    // ahead of the server. Pellet eating runs every frame because a missed
+    // pellet contact is immediately visible (the dot stays under the cell).
     _predictPelletEating();
-
-    // 3. Predict eating of local-spawned feed (own cells absorbing own feed)
-    //    and of server-side feed in viewport. Also expire stale local feed
-    //    so it doesn't pile up after server's authoritative copy takes over.
-    _predictEjectedEating();
-    _expireLocalEjected();
-
-    // 4. Predict virus pops. The server is authoritative but waiting a full
-    //    RTT for the cell explosion makes the action feel rubbery, so we run
-    //    the same SplitHandler.popVirus locally.
-    _predictVirusPops();
-
-    // 5. Predict cell-vs-cell eating both directions — we eating an enemy
-    //    AND being eaten ourselves. Without this, both events lag by ~1 RTT
-    //    (the server's tick + the snapshot round-trip), which makes
-    //    aggressive plays feel sluggish.
-    _predictCellEating();
+    final runHeavy = (_predictFrameCounter++ & 1) == 0;
+    if (runHeavy) {
+      _predictEjectedEating();
+      _expireLocalEjected();
+      _predictVirusPops();
+      _predictCellEating();
+    } else {
+      // Even on the "off" frame, keep local-ejected lifetime accurate so
+      // they expire on schedule even if we skip the eating pass.
+      _expireLocalEjected();
+    }
 
     // 6. Snapshot-buffer interpolation for every remote entity. Render time
     //    is `now - interpDelayMs` so we always interpolate between two real
@@ -891,6 +921,8 @@ class V2Controller extends ChangeNotifier {
       await s.cancel();
     }
     await client.dispose();
+    deathListenable.dispose();
+    connStateListenable.dispose();
     super.dispose();
   }
 }
