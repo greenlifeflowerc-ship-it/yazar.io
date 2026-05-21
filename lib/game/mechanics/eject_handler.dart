@@ -46,8 +46,19 @@ class EjectHandler {
         if (c.mass < GameConstants.ejectMinMass) break;
         c.mass -= GameConstants.ejectCost;
 
+        // Determinstic mode: replace the random ± 6 ° / ± 5 % wobble with a
+        // burst-index-based spread so the SERVER (which has no client RNG
+        // access) can reproduce the exact piece path the player saw. The
+        // spread keeps the visible "spray" agar.io has for burst > 1
+        // without leaving the server unable to match it.
+        //   spreadStep   — half-degree per index, so 5 pieces in a burst
+        //                  fan out over ~ 16 ° total. Matches the
+        //                  "skinny cone" agar.io mobile produces.
+        //   centeredIdx  — recenter the spread around the aim direction
+        //                  (e.g. for burst=5 → [-2, -1, 0, 1, 2]).
+        final centeredIdx = i - (burstCount - 1) / 2.0;
         final randomRad = deterministic
-            ? 0.0
+            ? centeredIdx * 4.0 * pi / 180.0
             : (rng.nextDouble() * 12 - 6) * (pi / 180);
         final speedVar = deterministic ? 1.0 : 0.95 + rng.nextDouble() * 0.1;
 

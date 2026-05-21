@@ -743,38 +743,41 @@ function updateViruses(dt: number): void {
 }
 
 // ─────────────────────────────────────────────────────── eject
-function tryDoEject(p: Player, dirX: number, dirY: number): void {
+// `burstIdx` and `burstCount` describe this piece's position inside a
+// multi-piece burst (high feedSpeedMultiplier). They drive a deterministic
+// per-index angular spread that matches the client EjectHandler's spread
+// when `deterministic` is on — both sides end up with identical piece
+// paths even though there's no shared RNG.
+function tryDoEject(
+  p: Player,
+  dirX: number,
+  dirY: number,
+  burstIdx: number = 0,
+  burstCount: number = 1,
+): void {
   if (p.dead) return;
   const m = Math.hypot(dirX, dirY);
   const ux = m > 0.05 ? dirX / m : p.input.lastDir.x;
   const uy = m > 0.05 ? dirY / m : p.input.lastDir.y;
   const er = radius(EJECT_MASS);
-  // Per-player tuning, sent at join. Mirror the client's offline
-  // EjectHandler so the server-side piece flies on EXACTLY the same arc
-  // the local sim is showing the player. The previous "fixed" version
-  // ignored these multipliers, which is why the user complained the
-  // feed's collision position felt "imaginary".
   const speedMult = p.ejectSpeedMult > 0 ? p.ejectSpeedMult : 1.0;
   const distMult = p.ejectDistMult > 0 ? p.ejectDistMult : 1.0;
-  // EjectHandler.update uses the formula:
-  //   derivedFric = 1 - (1 - baseFric) * speedMult / distMult
-  // so identical online physics requires the same per-piece friction.
   const derivedFric = clamp(
     1 - (1 - EJECT_FRICTION_PER_FRAME) * speedMult / distMult,
     0.01,
     0.99,
   );
+  // Deterministic spread matching the client EjectHandler: half-degree-per-
+  // index fan, centered on the aim direction. For burst=1 the offset is 0,
+  // so single-piece feed flies in a perfectly straight line.
+  const centeredIdx = burstIdx - (burstCount - 1) / 2;
+  const spreadAng = centeredIdx * 4 * Math.PI / 180;
+  const csA = Math.cos(spreadAng), snA = Math.sin(spreadAng);
   for (const c of p.cells) {
     if (c.mass < EJECT_MIN_MASS) continue;
     c.mass -= EJECT_COST;
-    // Determinism: no randomised angular spread or speed variance.
-    // Offline classic uses a small ± 6°, ± 5 % wobble for visual
-    // texture, but for online the local sim and server sim must
-    // agree on every piece's position — otherwise the visible piece
-    // and the collision-detectable piece are at different places, and
-    // enemies appear to eat feed "out of nowhere".
-    const fx = ux;
-    const fy = uy;
+    const fx = ux * csA - uy * snA;
+    const fy = ux * snA + uy * csA;
     const cr = radius(c.mass);
     let lx = c.x + fx * (cr + er + LAUNCH_OFFSET);
     let ly = c.y + fy * (cr + er + LAUNCH_OFFSET);
@@ -1449,7 +1452,7 @@ wss.on("connection", (ws) => {
       if (m < 0.05) { dx = player.input.lastDir.x; dy = player.input.lastDir.y; }
       const rawCount = Number(msg.count);
       const count = Number.isFinite(rawCount) ? Math.max(1, Math.min(10, Math.floor(rawCount))) : 1;
-      for (let i = 0; i < count; i++) tryDoEject(player, dx, dy);
+      for (let i = 0; i < count; i++) tryDoEject(player, dx, dy, i, count);
     } else if (type === "respawn") {
       if (player.dead) spawnCellForPlayer(player);
     } else if (type === "ping") {
