@@ -874,89 +874,57 @@ class V2Controller extends ChangeNotifier {
     }
     _countMismatchTicks = 0;
 
-    // ─────────────────────── input-replay reconciliation ───────────────
-    // Cell counts match. Instead of blending positions toward the server
-    // sample (which always lags by RTT/2), we:
-    //   1. Rebuild the local cells *from* the server sample (authoritative
-    //      position, mass, mergeReadyAt, freshSplit — everything).
-    //   2. Replay every per-frame input recorded since the seq the server
-    //      just ack'd. After replay, the local sim is exactly where the
-    //      player's inputs would have driven it had the server been
-    //      infinitely fast.
-    // This is the same loop Source-engine / agar.io use: no perpetual tug,
-    // no rubber-band, no dead-zone tuning. The only visible discrepancy
-    // is during the first RTT after a fresh divergence (rare).
-    _replayFromServer(s, serverCells);
-  }
-
-  /// Replay all frames recorded since `ackSeq` was sent. Mutates
-  /// `sim.player.cells` in place: starts from the server-authoritative
-  /// rebuild, then re-applies every recorded movement / split / eject so
-  /// the local sim ends up at its "current predicted" state.
-  void _replayFromServer(V2State s, List<V2WorldCell> serverCells) {
-    // Cap the ack-time lookup. If we don't have a stamp (very early
-    // session) replay from the head of the buffer.
-    final ackStamp = _seqStampMs[s.ackSeq];
-
-    // Drop locally-ejected feed that was spawned AFTER the server-ack
-    // timestamp. Replay below will re-fire the corresponding doEject calls
-    // and re-create them — without this, the original local pieces plus
-    // the replay-spawned pieces would double-render until the FIFO match
-    // drains them.
-    if (ackStamp != null && sim.localEjected.isNotEmpty) {
-      sim.localEjected.removeWhere(
-        (e) => e.spawnTime.millisecondsSinceEpoch > ackStamp,
-      );
-    }
-
-    // Rebuild local cells from the server snapshot. This blows away any
-    // local prediction state — it's about to be re-derived from the input
-    // history below.
-    _rebuildLocalFromServer(serverCells);
-
-    // Find the first frame the server has NOT seen yet.
-    int startIdx = 0;
-    if (ackStamp != null) {
-      while (startIdx < _frameHistory.length &&
-          _frameHistory[startIdx].stampMs <= ackStamp) {
-        startIdx++;
+    // ─────────────────────── trust-local reconciliation ───────────────
+    // Cell counts match. For the local player's own cells we DO NOT touch
+    // position — the local sim is the source of truth for "where am I" so
+    // the joystick produces zero-lag motion. The server is still the
+    // source of truth for:
+    //   • Catastrophic divergence (we missed a virus pop, world boundary
+    //     bounce, etc.) → snap-rebuild past a wide tolerance.
+    //   • Total mass drift (pellet eating prediction is approximate) →
+    //     gentle scaling.
+    //   • Discrete events (death, respawn, split count) — those still go
+    //     through the count-mismatch tolerate path above.
+    //
+    // The previous "snap + input replay" approach matched server exactly
+    // but each replay re-ran the local EjectHandler RNG with fresh seeds,
+    // which made feed pieces and split impulses jitter once per snapshot.
+    // Trust-local restores the buttery-smooth single-player feel.
+    double maxDrift2 = 0;
+    for (final l in sim.cells) {
+      V2WorldCell? nearest;
+      double bestD2 = double.infinity;
+      for (final r in serverCells) {
+        final dx = r.targetX - l.position.dx;
+        final dy = r.targetY - l.position.dy;
+        final d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          nearest = r;
+        }
+      }
+      if (nearest != null && bestD2 > maxDrift2) {
+        maxDrift2 = bestD2;
       }
     }
 
-    // Walk forward through unacknowledged frames re-running the sim with
-    // the recorded inputs so the cell ends up where the player visually
-    // expects, not 1 RTT behind.
-    for (int i = startIdx; i < _frameHistory.length; i++) {
-      final f = _frameHistory[i];
-      sim.moveDir = f.moveDir;
-      sim.lastNonZeroDir = f.lastDir;
-      sim.attackMode = f.attack;
-      if (f.splitFired) {
-        sim.doSplit(f.splitAim);
-      }
-      if (f.ejectBurst > 0) {
-        // doEject also re-spawns the local pieces we just culled above.
-        // Mass deduction + recoil are intentionally re-applied since the
-        // rebuilt cells started from the SERVER's pre-eject mass.
-        sim.doEject(f.ejectAim);
-      }
-      sim.step(f.dt, world: world, replay: true);
+    // 350 u tolerance: covers steady RTT drift, virus-pop impulses, fresh
+    // split spread, attack-mode lane re-alignment. Past it, something
+    // major happened on the server we can't reproduce — snap.
+    const hardSnapDrift = 350.0;
+    if (maxDrift2 > hardSnapDrift * hardSnapDrift) {
+      _rebuildLocalFromServer(serverCells);
     }
 
-    // After replay, restore the controller's current input to the live
-    // values (the loop above scrubbed them while walking history).
-    sim.moveDir = _moveDir;
-    sim.lastNonZeroDir = _lastDir;
-    sim.attackMode = _attackMode;
-
-    // Total-mass correction kept as a safety net for pellet eating, which
-    // is purely a client-side prediction and can drift. Pellet eats are
-    // not part of the input record so replay can't recover them.
+    // Mass-scale correction stays — pellet eating accumulates tiny
+    // prediction errors that mass-aware physics (max-speed clamp) needs
+    // the server view to correct. Bumped threshold to 12 % because we no
+    // longer do per-cell mass correction on every snapshot.
     if (s.self.mass > 0 && sim.cells.isNotEmpty) {
       final localTotal = sim.cells.fold(0.0, (acc, c) => acc + c.mass);
       final serverTotal = s.self.mass;
       final drift = (serverTotal - localTotal).abs();
-      if (drift > localTotal * 0.10 && localTotal > 0) {
+      if (drift > localTotal * 0.12 && localTotal > 0) {
         final scale = serverTotal / localTotal;
         for (final c in sim.cells) {
           c.mass = (c.mass * scale).clamp(1.0, GameConstants.maxCellMass);
@@ -964,8 +932,7 @@ class V2Controller extends ChangeNotifier {
       }
     }
 
-    // Trim the seq-stamp map of entries the server has already ack'd —
-    // we'll never need to rewind to those again.
+    // Trim stamp map so it doesn't grow unbounded.
     _seqStampMs.removeWhere((seq, _) => seq <= s.ackSeq);
   }
 
