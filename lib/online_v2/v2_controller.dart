@@ -44,15 +44,20 @@ class V2Controller extends ChangeNotifier {
   final V2LocalSim sim = V2LocalSim();
   final V2SkinCache skinCache = V2SkinCache();
 
-  /// Local lifetime cap for self-spawned ejected mass. After this window the
-  /// authoritative server-side copy (in [V2World.ejected]) has fully arrived,
-  /// so the locally-spawned one is dropped to avoid double-rendering.
-  /// Local ejected mass is rendered until the matching server-broadcast copy
-  /// has had time to arrive (1 RTT + 1 server tick). Too short = visible
-  /// "blink" when the feed disappears before the server version shows up.
-  /// Too long = double-rendered feed (local + server overlap) is visible.
-  /// 300 ms covers typical mobile latencies (RTT ≤ 250 ms) comfortably.
-  static const _localEjectedLifetimeMs = 300;
+  /// Safety net only: local ejected pieces normally live until the server
+  /// FIFO-matches them via `addEjected`, at which point we transfer their
+  /// render position to the server piece and drop the local copy. This
+  /// timeout only matters when the server never confirms (rare: server
+  /// rejected the eject because mass dropped below threshold, or the
+  /// packet was lost). Generous 2 s window so the feed never visually
+  /// "blinks" out on a momentary network hiccup — agar.io mobile parity:
+  /// feed only disappears when something physically eats it.
+  static const _localEjectedLifetimeMs = 2000;
+  /// Hard cap on how many local pieces we keep alive simultaneously. With
+  /// the 50 ms eject timer floor and ~80 ms RTT, we expect ≤ 8 pending at a
+  /// time. 64 is a comfortable ceiling so unbounded growth can't happen
+  /// even if the server stops broadcasting (extremely degraded link).
+  static const _localEjectedHardCap = 64;
   /// Local prediction window for virus pops, used to suppress accidental
   /// re-pop of the same virus across two ticks before the server confirms.
   final Set<String> _locallyPoppedViruses = {};
@@ -288,15 +293,26 @@ class V2Controller extends ChangeNotifier {
 
     world.applySnapshot(s);
 
-    // Seed render positions so the visual continues from where local was —
-    // the smooth tick() will then converge it onto the server's authoritative
-    // target over the next few frames without any visible jump.
+    // Seed the snapshot interp so the visual continues from where the local
+    // piece was instead of teleporting to the server's spawn location. We
+    // overwrite BOTH `prev` AND `render` to the inherited position, then
+    // bump `prevRecvAt` ~100 ms into the past so the interp will spend that
+    // time converging from the inherited spot toward the server target.
+    // (Without the prev rewrite, tickInterp would compute t = 1 immediately
+    // because span == 0 — visible as a one-frame teleport.)
     if (inheritedRenderPos.isNotEmpty) {
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
       for (final entry in inheritedRenderPos.entries) {
         final w = world.ejected[entry.key];
         if (w != null) {
           w.renderX = entry.value.dx;
           w.renderY = entry.value.dy;
+          w.prevX = entry.value.dx;
+          w.prevY = entry.value.dy;
+          // 110 ms is the default interp delay — matches world.interpDelayMs
+          // so the piece is rendered at the inherited position for one full
+          // interp window, then converges to the server's path.
+          w.prevRecvAt = nowMs - 110;
         }
       }
     }
@@ -575,14 +591,32 @@ class V2Controller extends ChangeNotifier {
     }
   }
 
-  /// After [_localEjectedLifetimeMs], the server-broadcast copy of our own
-  /// feed is fully visible via [V2World.ejected]. Drop the local-only one so
-  /// we don't render it twice.
+  /// Local feed normally goes away via FIFO match in `_onSnapshot` once the
+  /// server broadcasts the equivalent `addEjected`. This is the safety net
+  /// for two cases:
+  ///   • Server rejected the eject (mass dropped below threshold mid-burst)
+  ///     so no `addEjected` will ever come. Without this, the local piece
+  ///     would render forever.
+  ///   • Network dropped the snapshot containing the match. RTT spike.
+  /// Either way 2 s is long enough that the eye won't see a "blink" — the
+  /// piece has long since landed and decayed to zero velocity.
+  ///
+  /// Also enforces the hard cap so a runaway eject loop (or a malicious
+  /// network condition) can't grow the list unbounded. We drop the OLDEST
+  /// pieces (those most likely already confirmed by server, just stuck in
+  /// the queue because they're un-FIFO-matched for some reason) — not the
+  /// newest, so the player keeps seeing their freshest feed on screen.
   void _expireLocalEjected() {
     if (sim.localEjected.isEmpty) return;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     sim.localEjected.removeWhere((e) =>
         nowMs - e.spawnTime.millisecondsSinceEpoch > _localEjectedLifetimeMs);
+    if (sim.localEjected.length > _localEjectedHardCap) {
+      sim.localEjected.removeRange(
+        0,
+        sim.localEjected.length - _localEjectedHardCap,
+      );
+    }
   }
 
   /// Predict cell-vs-cell eating, both directions:
