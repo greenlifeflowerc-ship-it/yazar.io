@@ -813,18 +813,19 @@ function updateEjected(dt: number): void {
   const dt60 = dt * 60;
   for (const e of ejected.values()) {
     if (e.vx === 0 && e.vy === 0) continue;
-    // Feed magnet — pulls pieces toward nearby cells within 150 u so
-    // ejected mass tends to flow back into the player after slowing.
-    // Mirrors the client's offline EjectHandler magnet so server and
-    // client agree on where each piece ends up over its flight. Without
-    // this, ~50 % of a micro burst sat on the ground stranded, which
-    // the player perceived as "half my ejected mass vanished".
+    // Feed magnet — pulls pieces toward nearby cells. Range scales with
+    // the cell's radius so even massive cells (dev start mass,
+    // late-game splits) can recover the feed they shoot from their
+    // edge. Mirrors the client EjectHandler magnet so server and client
+    // agree on where each piece ends up.
     let magVx = 0, magVy = 0;
-    cellGrid.queryEach(e.x, e.y, 150, (c) => {
+    cellGrid.queryEach(e.x, e.y, 1200, (c) => {
+      const cr = radius(c.mass);
+      const magnetRange = Math.max(150, cr + 300);
       const dx = c.x - e.x, dy = c.y - e.y;
       const d = Math.hypot(dx, dy);
-      if (d < 10 || d > 150) return;
-      const strength = (1 - d / 150) * 800;
+      if (d < 10 || d > magnetRange) return;
+      const strength = (1 - d / magnetRange) * 800;
       magVx += (dx / d) * strength;
       magVy += (dy / d) * strength;
     });

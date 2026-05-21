@@ -110,11 +110,20 @@ class EjectHandler {
 
   Color _vivid(Color c) {
     final hsl = HSLColor.fromColor(c);
-    // Increase saturation and lightness slightly to make it pop.
-    return hsl
-        .withSaturation((hsl.saturation * 1.2).clamp(0.0, 1.0))
-        .withLightness((hsl.lightness * 1.1).clamp(0.0, 1.0))
-        .toColor();
+    // Crank saturation to max and bring lightness into the bright-neon
+    // band (0.55 – 0.70). Pure RGB cell colours (#FF0000 etc.) already
+    // sit there but skin tints, dimmed bot colours, and any non-palette
+    // hue get a real boost. The piece reads as "neon glow stone" instead
+    // of "dimmed cell colour", matching the agar.io mobile feed look.
+    final boostedL = hsl.lightness < 0.5
+        ? 0.55
+        : (hsl.lightness * 1.15).clamp(0.55, 0.70);
+    return HSLColor.fromAHSL(
+      1.0,
+      hsl.hue,
+      1.0,
+      boostedL,
+    ).toColor();
   }
 
   Offset _findClearLaunchPoint(
@@ -184,8 +193,16 @@ class EjectHandler {
           for (final c in p.cells) {
             final delta = c.position - e.position;
             final d = delta.distance;
-            if (d < 150 && d > 10) {
-              final strength = (1.0 - d / 150) * 800.0;
+            // Magnet range scales with cell radius so massive cells
+            // (dev start mass, late-game splits) can still recover their
+            // own feed. A fixed 150 u range only engaged for cells with
+            // r < 130 — anything bigger ejected feed straight outside
+            // the magnet field and never got it back.
+            final magnetRange = c.radius + 300.0 > 150.0
+                ? c.radius + 300.0
+                : 150.0;
+            if (d < magnetRange && d > 10) {
+              final strength = (1.0 - d / magnetRange) * 800.0;
               magnetForce += (delta / d) * strength;
             }
           }
