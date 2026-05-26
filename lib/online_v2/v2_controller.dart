@@ -261,6 +261,26 @@ class V2Controller extends ChangeNotifier {
     // with the local piece's last position. Without the position transfer,
     // the local piece (rendered at the predicted cell edge + flight) vanishes
     // and the server piece pops up tens of units behind it — looks like the
+    // Reconcile locally-predicted enemy kills: rmCells confirms, TTL restores.
+    if (_locallyKilledExpiry.isNotEmpty) {
+      final ids = _locallyKilledExpiry.keys.toList();
+      for (final id in ids) {
+        if (s.rmCells.contains(id)) {
+          _locallyKilledEnemy.remove(id);
+          _locallyKilledExpiry.remove(id);
+        }
+      }
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      _locallyKilledExpiry.removeWhere((id, exp) {
+        if (nowMs > exp) {
+          final restored = _locallyKilledEnemy.remove(id);
+          if (restored != null) world.cells[id] = restored;
+          return true;
+        }
+        return false;
+      });
+    }
+
     // Own ejected feed is rendered OFFLINE-STYLE from sim.localEjected for
     // the whole flight. The server still mirrors our pieces (so other
     // players see them) but we DO NOT FIFO-match local↔server, we DO NOT
@@ -442,6 +462,7 @@ class V2Controller extends ChangeNotifier {
     final runHeavy = (_predictFrameCounter++ & 1) == 0;
     if (runHeavy) {
       _predictVirusPops();
+      _predictCellEating();
     }
 
     // 6. Snapshot-buffer interpolation for every remote entity. Render time
@@ -619,31 +640,15 @@ class V2Controller extends ChangeNotifier {
     }
   }
 
-  /// Predict cell-vs-cell eating, both directions:
-  ///   • We eat an enemy → remove their cell locally, add their mass.
-  ///     Tracked for ~1 s; if the server keeps reporting the cell alive in
-  ///     subsequent snapshots we restore it (false-positive recovery).
-  ///   • We get eaten → drop the local cell immediately. The next snapshot's
-  ///     reconcile will confirm; if we mispredicted, the server-driven
-  ///     rebuild restores the cell on the next snapshot.
-  ///
-  /// Uses MASS-based ratio (matches the server). Uses the server's
-  /// authoritative target position for enemy cells (renderX/Y lags behind
-  /// what the server thinks is happening, which would make us miss eats
-  /// the server commits to).
+  /// Predict cell eating (we eat enemy only). Server-authoritative for
+  /// the reverse direction (enemy eats us) to avoid flicker from
+  /// predict-restore cycles.
   void _predictCellEating() {
     if (!sim.isInitialized || sim.cells.isEmpty) return;
     final selfId = _playerId;
     if (selfId == null) return;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
 
-    // (a) we → eat → enemy.
-    //
-    // No per-cell cap any more — capping at 2 made multi-enemy combos
-    // feel slow ("بطيئ كتير لياكل"). All enemies inside the eat
-    // radius get consumed in the same predict pass, matching what the
-    // server will compute and what the player visually expects when
-    // they land in a cluster.
     final eaten = <String>[];
     for (final ours in sim.cells) {
       final ar = ours.radius;
@@ -657,7 +662,6 @@ class V2Controller extends ChangeNotifier {
         final br = math.sqrt(enemy.targetMass / math.pi) * 10;
         final eatR = ar - br * 0.4;
         if (eatR <= 0) continue;
-        // Use targetX/Y (authoritative) — renderX/Y lags ~38 ms behind.
         final dx = enemy.targetX - ours.position.dx;
         final dy = enemy.targetY - ours.position.dy;
         if (dx * dx + dy * dy < eatR * eatR) {
@@ -674,33 +678,9 @@ class V2Controller extends ChangeNotifier {
     for (final id in eaten) {
       final cell = world.cells.remove(id);
       if (cell != null) {
-        // Stash so we can restore on mispredict.
         _locallyKilledEnemy[id] = cell;
         _locallyKilledExpiry[id] = nowMs + _locallyKilledTtlMs;
       }
-    }
-
-    // (b) enemy → eats → us
-    final dead = <ge.Cell>[];
-    for (final ours in sim.cells) {
-      for (final enemy in world.cells.values) {
-        if (enemy.ownerId == selfId) continue;
-        if (enemy.targetMass <= ours.mass) continue;
-        final ratio = enemy.freshSplit ? 1.33 : 1.25;
-        if (enemy.targetMass < ours.mass * ratio) continue;
-        final er = math.sqrt(enemy.targetMass / math.pi) * 10;
-        final eatR = er - ours.radius * 0.4;
-        if (eatR <= 0) continue;
-        final dx = ours.position.dx - enemy.targetX;
-        final dy = ours.position.dy - enemy.targetY;
-        if (dx * dx + dy * dy < eatR * eatR) {
-          dead.add(ours);
-          break;
-        }
-      }
-    }
-    if (dead.isNotEmpty) {
-      sim.player.cells.removeWhere(dead.contains);
     }
   }
 
@@ -799,9 +779,9 @@ class V2Controller extends ChangeNotifier {
       //     "shrank" the freshly-split cells back into one.
       //   • Recent virus pop (local > server) ......... 30 ticks (~1 s)
       //     — we popped predictively, server hasn't broadcast fragments yet.
-      //   • Otherwise local > server ..................  1 tick   (~33 ms)
-      //     — almost certainly we just got eaten / server-side-merged. Snap
-      //     to reality NOW so the player sees the death / merge in real time.
+      //   • Otherwise local > server ..................  5 ticks  (~166 ms)
+      //     — server merged cells before local (merge timer RTT skew).
+      //     5 ticks lets the local merge catch up without a visible snap.
       //   • Local < server ............................  3 ticks (~100 ms)
       //     — server has cells we didn't predict; rebuild to catch up.
       final int tolerateTicks;
@@ -811,7 +791,7 @@ class V2Controller extends ChangeNotifier {
         } else if (recentVirusPop) {
           tolerateTicks = 30;
         } else {
-          tolerateTicks = 1;
+          tolerateTicks = 5;
         }
       } else {
         tolerateTicks = _countMismatchSnapThreshold; // 3
