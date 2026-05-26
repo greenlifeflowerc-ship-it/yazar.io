@@ -798,7 +798,7 @@ class V2Controller extends ChangeNotifier {
       }
 
       if (_countMismatchTicks >= tolerateTicks) {
-        _rebuildLocalFromServer(serverCells);
+        _rebuildLocalFromServer(serverCells, snapPositions: false);
         _countMismatchTicks = 0;
       }
       return;
@@ -838,9 +838,16 @@ class V2Controller extends ChangeNotifier {
       }
       if (nearest != null) {
         if (bestD2 > maxDrift2) maxDrift2 = bestD2;
-        // Sync merge timer from server — prevents merge-timing skew that
-        // causes count mismatches and rebuild-teleports.
-        if (sNow > 0 && nearest.mergeReadyAtMs > 0) {
+        // Sync merge timer from server — prevents merge-timing skew.
+        // Use freshSplit flag as primary signal: when the server clears
+        // it, the cell is merge-ready on the server, so make it ready
+        // locally too. Fall back to the timestamp when still fresh.
+        if (!nearest.freshSplit) {
+          // Server says merge-ready → allow local merge immediately.
+          if (l.mergeReadyAt.isAfter(nowDt)) {
+            l.mergeReadyAt = nowDt;
+          }
+        } else if (sNow > 0 && nearest.mergeReadyAtMs > 0) {
           final remainMs =
               (nearest.mergeReadyAtMs - sNow).clamp(0, 28000);
           l.mergeReadyAt = nowDt.add(Duration(milliseconds: remainMs));
@@ -895,7 +902,7 @@ class V2Controller extends ChangeNotifier {
     _seqStampMs.removeWhere((seq, _) => seq <= s.ackSeq);
   }
 
-  void _rebuildLocalFromServer(List<V2WorldCell> serverCells) {
+  void _rebuildLocalFromServer(List<V2WorldCell> serverCells, {bool snapPositions = true}) {
     final now = DateTime.now();
     final serverNow = world.lastServerNow;
     // To avoid the visible 1-frame "stop" of a wholesale clear+rebuild, we
@@ -948,7 +955,9 @@ class V2Controller extends ChangeNotifier {
       final cell = ge.Cell(
         id: s.id,
         ownerId: s.ownerId,
-        position: Offset(s.targetX, s.targetY),
+        position: (!snapPositions && donor != null)
+            ? donor.position
+            : Offset(s.targetX, s.targetY),
         mass: keepMass,
         color: s.color,
         name: s.name,
