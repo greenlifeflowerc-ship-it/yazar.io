@@ -165,7 +165,7 @@ class V2Controller extends ChangeNotifier {
   /// time out unconfirmed local actions.
   final List<_PendingAction> _pendingActions = [];
   int _countMismatchTicks = 0;
-  static const _countMismatchSnapThreshold = 3; // ~100 ms at 30 Hz
+  static const _countMismatchSnapThreshold = 10; // ~333 ms at 30 Hz
 
   /// After `welcome` we spawn the local sim at world center as a placeholder
   /// — the server's actual chosen spawn point arrives one tick later.
@@ -779,9 +779,9 @@ class V2Controller extends ChangeNotifier {
       //     "shrank" the freshly-split cells back into one.
       //   • Recent virus pop (local > server) ......... 30 ticks (~1 s)
       //     — we popped predictively, server hasn't broadcast fragments yet.
-      //   • Otherwise local > server ..................  5 ticks  (~166 ms)
+      //   • Otherwise local > server ..................  10 ticks (~333 ms)
       //     — server merged cells before local (merge timer RTT skew).
-      //     5 ticks lets the local merge catch up without a visible snap.
+      //     10 ticks lets the local merge catch up without a visible snap.
       //   • Local < server ............................  3 ticks (~100 ms)
       //     — server has cells we didn't predict; rebuild to catch up.
       final int tolerateTicks;
@@ -791,7 +791,7 @@ class V2Controller extends ChangeNotifier {
         } else if (recentVirusPop) {
           tolerateTicks = 30;
         } else {
-          tolerateTicks = 5;
+          tolerateTicks = 10;
         }
       } else {
         tolerateTicks = _countMismatchSnapThreshold; // 3
@@ -822,6 +822,8 @@ class V2Controller extends ChangeNotifier {
     // which made feed pieces and split impulses jitter once per snapshot.
     // Trust-local restores the buttery-smooth single-player feel.
     double maxDrift2 = 0;
+    final nowDt = DateTime.now();
+    final sNow = world.lastServerNow;
     for (final l in sim.cells) {
       V2WorldCell? nearest;
       double bestD2 = double.infinity;
@@ -834,8 +836,15 @@ class V2Controller extends ChangeNotifier {
           nearest = r;
         }
       }
-      if (nearest != null && bestD2 > maxDrift2) {
-        maxDrift2 = bestD2;
+      if (nearest != null) {
+        if (bestD2 > maxDrift2) maxDrift2 = bestD2;
+        // Sync merge timer from server — prevents merge-timing skew that
+        // causes count mismatches and rebuild-teleports.
+        if (sNow > 0 && nearest.mergeReadyAtMs > 0) {
+          final remainMs =
+              (nearest.mergeReadyAtMs - sNow).clamp(0, 28000);
+          l.mergeReadyAt = nowDt.add(Duration(milliseconds: remainMs));
+        }
       }
     }
 
