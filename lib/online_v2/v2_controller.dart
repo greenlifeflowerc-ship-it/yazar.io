@@ -221,7 +221,7 @@ class V2Controller extends ChangeNotifier {
       name: w.name,
       color: const Color(0xFFFFD700),
       position: Offset(w.worldSize / 2, w.worldSize / 2),
-      mass: 76,
+      mass: 5000,
       skinImage: SkinSettings.instance.skinImage,
     );
     _deadServerConfirmed = false;

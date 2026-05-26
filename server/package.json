@@ -10,11 +10,10 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "uWebSockets.js": "uNetworking/uWebSockets.js#v20.49.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "@types/ws": "^8.5.10",
     "tsx": "^4.19.2",
     "typescript": "^5.4.0"
   }

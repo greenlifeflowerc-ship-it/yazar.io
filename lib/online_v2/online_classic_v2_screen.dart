@@ -96,9 +96,8 @@ class _OnlineClassicV2ScreenState extends State<OnlineClassicV2Screen>
     // late-game scenarios doesn't require a real boost.
     final devMass = GameSettings.instance.devStartMass;
     final activeBoostMult = AuthService.instance.activeMassMultiplier;
-    // Server's base start mass = 76, so multiplier × 76 = effective spawn.
     final effectiveMult = devMass > 0
-        ? (devMass / 76.0).clamp(0.5, 300.0)
+        ? (devMass / 5000.0).clamp(0.5, 300.0)
         : activeBoostMult;
     _ctrl.connect(
       playerName: widget.nickname.trim(),

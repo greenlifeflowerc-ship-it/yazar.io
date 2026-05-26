@@ -175,28 +175,24 @@ class V2LocalSim {
     }
   }
 
-  // NOTE: pellet magnet is still off both client and server — it cost the
-  // server 8.8 M ops/tick and is not part of Offline Classic either. Pellets
-  // are picked up via resolveEatPellets() on contact (zero predicted drift).
-
   // ────────────────────────── ported from GameEngine ──────────────────────
-  // We can't call the engine's private `_applyInputForce` / `_integrateCells`
-  // directly, so the formulas are reproduced verbatim here. Any tuning of
-  // GameConstants in `lib/game/game_engine.dart` flows through automatically.
 
-  /// Simple impulse — mirrors the server's [applyInputForce] EXACTLY.
-  /// Each cell gets the same per-tick velocity kick; damping in [_integrate]
-  /// + per-radius speed clamp shape the feel. No convergent target point,
-  /// no agility scaling, no per-cell pow() calls. This is what the user
-  /// confirmed feels smooth (Desktop reference style).
   void _applyInputForce(Player p, Offset rawDir, double dt) {
     final mag = rawDir.distance;
     if (mag < 0.05) return;
-    final ux = rawDir.dx / mag;
-    final uy = rawDir.dy / mag;
-    final f = GameConstants.inputMoveStrength * dt;
+    final intensity = mag > 1.0 ? 1.0 : mag;
+    final com = p.centerOfMass;
+    final targetPoint = com + (rawDir / mag) * 1000.0;
     for (final c in p.cells) {
-      c.velocity += Offset(ux * f, uy * f);
+      final toTarget = targetPoint - c.position;
+      final dist = toTarget.distance;
+      if (dist < 0.1) continue;
+      final dir = toTarget / dist;
+      final maxSpeed = GameConstants.maxSpeedForRadius(c.radius);
+      final agility =
+          math.pow(150.0 / (c.mass + 50.0), 0.15).clamp(0.7, 1.5).toDouble();
+      final accel = maxSpeed * GameConstants.dampingPerSecond * agility;
+      c.velocity += dir * accel * intensity * dt;
     }
   }
 
@@ -234,9 +230,20 @@ class V2LocalSim {
       }
       final r = c.radius;
       final inset = r * 0.75;
+      final world = GameConstants.worldSize;
+      final atLeft = c.position.dx <= inset;
+      final atRight = c.position.dx >= world - inset;
+      final atTop = c.position.dy <= inset;
+      final atBottom = c.position.dy >= world - inset;
+      if ((atLeft && c.velocity.dx < 0) || (atRight && c.velocity.dx > 0)) {
+        c.velocity = Offset(0, c.velocity.dy);
+      }
+      if ((atTop && c.velocity.dy < 0) || (atBottom && c.velocity.dy > 0)) {
+        c.velocity = Offset(c.velocity.dx, 0);
+      }
       c.position = Offset(
-        c.position.dx.clamp(inset, GameConstants.worldSize - inset),
-        c.position.dy.clamp(inset, GameConstants.worldSize - inset),
+        c.position.dx.clamp(inset, world - inset),
+        c.position.dy.clamp(inset, world - inset),
       );
     }
   }

@@ -1,63 +1,19 @@
 /**
- * Yazario Online Classic V3 — high-performance authoritative WebSocket server.
- *
- * Designed for 1-vCPU hosts (AWS Lightsail) with the following architectural
- * upgrades over the previous V2 implementation:
- *
- *   1. Spatial hash broadphase — pellet, cell, ejected and virus lookups all
- *      go through a 36×36 uniform grid instead of O(N²) scans:
- *        resolveEatPellets  : 2.84 M ops/tick → ~20 K ops/tick  (≈140× faster)
- *        resolveCellVsCell  :  122 K ops/tick →  ~3 K ops/tick  (≈40×  faster)
- *        botDecide neighbour scan : whole-world iteration → ~10 cells checked.
- *
- *   2. Soft hard-position correction during separation (alpha 0.5) — fixes
- *      "cells overlap visibly" without producing the snap-jitter of full
- *      Agar.io-style correction. Matches the client's MergeHandler exactly so
- *      reconciliation never tugs the cell back.
- *
- *   3. Tick budget monitor — logs any tick that exceeds 80 % of the budget
- *      so capacity issues are visible in pm2 logs instead of silently
- *      degrading into stutter.
- *
- *   4. Bot count tuned for Lightsail (50 instead of 70) — fills the world
- *      densely while leaving 30 % CPU headroom for human spikes.
- *
- *   5. Pellet grid is maintained incrementally (only changes when a pellet
- *      is added/removed) — avoids O(P) rebuild cost per tick.
- *
- *   6. Cell / ejected / virus grids rebuilt once per tick AFTER physics so
- *      collision queries see correct positions. Cheap (~500 inserts/tick).
- *
- * Wire protocol (V2) is unchanged — no client changes required:
- *   client→server: {type:"join", name, skin, massMult}
- *                  {type:"input", seq, dx, dy, attack}
- *                  {type:"split", seq}
- *                  {type:"eject", seq, count}
- *                  {type:"respawn"}
- *                  {type:"ping", t}
- *   server→client: {type:"welcome", id, worldSize, tickRate, tickMs, name}
- *                  {type:"state", t, now, ack, self, ...add/upd/rm arrays,
- *                                 leaderboard, online}
- *                  {type:"pong", t, now}
+ * Yazario Online Classic V4 — exact offline-classic physics, uWebSockets.js transport.
  *
  * Run:  npm run dev               (tsx watch)
  *       npm run build && npm start (prod — runs compiled dist/index.js)
  */
 
-import { createServer } from "http";
-import { WebSocketServer, WebSocket } from "ws";
+import uWS from "uWebSockets.js";
 
 // ─────────────────────────────────────────────────────── world constants
 const PORT = Number(process.env.PORT ?? 2567);
 
 const WORLD_SIZE = 14142;
-const TARGET_PELLETS = 7500;
+const TARGET_PELLETS = 8000;
 const TARGET_VIRUSES = 30;
-// Tuned for a Lightsail 2-vCPU host. With ~50 ms of CPU budget across both
-// cores per tick, 50 bots + 8 humans fits well within the 26 ms wall-clock
-// budget (Node is single-thread, but the OS scheduling on the second core
-// keeps the WS i/o & GC out of the tick path).
-const TARGET_BOTS = 50;
+const TARGET_BOTS = 70;
 
 const MAX_CELLS_PER_PLAYER = 16;
 const MAX_CELL_MASS = 22500;
@@ -102,11 +58,10 @@ const LANE_WIDTH_BASE = 18.0;
 const LANE_WIDTH_RADIUS_FACTOR = 0.72;
 const LANE_FORWARD_DEPTH_FACTOR = 2.8;
 
-// Per-radius speed clamp (Desktop reference values — proven smooth).
 const REFERENCE_RADIUS = 35.0;
 const MAX_SMALL_CELL_SPEED = 360.0;
-const MAX_LARGE_CELL_SPEED = 95.0;
-const SPEED_RADIUS_POWER = 0.42;
+const MAX_LARGE_CELL_SPEED = 115.0;
+const SPEED_RADIUS_POWER = 0.38;
 const SPEED_SCALE_BASE = 260.0;
 
 // Merge.
@@ -277,9 +232,11 @@ interface Cell {
   mergeReadyAt: number;
 }
 
+interface SocketData { playerId: string; }
+
 interface Player {
   id: string;
-  socket: WebSocket | null;
+  socket: uWS.WebSocket<SocketData> | null;
   isBot: boolean;
   name: string;
   color: string;
@@ -392,12 +349,8 @@ function spawnVirus(): Virus {
 
 function spawnCellForPlayer(p: Player): void {
   const pos = safeSpawnPos();
-  // Honour the wider clamp range the join handler accepts (matches dev /
-  // test scenarios where a player wants to spawn at ~ 5 K mass). The
-  // 300× upper bound caps spawn mass at ~ 22 800, just under the engine
-  // MAX_CELL_MASS so the cell doesn't trip the auto-split limit on spawn.
   const mult = p.isBot ? 1.0 : clamp(p.massMult, 0.5, 300.0);
-  const startMass = p.isBot ? 100 : Math.round(76 * mult);
+  const startMass = p.isBot ? 100 : clamp(Math.round(5000 * mult), 76, 1e9);
   p.cells = [{
     id: newId("c"),
     ownerId: p.id,
@@ -603,13 +556,27 @@ function botDecideEject(p: Player, now: number): void {
 
 // ─────────────────────────────────────────────────────── physics
 function applyInputForce(p: Player, dt: number): void {
-  const dx = p.isBot ? p.aiDir.x : p.input.dx;
-  const dy = p.isBot ? p.aiDir.y : p.input.dy;
-  const mag = Math.hypot(dx, dy);
+  const rawDx = p.isBot ? p.aiDir.x : p.input.dx;
+  const rawDy = p.isBot ? p.aiDir.y : p.input.dy;
+  const mag = Math.hypot(rawDx, rawDy);
   if (mag < 0.05) return;
-  const ux = dx / mag, uy = dy / mag;
-  const f = INPUT_MOVE_STRENGTH * dt;
-  for (const c of p.cells) { c.vx += ux * f; c.vy += uy * f; }
+  const intensity = mag > 1.0 ? 1.0 : mag;
+  const ux = rawDx / mag, uy = rawDy / mag;
+  const com = centerOfMass(p);
+  const targetX = com.x + ux * 1000;
+  const targetY = com.y + uy * 1000;
+  for (const c of p.cells) {
+    const toX = targetX - c.x, toY = targetY - c.y;
+    const dist = Math.hypot(toX, toY);
+    if (dist < 0.1) continue;
+    const dirX = toX / dist, dirY = toY / dist;
+    const r = radius(c.mass);
+    const maxV = maxSpeedForRadius(r);
+    const agility = clamp(Math.pow(150.0 / (c.mass + 50.0), 0.15), 0.7, 1.5);
+    const accel = maxV * DAMPING_PER_SECOND * agility;
+    c.vx += dirX * accel * intensity * dt;
+    c.vy += dirY * accel * intensity * dt;
+  }
 }
 
 function applyCohesion(p: Player, dt: number): void {
@@ -698,6 +665,21 @@ function applyAttackSpread(p: Player, dt: number): void {
   }
 }
 
+function applyPelletMagnet(p: Player, dt: number): void {
+  if (p.dead) return;
+  for (const c of p.cells) {
+    pelletGrid.queryEach(c.x, c.y, 100, (pe) => {
+      const dx = pe.x - c.x, dy = pe.y - c.y;
+      const d = Math.hypot(dx, dy);
+      if (d < 100 && d > 1) {
+        const strength = (1.0 - d / 100) * 150.0;
+        c.vx += (dx / d) * strength * dt;
+        c.vy += (dy / d) * strength * dt;
+      }
+    });
+  }
+}
+
 function integrateCells(p: Player, dt: number): void {
   const damping = Math.exp(-DAMPING_PER_SECOND * dt);
   const splitFric = Math.pow(SPLIT_FRICTION_PER_FRAME, dt * 60);
@@ -718,6 +700,12 @@ function integrateCells(p: Player, dt: number): void {
       c.mass = nm < DECAY_THRESHOLD ? DECAY_THRESHOLD : nm;
     }
     const inset = r * 0.75;
+    const atLeft = c.x <= inset;
+    const atRight = c.x >= WORLD_SIZE - inset;
+    const atTop = c.y <= inset;
+    const atBottom = c.y >= WORLD_SIZE - inset;
+    if ((atLeft && c.vx < 0) || (atRight && c.vx > 0)) c.vx = 0;
+    if ((atTop && c.vy < 0) || (atBottom && c.vy > 0)) c.vy = 0;
     c.x = clamp(c.x, inset, WORLD_SIZE - inset);
     c.y = clamp(c.y, inset, WORLD_SIZE - inset);
   }
@@ -1287,20 +1275,17 @@ function buildSnapshot(p: Player, lb: LBEntry[], sendSlow: boolean): unknown {
   };
 }
 
+function safeSend(ws: uWS.WebSocket<SocketData>, obj: unknown): void {
+  try { ws.send(JSON.stringify(obj)); } catch { /* closed */ }
+}
+
 function sendSnapshotTo(p: Player, lb: LBEntry[], sendSlow: boolean): void {
-  if (p.isBot || !p.socket || p.socket.readyState !== WebSocket.OPEN) return;
-  // Build the snapshot SYNCHRONOUSLY (mutates p.seenCells / p.lastSent etc.
-  // — those need to stay coherent with this tick). Defer the expensive
-  // JSON.stringify + socket write to setImmediate so the tick can return to
-  // the event loop first. This stops the snapshot burst from eating into
-  // the NEXT tick's budget — the single biggest source of "all snapshots
-  // arrive together then 80 ms gap" jitter the client sees.
+  if (p.isBot || !p.socket) return;
   let snap: unknown;
   try { snap = buildSnapshot(p, lb, sendSlow); } catch { return; }
   const sock = p.socket;
   setImmediate(() => {
-    if (sock.readyState !== WebSocket.OPEN) return;
-    try { sock.send(JSON.stringify(snap)); } catch { /* ignore */ }
+    try { sock.send(JSON.stringify(snap)); } catch { /* closed */ }
   });
 }
 
@@ -1333,6 +1318,7 @@ setInterval(() => {
     applyCohesion(p, dt);
     applySeparation(p, dt);
     applyAttackSpread(p, dt);
+    applyPelletMagnet(p, dt);
     integrateCells(p, dt);
   }
   updateViruses(dt);
@@ -1372,7 +1358,8 @@ setInterval(() => {
   for (const [id, p] of players) {
     if (p.isBot) continue;
     if (now - p.lastSeenAt > STALE_PLAYER_MS) {
-      try { p.socket?.close(); } catch { /* ignore */ }
+      try { p.socket?.close(); } catch { /* already closed */ }
+      p.socket = null;
       players.delete(id);
     }
   }
@@ -1382,118 +1369,130 @@ setInterval(() => {
   if (tickMs > TICK_BUDGET_MS) {
     slowTickCount++;
     if (now >= slowTickReportAt) {
-      console.warn(`[yazario-v3] ${slowTickCount} slow ticks in last 5s (last: ${tickMs.toFixed(1)}ms, budget: ${TICK_BUDGET_MS.toFixed(1)}ms)`);
+      console.warn(`[yazario-v4] ${slowTickCount} slow ticks in last 5s (last: ${tickMs.toFixed(1)}ms, budget: ${TICK_BUDGET_MS.toFixed(1)}ms)`);
       slowTickCount = 0;
       slowTickReportAt = now + 5000;
     }
   }
 }, TICK_MS);
 
-// ─────────────────────────────────────────────────────── ws server
-const http = createServer((_, res) => {
-  res.writeHead(200, { "content-type": "text/plain" });
-  res.end("Yazario Online Classic V3");
-});
-const wss = new WebSocketServer({ server: http });
+// ─────────────────────────────────────────────────────── uWebSockets.js server
+function handleMessage(ws: uWS.WebSocket<SocketData>, message: ArrayBuffer): void {
+  let msg: { type?: string; [k: string]: unknown };
+  try { msg = JSON.parse(Buffer.from(message).toString("utf-8")); } catch { return; }
+  const type = msg?.type;
+  const data = ws.getUserData();
 
-wss.on("connection", (ws) => {
-  let player: Player | null = null;
-  const safeSend = (obj: unknown) => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    try { ws.send(JSON.stringify(obj)); } catch { /* ignore */ }
-  };
+  if (type === "join") {
+    if (data.playerId) return;
+    const rawName = typeof msg.name === "string" ? msg.name : "";
+    const name = rawName.trim().slice(0, 18) || "Player";
+    const skinId = typeof msg.skin === "string" ? msg.skin.slice(0, 128) : "";
+    const rawMult = Number(msg.massMult);
+    const massMult = Number.isFinite(rawMult) ? clamp(rawMult, 0.5, 300.0) : 1.0;
+    const rawEsm = Number(msg.ejectSpeedMult);
+    const ejectSpeedMult = Number.isFinite(rawEsm) ? clamp(rawEsm, 0.25, 5.0) : 1.0;
+    const rawEdm = Number(msg.ejectDistMult);
+    const ejectDistMult = Number.isFinite(rawEdm) ? clamp(rawEdm, 0.25, 5.0) : 1.0;
+    const id = newId("h");
+    data.playerId = id;
+    const player: Player = {
+      id, socket: ws, isBot: false, name,
+      color: pickPaletteColor(), skinId,
+      cells: [],
+      input: { dx: 0, dy: 0, attack: false, lastDir: { x: 1, y: 0 }, seq: 0 },
+      dead: false, deadAt: 0, lastInputSeq: 0,
+      lastSeenAt: Date.now(), spawnAt: Date.now(),
+      highestMass: 5000, massMult,
+      ejectSpeedMult, ejectDistMult,
+      eatenCount: 0,
+      aiDir: { x: 0, y: 0 }, aiNextDecide: 0, aiNextSplit: 0, aiNextEject: 0,
+      seenCells: new Set(), seenPellets: new Set(),
+      seenViruses: new Set(), seenEjected: new Set(),
+      lastSent: new Map(), lastSentVirus: new Map(), lastSentEjected: new Map(),
+    };
+    spawnCellForPlayer(player);
+    players.set(id, player);
+    safeSend(ws, {
+      type: "welcome", id,
+      worldSize: WORLD_SIZE, tickRate: TICK_RATE, tickMs: TICK_MS,
+      name: player.name,
+    });
+    return;
+  }
 
-  ws.on("message", (raw) => {
-    let msg: { type?: string; [k: string]: unknown };
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-    const type = msg?.type;
+  const player = data.playerId ? players.get(data.playerId) : undefined;
+  if (!player) return;
+  player.lastSeenAt = Date.now();
 
-    if (type === "join") {
-      if (player) return;
-      const rawName = typeof msg.name === "string" ? msg.name : "";
-      const name = rawName.trim().slice(0, 18) || "Player";
-      const skinId = typeof msg.skin === "string" ? msg.skin.slice(0, 128) : "";
-      const rawMult = Number(msg.massMult);
-      // Upper bound generous (300×) so the client can drive a dev /
-      // testing spawn mass of up to ~ 22 500 (matches the in-engine cap).
-      // The server still validates Number.isFinite to reject bad data.
-      const massMult = Number.isFinite(rawMult) ? clamp(rawMult, 0.5, 300.0) : 1.0;
-      // Per-player eject tuning. Sane clamps so a malicious / desynced
-      // client can't ship pieces at world-spanning velocities.
-      const rawEsm = Number(msg.ejectSpeedMult);
-      const ejectSpeedMult = Number.isFinite(rawEsm) ? clamp(rawEsm, 0.25, 5.0) : 1.0;
-      const rawEdm = Number(msg.ejectDistMult);
-      const ejectDistMult = Number.isFinite(rawEdm) ? clamp(rawEdm, 0.25, 5.0) : 1.0;
-      const id = newId("h");
-      player = {
-        id, socket: ws, isBot: false, name,
-        color: pickPaletteColor(), skinId,
-        cells: [],
-        input: { dx: 0, dy: 0, attack: false, lastDir: { x: 1, y: 0 }, seq: 0 },
-        dead: false, deadAt: 0, lastInputSeq: 0,
-        lastSeenAt: Date.now(), spawnAt: Date.now(),
-        highestMass: 76, massMult,
-        ejectSpeedMult, ejectDistMult,
-        eatenCount: 0,
-        aiDir: { x: 0, y: 0 }, aiNextDecide: 0, aiNextSplit: 0, aiNextEject: 0,
-        seenCells: new Set(), seenPellets: new Set(),
-        seenViruses: new Set(), seenEjected: new Set(),
-        lastSent: new Map(), lastSentVirus: new Map(), lastSentEjected: new Map(),
-      };
-      spawnCellForPlayer(player);
-      players.set(id, player);
-      safeSend({
-        type: "welcome", id,
-        worldSize: WORLD_SIZE, tickRate: TICK_RATE, tickMs: TICK_MS,
-        name: player.name,
-      });
-      return;
+  if (type === "input") {
+    const dx = Number(msg.dx), dy = Number(msg.dy);
+    const seq = Number(msg.seq);
+    const attack = !!msg.attack;
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    player.input.dx = clamp(dx, -1, 1);
+    player.input.dy = clamp(dy, -1, 1);
+    player.input.attack = attack;
+    if (Number.isFinite(seq) && seq > player.lastInputSeq) player.lastInputSeq = seq;
+  } else if (type === "split") {
+    const seq = Number(msg.seq);
+    if (Number.isFinite(seq) && seq > player.lastInputSeq) player.lastInputSeq = seq;
+    let dx = player.input.dx, dy = player.input.dy;
+    const m = Math.hypot(dx, dy);
+    if (m < 0.05) { dx = player.input.lastDir.x; dy = player.input.lastDir.y; }
+    tryDoSplit(player, dx, dy);
+  } else if (type === "eject") {
+    const seq = Number(msg.seq);
+    if (Number.isFinite(seq) && seq > player.lastInputSeq) player.lastInputSeq = seq;
+    let dx = player.input.dx, dy = player.input.dy;
+    const m = Math.hypot(dx, dy);
+    if (m < 0.05) { dx = player.input.lastDir.x; dy = player.input.lastDir.y; }
+    const rawCount = Number(msg.count);
+    const count = Number.isFinite(rawCount) ? Math.max(1, Math.min(30, Math.floor(rawCount))) : 1;
+    for (let i = 0; i < count; i++) tryDoEject(player, dx, dy, i, count);
+  } else if (type === "respawn") {
+    if (player.dead) spawnCellForPlayer(player);
+  } else if (type === "ping") {
+    const t = Number(msg.t);
+    safeSend(ws, { type: "pong", t: Number.isFinite(t) ? t : 0, now: Date.now() });
+  }
+}
+
+const app = uWS.App();
+
+app.ws<SocketData>("/*", {
+  compression: uWS.DISABLED,
+  maxPayloadLength: 4 * 1024,
+  idleTimeout: 60,
+  open: (_ws) => { /* player created on join message */ },
+  message: (ws, message, _isBinary) => { handleMessage(ws, message); },
+  close: (ws, _code, _message) => {
+    const data = ws.getUserData();
+    if (data.playerId) {
+      const p = players.get(data.playerId);
+      if (p) { p.socket = null; players.delete(data.playerId); }
     }
-
-    if (!player) return;
-    player.lastSeenAt = Date.now();
-
-    if (type === "input") {
-      const dx = Number(msg.dx), dy = Number(msg.dy);
-      const seq = Number(msg.seq);
-      const attack = !!msg.attack;
-      if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
-      player.input.dx = clamp(dx, -1, 1);
-      player.input.dy = clamp(dy, -1, 1);
-      player.input.attack = attack;
-      if (Number.isFinite(seq) && seq > player.lastInputSeq) player.lastInputSeq = seq;
-    } else if (type === "split") {
-      const seq = Number(msg.seq);
-      if (Number.isFinite(seq) && seq > player.lastInputSeq) player.lastInputSeq = seq;
-      let dx = player.input.dx, dy = player.input.dy;
-      const m = Math.hypot(dx, dy);
-      if (m < 0.05) { dx = player.input.lastDir.x; dy = player.input.lastDir.y; }
-      tryDoSplit(player, dx, dy);
-    } else if (type === "eject") {
-      const seq = Number(msg.seq);
-      if (Number.isFinite(seq) && seq > player.lastInputSeq) player.lastInputSeq = seq;
-      let dx = player.input.dx, dy = player.input.dy;
-      const m = Math.hypot(dx, dy);
-      if (m < 0.05) { dx = player.input.lastDir.x; dy = player.input.lastDir.y; }
-      const rawCount = Number(msg.count);
-      // Match the client clamp(1, 30). 30 ejects per cell per packet at
-      // up to 1000 Hz timer rate = 30 000 ejects/sec/cell — same upper
-      // bound as offline classic.
-      const count = Number.isFinite(rawCount) ? Math.max(1, Math.min(30, Math.floor(rawCount))) : 1;
-      for (let i = 0; i < count; i++) tryDoEject(player, dx, dy, i, count);
-    } else if (type === "respawn") {
-      if (player.dead) spawnCellForPlayer(player);
-    } else if (type === "ping") {
-      const t = Number(msg.t);
-      safeSend({ type: "pong", t: Number.isFinite(t) ? t : 0, now: Date.now() });
-    }
-  });
-
-  ws.on("close", () => { if (player) { players.delete(player.id); player = null; } });
-  ws.on("error", () => { /* ignore */ });
+  },
+  upgrade: (res, req, context) => {
+    res.upgrade<SocketData>(
+      { playerId: "" },
+      req.getHeader("sec-websocket-key"),
+      req.getHeader("sec-websocket-protocol"),
+      req.getHeader("sec-websocket-extensions"),
+      context,
+    );
+  },
 });
 
-http.listen(PORT, () => {
-  console.log(`[yazario-v3] Online Classic V3 (spatial-hash) server listening on :${PORT}`);
-  console.log(`[yazario-v3] tick=${TICK_RATE}Hz, budget=${TICK_BUDGET_MS.toFixed(1)}ms, bots=${TARGET_BOTS}, grid=${GRID_DIM}x${GRID_DIM}`);
+app.get("/*", (res, _req) => {
+  res.writeStatus("200 OK").writeHeader("content-type", "text/plain").end("Yazario Online Classic V4");
+});
+
+app.listen(PORT, (listenSocket) => {
+  if (listenSocket) {
+    console.log(`[yazario-v4] Online Classic V4 (uWS) listening on :${PORT}`);
+    console.log(`[yazario-v4] tick=${TICK_RATE}Hz, budget=${TICK_BUDGET_MS.toFixed(1)}ms, bots=${TARGET_BOTS}, grid=${GRID_DIM}x${GRID_DIM}`);
+  } else {
+    console.error(`[yazario-v4] Failed to listen on :${PORT}`);
+  }
 });
