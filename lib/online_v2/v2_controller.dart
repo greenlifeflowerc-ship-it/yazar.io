@@ -61,6 +61,7 @@ class V2Controller extends ChangeNotifier {
   /// cells than the server (server hasn't broadcast the fragments yet) and
   /// we have to wait it out instead of rebuilding immediately.
   int _lastVirusPopMs = 0;
+  int _lastSplitMs = 0;
 
   /// Enemy cells we locally predicted as eaten. The painter no longer draws
   /// them, but if the server keeps reporting them alive in a subsequent
@@ -355,6 +356,7 @@ class V2Controller extends ChangeNotifier {
     sim.doSplit(aim);
     client.sendSplit();
     final nowMs = DateTime.now().millisecondsSinceEpoch;
+    _lastSplitMs = nowMs;
     _seqStampMs[client.lastSentSeq] = nowMs;
     _pendingActions.add(_PendingAction(client.lastSentSeq, 'split', nowMs, aim));
     // Tag the current frame record so input-replay re-fires the split when
@@ -865,9 +867,14 @@ class V2Controller extends ChangeNotifier {
     // rubber-band the player reported. 800 u only catches a genuine
     // physics divergence (missed virus pop, off-screen kill, …)
     // without firing on normal play.
-    const hardSnapDrift = 800.0;
-    if (maxDrift2 > hardSnapDrift * hardSnapDrift) {
-      _rebuildLocalFromServer(serverCells);
+    final nowMsRecon = DateTime.now().millisecondsSinceEpoch;
+    final recentSplit = nowMsRecon - _lastSplitMs < 1000;
+    final recentPop = nowMsRecon - _lastVirusPopMs < 1000;
+    if (!recentSplit && !recentPop) {
+      const hardSnapDrift = 800.0;
+      if (maxDrift2 > hardSnapDrift * hardSnapDrift) {
+        _rebuildLocalFromServer(serverCells);
+      }
     }
 
     // SMOOTH mass convergence — DEAD-SLOW so the player never sees
@@ -934,7 +941,7 @@ class V2Controller extends ChangeNotifier {
             best = c;
           }
         }
-        if (best != null && bestD2 < 400 * 400) {
+        if (best != null && bestD2 < 1200 * 1200) {
           leftover.remove(best);
           donor = best;
         }
