@@ -282,7 +282,11 @@ function spawnVirus() {
 }
 function spawnCellForPlayer(p) {
     const pos = safeSpawnPos();
-    const mult = p.isBot ? 1.0 : clamp(p.massMult, 0.5, 10.0);
+    // Honour the wider clamp range the join handler accepts (matches dev /
+    // test scenarios where a player wants to spawn at ~ 5 K mass). The
+    // 300× upper bound caps spawn mass at ~ 22 800, just under the engine
+    // MAX_CELL_MASS so the cell doesn't trip the auto-split limit on spawn.
+    const mult = p.isBot ? 1.0 : clamp(p.massMult, 0.5, 300.0);
     const startMass = p.isBot ? 100 : Math.round(76 * mult);
     p.cells = [{
             id: newId("c"),
@@ -314,7 +318,9 @@ function makeBot() {
         input: { dx: 0, dy: 0, attack: false, lastDir: { x: 1, y: 0 }, seq: 0 },
         dead: false, deadAt: 0, lastInputSeq: 0,
         lastSeenAt: Date.now(), spawnAt: Date.now(),
-        highestMass: 100, massMult: 1.0, eatenCount: 0,
+        highestMass: 100, massMult: 1.0,
+        ejectSpeedMult: 1.0, ejectDistMult: 1.0,
+        eatenCount: 0,
         aiDir: { x: 0, y: 0 }, aiNextDecide: 0, aiNextSplit: 0, aiNextEject: 0,
         seenCells: new Set(), seenPellets: new Set(),
         seenViruses: new Set(), seenEjected: new Set(),
@@ -710,22 +716,33 @@ function updateViruses(dt) {
     }
 }
 // ─────────────────────────────────────────────────────── eject
-function tryDoEject(p, dirX, dirY) {
+// `burstIdx` and `burstCount` describe this piece's position inside a
+// multi-piece burst (high feedSpeedMultiplier). They drive a deterministic
+// per-index angular spread that matches the client EjectHandler's spread
+// when `deterministic` is on — both sides end up with identical piece
+// paths even though there's no shared RNG.
+function tryDoEject(p, dirX, dirY, burstIdx = 0, burstCount = 1) {
     if (p.dead)
         return;
     const m = Math.hypot(dirX, dirY);
     const ux = m > 0.05 ? dirX / m : p.input.lastDir.x;
     const uy = m > 0.05 ? dirY / m : p.input.lastDir.y;
     const er = radius(EJECT_MASS);
+    const speedMult = p.ejectSpeedMult > 0 ? p.ejectSpeedMult : 1.0;
+    const distMult = p.ejectDistMult > 0 ? p.ejectDistMult : 1.0;
+    const derivedFric = clamp(1 - (1 - EJECT_FRICTION_PER_FRAME) * speedMult / distMult, 0.01, 0.99);
+    // Deterministic spread matching the client EjectHandler: half-degree-per-
+    // index fan, centered on the aim direction. For burst=1 the offset is 0,
+    // so single-piece feed flies in a perfectly straight line.
+    const centeredIdx = burstIdx - (burstCount - 1) / 2;
+    const spreadAng = centeredIdx * 4 * Math.PI / 180;
+    const csA = Math.cos(spreadAng), snA = Math.sin(spreadAng);
     for (const c of p.cells) {
         if (c.mass < EJECT_MIN_MASS)
             continue;
         c.mass -= EJECT_COST;
-        const ang = (Math.random() * 12 - 6) * (Math.PI / 180);
-        const cs = Math.cos(ang), sn = Math.sin(ang);
-        const fx = ux * cs - uy * sn;
-        const fy = ux * sn + uy * cs;
-        const sv = 0.95 + Math.random() * 0.1;
+        const fx = ux * csA - uy * snA;
+        const fy = ux * snA + uy * csA;
         const cr = radius(c.mass);
         let lx = c.x + fx * (cr + er + LAUNCH_OFFSET);
         let ly = c.y + fy * (cr + er + LAUNCH_OFFSET);
@@ -749,20 +766,44 @@ function tryDoEject(p, dirX, dirY) {
         const id = newId("e");
         ejected.set(id, {
             id, ownerId: p.id, x: lx, y: ly,
-            vx: fx * EJECT_VELOCITY_INITIAL * sv,
-            vy: fy * EJECT_VELOCITY_INITIAL * sv,
+            vx: fx * EJECT_VELOCITY_INITIAL * speedMult,
+            vy: fy * EJECT_VELOCITY_INITIAL * speedMult,
             color: c.color, spawnedAt: Date.now(),
+            fric: derivedFric,
         });
     }
 }
 function updateEjected(dt) {
     if (ejected.size === 0)
         return;
-    const fric = Math.pow(EJECT_FRICTION_PER_FRAME, dt * 60);
     const er = radius(EJECT_MASS);
+    const dt60 = dt * 60;
     for (const e of ejected.values()) {
         if (e.vx === 0 && e.vy === 0)
             continue;
+        // Feed magnet — pulls pieces toward nearby cells. Range scales with
+        // the cell's radius so even massive cells (dev start mass,
+        // late-game splits) can recover the feed they shoot from their
+        // edge. Mirrors the client EjectHandler magnet so server and client
+        // agree on where each piece ends up.
+        let magVx = 0, magVy = 0;
+        cellGrid.queryEach(e.x, e.y, 1200, (c) => {
+            const cr = radius(c.mass);
+            const magnetRange = Math.max(150, cr + 300);
+            const dx = c.x - e.x, dy = c.y - e.y;
+            const d = Math.hypot(dx, dy);
+            if (d < 10 || d > magnetRange)
+                return;
+            const strength = (1 - d / magnetRange) * 800;
+            magVx += (dx / d) * strength;
+            magVy += (dy / d) * strength;
+        });
+        e.vx += magVx * dt;
+        e.vy += magVy * dt;
+        // Per-piece friction so each owner's pieces honour that owner's
+        // ejectSpeedMult / ejectDistMult tuning. The math matches the
+        // client EjectHandler.update exactly.
+        const fric = Math.pow(e.fric || EJECT_FRICTION_PER_FRAME, dt60);
         e.x += e.vx * dt;
         e.y += e.vy * dt;
         e.vx *= fric;
@@ -1421,7 +1462,16 @@ wss.on("connection", (ws) => {
             const name = rawName.trim().slice(0, 18) || "Player";
             const skinId = typeof msg.skin === "string" ? msg.skin.slice(0, 128) : "";
             const rawMult = Number(msg.massMult);
-            const massMult = Number.isFinite(rawMult) ? clamp(rawMult, 0.5, 10.0) : 1.0;
+            // Upper bound generous (300×) so the client can drive a dev /
+            // testing spawn mass of up to ~ 22 500 (matches the in-engine cap).
+            // The server still validates Number.isFinite to reject bad data.
+            const massMult = Number.isFinite(rawMult) ? clamp(rawMult, 0.5, 300.0) : 1.0;
+            // Per-player eject tuning. Sane clamps so a malicious / desynced
+            // client can't ship pieces at world-spanning velocities.
+            const rawEsm = Number(msg.ejectSpeedMult);
+            const ejectSpeedMult = Number.isFinite(rawEsm) ? clamp(rawEsm, 0.25, 5.0) : 1.0;
+            const rawEdm = Number(msg.ejectDistMult);
+            const ejectDistMult = Number.isFinite(rawEdm) ? clamp(rawEdm, 0.25, 5.0) : 1.0;
             const id = newId("h");
             player = {
                 id, socket: ws, isBot: false, name,
@@ -1430,7 +1480,9 @@ wss.on("connection", (ws) => {
                 input: { dx: 0, dy: 0, attack: false, lastDir: { x: 1, y: 0 }, seq: 0 },
                 dead: false, deadAt: 0, lastInputSeq: 0,
                 lastSeenAt: Date.now(), spawnAt: Date.now(),
-                highestMass: 76, massMult, eatenCount: 0,
+                highestMass: 76, massMult,
+                ejectSpeedMult, ejectDistMult,
+                eatenCount: 0,
                 aiDir: { x: 0, y: 0 }, aiNextDecide: 0, aiNextSplit: 0, aiNextEject: 0,
                 seenCells: new Set(), seenPellets: new Set(),
                 seenViruses: new Set(), seenEjected: new Set(),
@@ -1483,9 +1535,12 @@ wss.on("connection", (ws) => {
                 dy = player.input.lastDir.y;
             }
             const rawCount = Number(msg.count);
-            const count = Number.isFinite(rawCount) ? Math.max(1, Math.min(10, Math.floor(rawCount))) : 1;
+            // Match the client clamp(1, 30). 30 ejects per cell per packet at
+            // up to 1000 Hz timer rate = 30 000 ejects/sec/cell — same upper
+            // bound as offline classic.
+            const count = Number.isFinite(rawCount) ? Math.max(1, Math.min(30, Math.floor(rawCount))) : 1;
             for (let i = 0; i < count; i++)
-                tryDoEject(player, dx, dy);
+                tryDoEject(player, dx, dy, i, count);
         }
         else if (type === "respawn") {
             if (player.dead)

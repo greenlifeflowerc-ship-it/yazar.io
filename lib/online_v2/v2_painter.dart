@@ -192,17 +192,16 @@ class V2Painter extends CustomPainter {
   // ────────────────────────────────────────────────── ejected mass
   void _drawEjected(Canvas canvas, Rect view) {
     final selfId = controller.playerId;
-    // Server-side ejected — every OTHER player's feed. Pieces we own are
-    // rendered from sim.localEjected below (offline-style), so we skip
-    // their server-mirrored entries here to avoid the visible double-
-    // render / lag-handoff that comes from network interp delay.
+    // Enemy pieces only (filter out the server's mirrored copy of our
+    // own feed — we render those locally below).
     for (final e in controller.world.ejected.values) {
       if (e.ownerId == selfId) continue;
       final pos = Offset(e.renderX, e.renderY);
       if (!view.contains(pos)) continue;
       _drawEjectedCircle(canvas, pos, _ejectedRadius, e.color);
     }
-    // Local-only ejected — the human's own feed, animated by the local sim.
+    // Own pieces — rendered straight from the local sim for zero-lag
+    // feedback when ejecting and re-capturing.
     for (final e in controller.sim.localEjected) {
       if (!view.contains(e.position)) continue;
       _drawEjectedCircle(canvas, e.position, e.radius, e.color);

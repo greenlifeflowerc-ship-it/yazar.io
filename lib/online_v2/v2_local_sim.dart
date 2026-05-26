@@ -100,11 +100,12 @@ class V2LocalSim {
 
   void doEject(Offset aimDir) {
     if (!_initialized || player.isDead) return;
-    // Same RNG spread as offline classic so the feed looks naturally
-    // scattered (not laser-straight). Own pieces are rendered from the
-    // local sim only — the server's mirrored copy is never drawn — so
-    // we don't need the server's path to match ours pixel-for-pixel.
-    _eject.ejectPlayer(player, aimDir);
+    // Local-rendered feed (the "VIP" baseline). Own pieces are spawned
+    // in sim.localEjected and rendered straight from there, the
+    // server-mirrored copy is filtered out of the painter, and the
+    // local sim runs the magnet + eat-prediction so the player gets
+    // instant feedback on every eject and recapture.
+    _eject.ejectPlayer(player, aimDir, spawnPieces: true);
   }
 
   /// Drop every cell — used when the server confirms our death.

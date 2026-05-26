@@ -45,13 +45,14 @@ class V2Controller extends ChangeNotifier {
   final V2SkinCache skinCache = V2SkinCache();
 
   /// Hard cap on how many local pieces we keep alive simultaneously.
-  /// Set high because the player needs to be able to come back and eat
-  /// pieces they fed minutes ago. Was 64 — too aggressive: at micro feed
-  /// rate (~ 60 pieces / sec) the cap drained pieces faster than the
-  /// player could circle back to consume them. 256 covers ~ 4 seconds of
-  /// max-rate micro before the oldest start to drop, which is far more
-  /// than anyone naturally fires before chasing their own feed.
-  static const _localEjectedHardCap = 256;
+  /// At extreme feedSpeedMultiplier (up to 30 000 ejects/sec/cell) plus
+  /// the ~ 1 s flight time before friction stops pieces, the steady-
+  /// state population can reach low thousands. 2048 lets normal-to-fast
+  /// micro stay continuously visible without the oldest pieces being
+  /// dropped mid-flight — the cap is now only a safety net for
+  /// pathological cases. Each piece is ~ 80 bytes, total ~ 160 KB which
+  /// is comfortable on every supported phone.
+  static const _localEjectedHardCap = 2048;
   /// Local prediction window for virus pops, used to suppress accidental
   /// re-pop of the same virus across two ticks before the server confirms.
   final Set<String> _locallyPoppedViruses = {};
@@ -259,20 +260,28 @@ class V2Controller extends ChangeNotifier {
     // with the local piece's last position. Without the position transfer,
     // the local piece (rendered at the predicted cell edge + flight) vanishes
     // and the server piece pops up tens of units behind it — looks like the
-    // feed "teleported back" or "disappeared" then a new one appeared.
-    // Reconcile locally-predicted enemy kills against the snapshot. If the
-    // server confirmed (rmCells), drop the tracking. If the server is still
-    // updating that cell (updCells), we mispredicted — restore it so the
-    // player doesn't lose sight of an enemy that's actually still alive.
+    // Reconcile locally-predicted enemy kills.
+    //   • rmCells contains the id  → server confirmed the kill, drop
+    //     tracking permanently.
+    //   • TTL expired (~ 1 s) without confirmation → mispredict, restore
+    //     the enemy.
+    //
+    // We DO NOT restore on the first updCells that still lists the
+    // enemy as alive. Server's view of our cell is RTT/2 behind, so
+    // immediately after a valid predict-eat the server still hasn't
+    // processed the contact — its next 1-2 snapshots will keep
+    // broadcasting the enemy in updCells. The previous code restored
+    // on that first updCells, then the predict pass eats the enemy
+    // again the next frame because the same conditions still hold,
+    // then the next snapshot restores again — the enemy visibly
+    // FLICKERS between "eaten" and "alive" until the rmCells finally
+    // arrives. Trusting the predict for the full TTL eliminates that
+    // flicker; if the predict was wrong the TTL fallback restores
+    // after ~ 1 s.
     if (_locallyKilledExpiry.isNotEmpty) {
       final ids = _locallyKilledExpiry.keys.toList();
       for (final id in ids) {
         if (s.rmCells.contains(id)) {
-          _locallyKilledEnemy.remove(id);
-          _locallyKilledExpiry.remove(id);
-        } else if (s.updCells.any((u) => u.id == id)) {
-          final restored = _locallyKilledEnemy[id];
-          if (restored != null) world.cells[id] = restored;
           _locallyKilledEnemy.remove(id);
           _locallyKilledExpiry.remove(id);
         }
@@ -520,11 +529,10 @@ class V2Controller extends ChangeNotifier {
     }
   }
 
-  /// Local cell-vs-ejected eating, for both our locally-spawned feed and the
-  /// server-broadcast ejected from other players. Mirrors the offline rule:
-  /// a cell needs mass >= 22, then anything inside `radius - ejectedRadius*0.4`
-  /// gets consumed. The 200 ms owner-immunity matches the offline / server
-  /// formula so the feed isn't self-eaten before it travels.
+  /// Local cell-vs-ejected eating, for both our locally-spawned feed
+  /// and the server-broadcast ejected from other players. Mirrors the
+  /// offline rule: a cell needs mass >= 22, then anything inside the
+  /// touch radius gets consumed (200 ms owner-immunity on own pieces).
   void _predictEjectedEating() {
     if (!sim.isInitialized || sim.cells.isEmpty) return;
     final selfId = _playerId;
@@ -534,64 +542,69 @@ class V2Controller extends ChangeNotifier {
 
     // ── local-only ejected (our own feed) ──
     final localToRemove = <EjectedMass>[];
-    // Check if MY cells eat MY local feed.
-    //   • 200 ms post-spawn immunity — same as offline / server.
-    //   • In-flight skip — pieces still travelling at > 80 u/s are
-    //     considered "en route" and not eligible for re-absorb. Stops
-    //     huge cells (after dev-mass spawn or big splits) from sucking
-    //     in their own feed mid-air just because their eat-radius
-    //     overlaps the piece while it's still flying away from them.
-    //     Friction takes pieces below the 80 u/s gate in ~ 500 ms, after
-    //     which the player can deliberately come back and catch them.
+    // Per-cell per-frame cap raised to 30 (was 6) so re-eating a
+    // micro-feed cluster doesn't feel slow. At 60 Hz that's 1800
+    // eats/sec/cell which is well above the realistic feed rate. The
+    // cap still prevents the pathological 1000-piece-in-one-frame
+    // mass jump to max, but normal play eats every piece in range
+    // each frame.
+    const eatsPerCellPerFrame = 30;
     for (final c in sim.cells) {
       if (c.mass < 22) continue;
+      final cX = c.position.dx;
+      final cY = c.position.dy;
+      final eatR = c.radius + ejectedRadius;
+      final eatR2 = eatR * eatR;
+      int eatsThisFrame = 0;
       for (final e in sim.localEjected) {
+        if (eatsThisFrame >= eatsPerCellPerFrame) break;
         if (localToRemove.contains(e)) continue;
+        final dx = e.position.dx - cX;
+        // AABB pre-cull avoids a sqrt+immunity-age check when the
+        // piece is obviously outside the eat box. Cuts the per-frame
+        // hot-loop cost by ~ 70 % when 1000+ pieces are alive.
+        if (dx > eatR || dx < -eatR) continue;
+        final dy = e.position.dy - cY;
+        if (dy > eatR || dy < -eatR) continue;
         final age = nowMs - e.spawnTime.millisecondsSinceEpoch;
         if (e.ownerId == c.ownerId && age < 200) continue;
-        if (e.velocity.distance > 80) continue;
-        final eatR = c.radius + e.radius;
-        final dx = e.position.dx - c.position.dx;
-        final dy = e.position.dy - c.position.dy;
-        if (dx * dx + dy * dy < eatR * eatR) {
+        if (dx * dx + dy * dy < eatR2) {
           if (c.mass < GameConstants.maxCellMass) {
             c.mass += GameConstants.ejectConsumedMass;
           }
           localToRemove.add(e);
+          eatsThisFrame++;
         }
       }
     }
-    // Check if OTHER players' cells eat MY local feed.
-    // Use the SERVER-STYLE strict overlap (`r - er * 0.4`, piece center
-    // must be > 50 % inside enemy cell) — NOT the lenient touch-circles
-    // rule we use for our own cells. Enemy positions come from the
-    // 110 ms-delayed render interpolation, so a lenient rule fires the
-    // moment the enemy's rendered shape just kisses a piece — which
-    // produces the "feed disappears glitch" the player sees when an
-    // enemy flies past without actually eating anything. The strict
-    // rule fires only when the piece is unambiguously inside the
-    // enemy's body, matching what the server's collision pass thinks.
+    // Enemy cells eating MY local feed — strict overlap (piece > 50 %
+    // inside cell). The lenient touch-circles rule fired false eats off
+    // the render-lagged enemy position.
     for (final c in world.cells.values) {
       if (c.isSelf) continue;
       if (c.targetMass < 22) continue;
       final cRadius = c.renderRadius;
+      final eatR = cRadius - ejectedRadius * 0.4;
+      if (eatR <= 0) continue;
+      final cX = c.renderX;
+      final cY = c.renderY;
+      final eatR2 = eatR * eatR;
       for (final e in sim.localEjected) {
         if (localToRemove.contains(e)) continue;
-        final eatR = cRadius - e.radius * 0.4;
-        if (eatR <= 0) continue;
-        final dx = e.position.dx - c.renderX;
-        final dy = e.position.dy - c.renderY;
-        if (dx * dx + dy * dy < eatR * eatR) {
+        final dx = e.position.dx - cX;
+        if (dx > eatR || dx < -eatR) continue;
+        final dy = e.position.dy - cY;
+        if (dy > eatR || dy < -eatR) continue;
+        if (dx * dx + dy * dy < eatR2) {
           localToRemove.add(e);
         }
       }
     }
-    // Check if viruses eat MY local feed.
+    // Viruses eating MY local feed.
     for (final v in world.viruses.values) {
       final vRadius = v.renderRadius;
       for (final e in sim.localEjected) {
         if (localToRemove.contains(e)) continue;
-        // Viruses eat ejected mass if it's within (virusR + ejectedR*0.5).
         final trigger = vRadius + e.radius * 0.5;
         final dx = e.position.dx - v.renderX;
         final dy = e.position.dy - v.renderY;
@@ -604,11 +617,9 @@ class V2Controller extends ChangeNotifier {
       sim.localEjected.removeWhere((e) => localToRemove.contains(e));
     }
 
-    // ── server-broadcast ejected (ENEMY feed only) ──
-    // Own pieces are rendered & consumed via sim.localEjected, so we skip
-    // them here entirely. Predict eating enemy feed against the RENDERED
-    // position (what the player sees) — the eat triggers the instant the
-    // cell visually overlaps the piece.
+    // ── server-broadcast ejected (ENEMY feed only — own server-mirrored
+    // pieces are filtered from the painter so eating them locally would
+    // remove invisible entries) ──
     final serverToRemove = <String>[];
     for (final c in sim.cells) {
       if (c.mass < 22) continue;
@@ -663,7 +674,13 @@ class V2Controller extends ChangeNotifier {
     if (selfId == null) return;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
 
-    // (a) we → eat → enemy
+    // (a) we → eat → enemy.
+    //
+    // No per-cell cap any more — capping at 2 made multi-enemy combos
+    // feel slow ("بطيئ كتير لياكل"). All enemies inside the eat
+    // radius get consumed in the same predict pass, matching what the
+    // server will compute and what the player visually expects when
+    // they land in a cluster.
     final eaten = <String>[];
     for (final ours in sim.cells) {
       final ar = ours.radius;
@@ -811,9 +828,13 @@ class V2Controller extends ChangeNotifier {
       final recentVirusPop = nowMs - _lastVirusPopMs < 500;
 
       // Decide how long to tolerate the count mismatch before snapping:
-      //   • Pending split (local > server) ............ 20 ticks (~666 ms)
-      //     — we just split, the new cells are en route through the server.
-      //   • Recent virus pop (local > server) ......... 12 ticks (~400 ms)
+      //   • Pending split (local > server) ............ 60 ticks (~2 s)
+      //     — we just split, the new cells are en route. Was 20 ticks
+      //     (666 ms); under heavy load (dev mass + micro feed) the
+      //     server's tick budget overruns delayed split acks past the
+      //     666 ms threshold, which fired a rebuild that visibly
+      //     "shrank" the freshly-split cells back into one.
+      //   • Recent virus pop (local > server) ......... 30 ticks (~1 s)
       //     — we popped predictively, server hasn't broadcast fragments yet.
       //   • Otherwise local > server ..................  1 tick   (~33 ms)
       //     — almost certainly we just got eaten / server-side-merged. Snap
@@ -823,9 +844,9 @@ class V2Controller extends ChangeNotifier {
       final int tolerateTicks;
       if (localAhead) {
         if (hasPendingSplit) {
-          tolerateTicks = 20;
+          tolerateTicks = 60;
         } else if (recentVirusPop) {
-          tolerateTicks = 12;
+          tolerateTicks = 30;
         } else {
           tolerateTicks = 1;
         }
@@ -875,39 +896,37 @@ class V2Controller extends ChangeNotifier {
       }
     }
 
-    // 350 u tolerance: covers steady RTT drift, virus-pop impulses, fresh
-    // split spread, attack-mode lane re-alignment. Past it, something
-    // major happened on the server we can't reproduce — snap.
-    const hardSnapDrift = 350.0;
+    // 800 u tolerance — was 350 u, but a fresh split at high mass
+    // routinely drifted 300-400 u within a single RTT (cells flying at
+    // 1500 u/s impulse while server is still processing the split),
+    // triggering a position rebuild that snapped the local cells back
+    // to where the server thinks they "should" be. That's the
+    // rubber-band the player reported. 800 u only catches a genuine
+    // physics divergence (missed virus pop, off-screen kill, …)
+    // without firing on normal play.
+    const hardSnapDrift = 800.0;
     if (maxDrift2 > hardSnapDrift * hardSnapDrift) {
       _rebuildLocalFromServer(serverCells);
     }
 
-    // Mass-scale correction is ONE-WAY: we scale UP when the server has
-    // more mass than we do (we missed an eat — pellet or feed contact the
-    // local prediction didn't catch) but we DO NOT scale down for any
-    // amount of local over-prediction less than a runaway-bug threshold.
-    // Scaling down would silently undo locally predicted own-feed eats
-    // during the ~ 1 RTT window before the server has mirrored them, and
-    // the path divergence between the client's random RNG and the
-    // server's path means the server may NEVER mirror them — the player
-    // would see their cell shrink without explanation.
+    // SMOOTH mass convergence — DEAD-SLOW so the player never sees
+    // a "cell suddenly bigger / smaller" jump. Lerps 2 % of the gap
+    // per snapshot, capped at 1.5 % of the cell's current mass per
+    // snapshot. Even a worst-case drift of +10 K mass (a server-side
+    // virus pop we never predicted) converges over ~ 2 seconds of
+    // sub-perceptible growth instead of a 1-frame snap.
     if (s.self.mass > 0 && sim.cells.isNotEmpty) {
       final localTotal = sim.cells.fold(0.0, (acc, c) => acc + c.mass);
       final serverTotal = s.self.mass;
       if (localTotal > 0) {
-        final drift = serverTotal - localTotal;
-        if (drift > localTotal * 0.05) {
-          // Local is BEHIND server — missed an eat. Scale up.
-          final scale = serverTotal / localTotal;
-          for (final c in sim.cells) {
-            c.mass = (c.mass * scale).clamp(1.0, GameConstants.maxCellMass);
-          }
-        } else if (drift < -localTotal * 0.50) {
-          // Local has predicted 50 %+ more mass than the server. This is
-          // almost certainly a real bug (we ate phantom food) — pull
-          // back to authoritative server view.
-          final scale = serverTotal / localTotal;
+        final relDrift = (serverTotal - localTotal).abs() / localTotal;
+        if (relDrift > 0.01) {
+          var desired = (serverTotal - localTotal) * 0.02;
+          final cap = localTotal * 0.015;
+          if (desired > cap) desired = cap;
+          if (desired < -cap) desired = -cap;
+          final targetTotal = localTotal + desired;
+          final scale = targetTotal / localTotal;
           for (final c in sim.cells) {
             c.mass = (c.mass * scale).clamp(1.0, GameConstants.maxCellMass);
           }
@@ -960,11 +979,20 @@ class V2Controller extends ChangeNotifier {
         }
       }
 
+      // Use the LOCAL mass entirely when a donor exists — never let
+      // rebuild change a cell's size, in either direction. Both
+      // directions would produce a visible "pop" (shrink or grow) the
+      // moment rebuild fires, which is the most jarring split glitch
+      // the player notices. Only brand-new server cells with no
+      // donor (e.g. a server-side virus pop we missed predicting) use
+      // the server's mass since we have no local reference. Smooth
+      // mass-scale below will reconcile any drift gradually.
+      final keepMass = donor?.mass ?? s.targetMass;
       final cell = ge.Cell(
         id: s.id,
         ownerId: s.ownerId,
         position: Offset(s.targetX, s.targetY),
-        mass: s.targetMass,
+        mass: keepMass,
         color: s.color,
         name: s.name,
         mergeReadyAt: now.add(Duration(milliseconds: remainingMs)),

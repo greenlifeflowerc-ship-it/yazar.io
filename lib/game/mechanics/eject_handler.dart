@@ -26,7 +26,21 @@ class EjectHandler {
   /// flies on the EXACT same arc the server's mirrored piece does — any
   /// random divergence makes the server's eat-detection fire while the
   /// player's eye still sees the piece short of the target.
-  void ejectPlayer(Player p, Offset aimDir, {double? multiplier, bool deterministic = false}) {
+  /// [spawnPieces] controls whether each successful eject also adds an
+  /// [EjectedMass] to `engine.ejectedMasses`. Offline classic keeps it
+  /// `true` so the engine drives every visible piece. Online V2 passes
+  /// `false`: pieces are server-authoritative there (the server creates
+  /// them and broadcasts via `addEjected`), so spawning locally would
+  /// just produce ghost pieces that diverge from the server's copy. Mass
+  /// deduction + recoil still happen so the local cell gets instant
+  /// feedback for the eject.
+  void ejectPlayer(
+    Player p,
+    Offset aimDir, {
+    double? multiplier,
+    bool deterministic = false,
+    bool spawnPieces = true,
+  }) {
     if (p.isDead) return;
     final mag = aimDir.distance;
     final unit = mag > 0 ? aimDir / mag : const Offset(1, 0);
@@ -78,12 +92,14 @@ class EjectHandler {
         final ejectVelocity = finalDir *
               (GameConstants.ejectVelocityInitial * speedMult * speedVar);
 
-        engine.ejectedMasses.add(EjectedMass(
-          ownerId: p.id,
-          position: launchPoint,
-          velocity: ejectVelocity,
-          color: _vivid(c.color),
-        ));
+        if (spawnPieces) {
+          engine.ejectedMasses.add(EjectedMass(
+            ownerId: p.id,
+            position: launchPoint,
+            velocity: ejectVelocity,
+            color: _vivid(c.color),
+          ));
+        }
 
         // --- Recoil Sticking Physics ---
         // Every eject applies a backward force (recoil) to the cell.
