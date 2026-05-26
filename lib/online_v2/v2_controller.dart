@@ -260,44 +260,6 @@ class V2Controller extends ChangeNotifier {
     // with the local piece's last position. Without the position transfer,
     // the local piece (rendered at the predicted cell edge + flight) vanishes
     // and the server piece pops up tens of units behind it — looks like the
-    // Reconcile locally-predicted enemy kills.
-    //   • rmCells contains the id  → server confirmed the kill, drop
-    //     tracking permanently.
-    //   • TTL expired (~ 1 s) without confirmation → mispredict, restore
-    //     the enemy.
-    //
-    // We DO NOT restore on the first updCells that still lists the
-    // enemy as alive. Server's view of our cell is RTT/2 behind, so
-    // immediately after a valid predict-eat the server still hasn't
-    // processed the contact — its next 1-2 snapshots will keep
-    // broadcasting the enemy in updCells. The previous code restored
-    // on that first updCells, then the predict pass eats the enemy
-    // again the next frame because the same conditions still hold,
-    // then the next snapshot restores again — the enemy visibly
-    // FLICKERS between "eaten" and "alive" until the rmCells finally
-    // arrives. Trusting the predict for the full TTL eliminates that
-    // flicker; if the predict was wrong the TTL fallback restores
-    // after ~ 1 s.
-    if (_locallyKilledExpiry.isNotEmpty) {
-      final ids = _locallyKilledExpiry.keys.toList();
-      for (final id in ids) {
-        if (s.rmCells.contains(id)) {
-          _locallyKilledEnemy.remove(id);
-          _locallyKilledExpiry.remove(id);
-        }
-      }
-      final nowMs = DateTime.now().millisecondsSinceEpoch;
-      _locallyKilledExpiry.removeWhere((id, exp) {
-        if (nowMs > exp) {
-          final restored = _locallyKilledEnemy[id];
-          if (restored != null) world.cells[id] = restored;
-          _locallyKilledEnemy.remove(id);
-          return true;
-        }
-        return false;
-      });
-    }
-
     // Own ejected feed is rendered OFFLINE-STYLE from sim.localEjected for
     // the whole flight. The server still mirrors our pieces (so other
     // players see them) but we DO NOT FIFO-match local↔server, we DO NOT
@@ -478,7 +440,6 @@ class V2Controller extends ChangeNotifier {
     final runHeavy = (_predictFrameCounter++ & 1) == 0;
     if (runHeavy) {
       _predictVirusPops();
-      _predictCellEating();
     }
 
     // 6. Snapshot-buffer interpolation for every remote entity. Render time
